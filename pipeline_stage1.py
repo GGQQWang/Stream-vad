@@ -48,11 +48,11 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
-from compression.temporal import TemporalTokenReducer
-from compression.spatial import SpatialTokenCompressor
-from compression.ssm_block import SSMBlock
-from compression.vit_forwarder import ViTForwarder
-from compression.hivau_dataset import HIVAUDataset
+from temporal import TemporalTokenReducer
+from spatial import SpatialTokenCompressor
+from ssm_block import SSMBlock
+from vit_forwarder import ViTForwarder
+from hivau_dataset import HIVAUDataset
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +204,20 @@ def validate(
         if not per_video_T:
             continue
 
-        all_frames = torch.cat(
-            [f for f in frames_list if f.shape[0] > 0], dim=0
-        )
-        all_labels_t = torch.cat(
-            [l for i, l in enumerate(labels_list)
-             if frames_list[i].shape[0] > 0], dim=0
-        )
+        # flat list of clips (no cat — different videos can differ in H,W)
+        all_videos: List[torch.Tensor] = []
+        all_labels_list: List[torch.Tensor] = []
+        for f, l in zip(frames_list, labels_list):
+            if f.shape[0] == 0:
+                continue
+            for clip in f:
+                all_videos.append(clip)               # [F, C, H, W]
+            all_labels_list.append(l)
+        all_labels_t = torch.cat(all_labels_list, dim=0)
 
         # processor on CPU
         processed = processor(
-            videos=list(all_frames.unbind(0)),
+            videos=all_videos,
             return_tensors="pt",
             size={"height": 448, "width": 448},
         )
@@ -419,12 +422,16 @@ def main():
             if not frames_list:
                 continue
 
-            all_frames = torch.cat(frames_list, dim=0)  # CPU for processor
+            # flat clip list (no cat — different resolutions safe)
+            all_clips: List[torch.Tensor] = []
+            for video_frames in frames_list:
+                for clip in video_frames:
+                    all_clips.append(clip)                  # [F, C, H, W]
             all_labels = torch.cat(labels_list, dim=0)
             all_binary = torch.cat(binary_list, dim=0)
 
             processed = processor(
-                videos=list(all_frames.unbind(0)),
+                videos=all_clips,
                 return_tensors="pt",
                 size={"height": args.image_size, "width": args.image_size},
             )
@@ -463,12 +470,12 @@ def main():
             # track per-batch stats for TensorBoard
             with torch.no_grad():
                 train_losses.append(loss.item() * args.grad_accum)
-                bin_mask = all_binary > 0
-                flat = scores.flatten().cpu()
-                if bin_mask.any():
-                    train_pos_scores.extend(flat[bin_mask].tolist())
-                if (~bin_mask).any():
-                    train_neg_scores.extend(flat[~bin_mask].tolist())
+                valid_scores = scores[valid].cpu()        # [sum(T_i)]
+                pos_mask = all_binary > 0
+                if pos_mask.any():
+                    train_pos_scores.extend(valid_scores[pos_mask].tolist())
+                if (~pos_mask).any():
+                    train_neg_scores.extend(valid_scores[~pos_mask].tolist())
                 # compression stats
                 clip_keep_ratios.extend(stats["clip_keep_ratios"])
                 clip_anomaly_ratios.extend(all_labels.cpu().tolist())

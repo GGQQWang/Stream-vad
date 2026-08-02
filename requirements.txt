@@ -1,6 +1,10 @@
 torch>=2.2.0
 transformers==4.46.2
-mamba-ssm>=1.2.0
+mamba-ssm>=2.0.0
 einops
 decord>=0.6.0
 peft>=0.10.0
+tensorboard
+numpy
+tqdm
+scikit-learn

@@ -93,7 +93,7 @@ class HIVAUDataset(Dataset):
                 clip_fl = frame_labels[
                     start : start + self.clip_span : sample_interval
                 ]
-                clip_labels.append(float(clip_fl.float().mean()))   # soft ratio
+                clip_labels.append(float(clip_fl.mean()))            # soft ratio
                 clip_binary.append(1 if clip_fl.any() else 0)       # hard for AUC
                 n_clips += 1
 

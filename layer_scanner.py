@@ -23,7 +23,7 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 from tqdm import tqdm
 
-from compression.shallow_llm import ShallowLLM, _get_llm_layers
+from shallow_llm import ShallowLLM, _get_llm_layers
 
 
 def _load_model(ckpt_path: str):
