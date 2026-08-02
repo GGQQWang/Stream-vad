@@ -8,27 +8,47 @@ Qwen2-VL's ViT transformer blocks and merger.  Two modes:
 - ``forward_streaming()`` inference: pre-filtered patches → ViT blocks
                          → merger.
 
-Does NOT import from LAVIDA.  References Qwen2-VL modules directly.
+Handles both old ``rotary_pos_emb`` and new ``position_embeddings=(cos,sin)``
+ViT-block APIs, and both single-tensor / tuple return from ``rot_pos_emb()``.
 """
 
+import inspect
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from compression.temporal import TemporalTokenReducer
+from .temporal import TemporalTokenReducer
+
+
+def _detect_vit_api(visual: nn.Module) -> str:
+    """Check which keyword the ViT blocks expect."""
+    sig = inspect.signature(visual.blocks[0].forward)
+    if "position_embeddings" in sig.parameters:
+        return "position_embeddings"
+    return "rotary_pos_emb"
+
+
+def _to_position_embeddings(rotary: torch.Tensor):
+    """Convert a flat RoPE tensor to ``(cos, sin)`` if needed.
+
+    Some Qwen2-VL versions return ``(cos, sin)`` from rot_pos_emb(),
+    others return a single concatenated tensor.  Normalise here.
+    """
+    if isinstance(rotary, tuple):
+        return rotary                     # already (cos, sin)
+    # Legacy single-tensor format — split along last dim
+    cos, sin = rotary.chunk(2, dim=-1)
+    return cos, sin
 
 
 class ViTForwarder(nn.Module):
     """Qwen2-VL ViT blocks + merger, batch & streaming.
 
     Args:
-        visual: Qwen2-VL ``self.visual`` module (from a loaded
-                ``Qwen2VLForConditionalGeneration`` model).
-        temporal_reducer: TemporalTokenReducer instance for batch mode.
-                         If None, batch mode still works (no temporal
-                         filtering).
+        visual: Qwen2-VL ``self.visual`` module (from a loaded model).
+        temporal_reducer: TemporalTokenReducer for batch mode.
     """
 
     def __init__(
@@ -39,6 +59,7 @@ class ViTForwarder(nn.Module):
         super().__init__()
         self.visual = visual
         self.temporal_reducer = temporal_reducer or TemporalTokenReducer()
+        self._block_api = _detect_vit_api(visual)  # "rotary_pos_emb" or "position_embeddings"
 
     # ------------------------------------------------------------------
     # Batch mode (training: uniform clip sampling)
@@ -51,39 +72,27 @@ class ViTForwarder(nn.Module):
         """Process a batch of video clips.
 
         Args:
-            pixel_values: ``[total_pixels, C=3]``  raw pixel values,
-                         flattened across all clips in the batch.
-            grid_thw: ``[B, 3]``  rows are ``(t_frames, h, w)``.
+            pixel_values: ``[total_pixels, C=3]``.
+            grid_thw: ``[B, 3]``  rows ``(t_frames, h, w)``.
 
         Returns:
-            visual_tokens:  ``[total_tokens, D_llm]``  merger output
-                           (``D_llm`` = 3584 for Qwen2-VL-7B).
-            merged_counts:  ``[sum(t_i)]``  token count per frame
-                           **after merger** (original / 4).
+            visual_tokens:  ``[total_tokens, D_llm]``.
+            merged_counts:  ``[sum(t_i)]``  tokens / frame post-merger.
         """
-        # 1. patch_embed  (same as LAVIDA video_embed L365)
         patches = self.visual.patch_embed(pixel_values)          # [total, 1280]
-        rotary = self.visual.rot_pos_emb(grid_thw)               # [total, 1280]
+        rotary_raw = self.visual.rot_pos_emb(grid_thw)           # tensor or (cos,sin)
 
-        # 2. temporal filtering  (our module replaces LAVIDA L368)
         mask, seqlens = self.temporal_reducer(patches, grid_thw)
 
-        patches = patches[mask.bool()]                           # [kept, 1280]
-        rotary = rotary[mask.bool()]
+        patches = patches[mask.bool()]
+        rotary_raw = self._slice_rotary(rotary_raw, mask)
 
-        # 3. cu_seqlens for Flash Attention varlen  (same as LAVIDA L370-371)
         cu = F.pad(seqlens.cumsum(dim=0), (1, 0), value=0).int()
 
-        # 4. ViT blocks  (same as LAVIDA L374-375)
-        for blk in self.visual.blocks:
-            patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
+        patches = self._run_blocks(patches, cu, rotary_raw)
 
-        # 5. merger  (same as LAVIDA L414)
-        tokens = self.visual.merger(patches)                     # [kept/4, D_llm]
-
-        # per-frame count after 4× downsample
+        tokens = self.visual.merger(patches)                     # [L/4, D_llm]
         merged_counts = torch.ceil(seqlens.float() / 4).int()
-
         return tokens, merged_counts
 
     # ------------------------------------------------------------------
@@ -98,32 +107,51 @@ class ViTForwarder(nn.Module):
     ) -> torch.Tensor:
         """Process one flushed window.
 
-        Patches are already filtered by ``StreamWindowManager``.
-        We only need to compute matching position embeddings and run
-        ViT blocks + merger.
-
         Args:
-            all_patches: ``[L, 1280]``  kept patches from the window.
-            cu_seqlens:  ``[n_frames + 1]``  cumulative lengths.
-            grid_thw:    ``[n_frames, 3]``  rows ``(1, h, w)``.
-            all_indices: ``[L]``  per-patch index in the original
-                        (full-frame) position embedding grid, used
-                        to select the right rotary positions.
+            all_patches: ``[L, 1280]``  kept patches.
+            cu_seqlens:  ``[n_frames + 1]``.
+            grid_thw:    ``[n_frames, 3]``.
+            all_indices: ``[L]``  patch indices in full-frame RoPE grid.
 
         Returns:
-            visual_tokens: ``[L/4, D_llm]``  merger output.
+            visual_tokens: ``[L/4, D_llm]``.
         """
-        # 1. full rotary embeddings for every frame, then select kept ones
-        rotary_full = self.visual.rot_pos_emb(grid_thw)          # [total_full, 1280]
-        rotary = rotary_full[all_indices]                         # [L, 1280]
+        rotary_full = self.visual.rot_pos_emb(grid_thw)          # [N_full, ...]
+        rotary_sel = self._slice_rotary(rotary_full, all_indices)
 
-        # 2. ViT blocks
-        for blk in self.visual.blocks:
-            all_patches = blk(
-                all_patches,
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb=rotary,
-            )
+        all_patches = self._run_blocks(all_patches, cu_seqlens, rotary_sel)
+        return self.visual.merger(all_patches)
 
-        # 3. merger
-        return self.visual.merger(all_patches)                   # [L/4, D_llm]
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _run_blocks(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run all ViT blocks, adapting to the detected API."""
+        if self._block_api == "position_embeddings":
+            pos = _to_position_embeddings(rotary)
+            for blk in self.visual.blocks:
+                x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=pos)
+        else:
+            for blk in self.visual.blocks:
+                x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary)
+        return x
+
+    @staticmethod
+    def _slice_rotary(
+        rotary,
+        mask_or_indices: torch.Tensor,
+    ):
+        """Select positions from a RoPE tensor (handles both formats)."""
+        if isinstance(rotary, tuple):
+            # (cos, sin) — index each
+            idx = mask_or_indices
+            if idx.dtype == torch.bool:
+                idx = torch.where(idx)[0]
+            return (rotary[0][idx], rotary[1][idx])
+        # flat tensor
+        return rotary[mask_or_indices]
