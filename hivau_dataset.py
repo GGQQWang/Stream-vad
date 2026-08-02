@@ -1,21 +1,20 @@
-"""HIVAU-70K dataset loader for streaming VAD training.
+"""HIVAU-70K dataset — video chunked into fixed-size windows for training.
 
-Converts second-level event annotations to frame-level and clip-level
-binary labels.  Each ``__getitem__`` returns **all non-overlapping clips**
-from one video, so the downstream SSM can model cross-window temporal
-dependencies.
+Each video is pre-cut into non-overlapping, contiguous chunks of at most
+``max_windows`` clips.  A chunk is an independent sample; shuffling chunks
+guarantees full coverage of every video in a single epoch.
 
-Collate:  ``hivau_collate`` pads uneven clip counts to ``max_T`` per batch.
+Chunks carry ``valid_mask`` so the last (possibly shorter) chunk is handled
+correctly in loss, metrics, and logging.
 """
 
 import json
-import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.nn.utils.rnn import pad_sequence
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
@@ -34,30 +33,27 @@ def _build_frame_labels(
 
 
 class HIVAUDataset(Dataset):
-    """HIVAU-70K — per-video clip sequences.
+    """HIVAU-70K — per-chunk window sequences.
 
-    Each ``__getitem__`` returns:
-        ``frames``: ``[T, total_sampled_frames, C, H, W]``  raw pixels.
-        ``labels``: ``[T]``  binary (1 = anomaly in this clip).
-        ``video_path``: str.
+    Each ``__getitem__`` returns a fixed-size chunk of ``max_windows``
+    consecutive clips (the last chunk may be shorter, padded with
+    ``valid_mask == 0``).
 
     Args:
-        annotation_path: path to ``*_database_*.json``.
+        annotation_path: ``*_database_*.json``.
         video_root: directory containing .mp4 files.
-        total_sampled_frames: frames per clip.  Default 8.
-        sample_interval: stride between sampled frames (original units).
-                         Default 4.
-        max_windows: max consecutive clips per sample.  Long videos are
-                    randomly truncated to this many clips.  Default 32.
-        fps: fallback frame rate when annotation lacks ``fps``.
+        total_sampled_frames: frames per clip.  Default 20.
+        sample_interval: stride inside a clip.  Default 1 (consecutive).
+        max_windows: max clips per chunk.  Default 32.
+        fps: fallback frame rate.
     """
 
     def __init__(
         self,
         annotation_path: str | Path,
         video_root: str | Path,
-        total_sampled_frames: int = 8,
-        sample_interval: int = 4,
+        total_sampled_frames: int = 20,
+        sample_interval: int = 1,
         max_windows: int = 32,
         fps: float = 30.0,
     ):
@@ -67,13 +63,16 @@ class HIVAUDataset(Dataset):
         self.sample_interval = sample_interval
         self.max_windows = max_windows
         self.fps = fps
-        self.clip_span = total_sampled_frames * sample_interval   # original frames
+        self.clip_span = total_sampled_frames * sample_interval
 
         # ---- load annotations ----
         with open(annotation_path, "r") as f:
             raw = json.load(f)
 
+        # ---- pre-compute per-video clip labels, then chunk ----
         self.samples: List[dict] = []
+        total_windows_all = 0
+
         for video_name, meta in raw.items():
             n = meta["n_frames"]
             if n < self.clip_span:
@@ -85,29 +84,62 @@ class HIVAUDataset(Dataset):
             frame_labels = _build_frame_labels(
                 n, meta.get("fps", fps), meta.get("events", [])
             )
-            # pre-compute clip labels
-            clip_labels: List[float] = []
-            clip_binary: List[int] = []
+            # per-clip soft + hard labels
+            clip_soft: List[float] = []
+            clip_bin: List[int] = []
             n_clips = 0
             for start in range(0, n - self.clip_span + 1, self.clip_span):
                 clip_fl = frame_labels[
                     start : start + self.clip_span : sample_interval
                 ]
-                clip_labels.append(float(clip_fl.mean()))            # soft ratio
-                clip_binary.append(1 if clip_fl.any() else 0)       # hard for AUC
+                clip_soft.append(float(clip_fl.mean()))
+                clip_bin.append(1 if clip_fl.any() else 0)
                 n_clips += 1
 
             if n_clips == 0:
                 continue
 
-            self.samples.append({
-                "video_path": str(video_path),
-                "n_frames": n,
-                "fps": meta.get("fps", fps),
-                "clip_labels": clip_labels,           # list[float], soft ratio
-                "clip_binary": clip_binary,           # list[int], hard label
-                "n_clips": n_clips,
-            })
+            total_windows_all += n_clips
+
+            # ---- chunk into ≤ max_windows segments ----
+            for lo in range(0, n_clips, max_windows):
+                hi = min(lo + max_windows, n_clips)
+                self.samples.append({
+                    "video_path": str(video_path),
+                    "video_id": video_name,
+                    "chunk_start": lo,
+                    "chunk_end": hi,
+                    "n_total_windows": n_clips,
+                    "is_last_chunk": (hi == n_clips),
+                    "clip_soft": clip_soft[lo:hi],
+                    "clip_bin": clip_bin[lo:hi],
+                })
+
+        # ---- sanity checks ----
+        # re-aggregate per-video
+        video_window_counts: Dict[str, int] = {}
+        for s in self.samples:
+            vid = s["video_id"]
+            w = s["chunk_end"] - s["chunk_start"]
+            video_window_counts[vid] = video_window_counts.get(vid, 0) + w
+
+        for video_name, meta in raw.items():
+            if video_name not in video_window_counts:
+                continue
+            n_clips_ref = 0
+            for start in range(0, meta["n_frames"] - self.clip_span + 1, self.clip_span):
+                n_clips_ref += 1
+            assert video_window_counts[video_name] == n_clips_ref, (
+                f"{video_name}: chunks cover {video_window_counts[video_name]} "
+                f"windows, expected {n_clips_ref}"
+            )
+
+        self.total_raw_windows = total_windows_all
+        print(
+            f"HIVAUDataset: {len(self.samples)} chunks from "
+            f"{len(video_window_counts)} videos, "
+            f"{total_windows_all} total windows"
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -120,16 +152,9 @@ class HIVAUDataset(Dataset):
         except ImportError:
             raise ImportError("decord is required for video reading")
 
-        n_total = meta["n_clips"]
-        max_w = min(self.max_windows, n_total)
-
-        # Random consecutive chunk for long videos
-        if n_total > max_w:
-            ci_start = random.randint(0, n_total - max_w)
-        else:
-            ci_start = 0
-
-        ci_end = ci_start + max_w
+        ci_start = meta["chunk_start"]
+        ci_end = meta["chunk_end"]
+        n_actual = ci_end - ci_start
 
         vr = VideoReader(meta["video_path"], ctx=cpu(0))
         total_video_frames = len(vr)
@@ -139,56 +164,51 @@ class HIVAUDataset(Dataset):
             start = ci * self.clip_span
             pts = list(range(start, start + self.clip_span, self.sample_interval))
             pts = [min(p, total_video_frames - 1) for p in pts]
-
-            f = vr.get_batch(pts).asnumpy()                       # [T, H, W, C]
-            f = torch.from_numpy(f).permute(0, 3, 1, 2)          # [T, C, H, W]
+            f = vr.get_batch(pts).asnumpy()
+            f = torch.from_numpy(f).permute(0, 3, 1, 2)       # [F, C, H, W]
             clips.append(f)
 
-        frames = torch.stack(clips, dim=0)                  # [max_w, Tf, C, H, W]
-        chunk_ratio = meta["clip_labels"][ci_start:ci_end]
-        chunk_bin = meta["clip_binary"][ci_start:ci_end]
+        frames = torch.stack(clips, dim=0)                     # [n_actual, F, C, H, W]
+
+        # pad to max_windows
+        if n_actual < self.max_windows:
+            pad = torch.zeros(
+                self.max_windows - n_actual, *frames.shape[1:],
+                dtype=frames.dtype,
+            )
+            frames = torch.cat([frames, pad], dim=0)
+
+        soft = torch.tensor(meta["clip_soft"], dtype=torch.float32)
+        binary = torch.tensor(meta["clip_bin"], dtype=torch.float32)
+        valid = torch.zeros(self.max_windows, dtype=torch.bool)
+        valid[:n_actual] = True
+
+        if n_actual < self.max_windows:
+            soft = F.pad(soft, (0, self.max_windows - n_actual), value=-1.0)
+            binary = F.pad(binary, (0, self.max_windows - n_actual), value=-1.0)
 
         return {
             "video_path": meta["video_path"],
+            "video_id": meta["video_id"],
+            "chunk_start": meta["chunk_start"],
+            "n_total_windows": meta["n_total_windows"],
+            "is_last_chunk": meta["is_last_chunk"],
             "frames": frames,
-            "labels": torch.tensor(chunk_ratio, dtype=torch.float32),   # soft ratio
-            "binary": torch.tensor(chunk_bin, dtype=torch.float32),    # hard for AUC
+            "labels": soft,
+            "binary": binary,
+            "valid_mask": valid,
         }
 
-
 def hivau_collate(batch: List[dict]) -> dict:
-    """Pad uneven clip counts across videos in a batch.
-
-    Pads ``labels`` with ``-1`` (ignore index for BCE) and ``frames``
-    with zeros (masked downstream via labels==-1).
-    """
-    video_paths = [b["video_path"] for b in batch]
-
-    labels_pad = pad_sequence(
-        [b["labels"] for b in batch],
-        batch_first=True,
-        padding_value=-1.0,
-    )                                                         # [B, max_T]
-
-    B = len(batch)
-    max_T = labels_pad.shape[1]
-    # pad frames to max_T  (zero frames → attention mask handles them)
-    frames_list: List[torch.Tensor] = []
-    for b in batch:
-        f = b["frames"]                          # [T, Tf, C, H, W]
-        if f.shape[0] < max_T:
-            pad_shape = (max_T - f.shape[0], *f.shape[1:])
-            pad = torch.zeros(pad_shape, dtype=f.dtype)
-            f = torch.cat([f, pad], dim=0)
-        frames_list.append(f)
-    frames_pad = torch.stack(frames_list, dim=0)              # [B, max_T, Tf, C, H, W]
-
-    # attention / valid mask: True where label != -1
-    valid_mask = labels_pad != -1.0                            # [B, max_T]
-
+    """Standard collate — all items already padded to max_windows."""
     return {
-        "video_path": video_paths,
-        "frames": frames_pad,
-        "labels": labels_pad,
-        "valid_mask": valid_mask,
+        "video_path": [b["video_path"] for b in batch],
+        "video_id": [b["video_id"] for b in batch],
+        "chunk_start": [b["chunk_start"] for b in batch],
+        "n_total_windows": [b["n_total_windows"] for b in batch],
+        "is_last_chunk": [b["is_last_chunk"] for b in batch],
+        "frames": torch.stack([b["frames"] for b in batch], dim=0),
+        "labels": torch.stack([b["labels"] for b in batch], dim=0),
+        "binary": torch.stack([b["binary"] for b in batch], dim=0),
+        "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),
     }

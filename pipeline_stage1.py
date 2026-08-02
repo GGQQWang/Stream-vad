@@ -105,70 +105,61 @@ class StreamingVADModel(nn.Module):
 
     def forward(
         self,
-        frames: torch.Tensor,
-        video_grid_thw: torch.Tensor,
-        per_video_T: List[int],
+        pixel_values: torch.Tensor,              # [total_pixels, 3]  valid clips only
+        video_grid_thw: torch.Tensor,            # [n_valid, 3]
+        valid_mask: torch.Tensor,                # [B, max_w]  bool
         return_stats: bool = False,
     ):
-        """Returns ``(scores, pooled)`` + optional compression stats dict."""
-        # 1. ViT packed forward
+        """Returns ``(scores, pooled)`` where ``scores`` is ``[B, max_w]``."""
+        B, max_w = valid_mask.shape
+        device = valid_mask.device
+
+        n_valid = video_grid_thw.shape[0]
+        if n_valid == 0:
+            scores = torch.zeros(B, max_w, device=device)
+            return (scores, None) if not return_stats else (scores, None, {})
+
+        # 1. ViT packed forward (same as LAVIDA)
         vit_out = self.vit.forward_batch(
-            frames, video_grid_thw, return_stats=return_stats,
+            pixel_values, video_grid_thw, return_stats=return_stats,
         )
         if return_stats:
             tokens, merged_counts, stats = vit_out
         else:
             tokens, merged_counts = vit_out
 
-        # 2. per-clip split
-        T_g_per_clip = video_grid_thw[:, 0].tolist()
+        # 2. per-clip split + spatial compress + pool
+        tg_list = video_grid_thw[:, 0].tolist()
         clip_token_counts: List[int] = []
         ptr = 0
-        for tg in T_g_per_clip:
+        for tg in tg_list:
             count = int(merged_counts[ptr: ptr + tg].sum().item())
             clip_token_counts.append(count)
             ptr += tg
         assert sum(clip_token_counts) == tokens.shape[0]
         clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
 
-        # 3. per-clip: spatial compress → pool → window vector
-        window_vectors: List[torch.Tensor] = []
-        for ct in clip_tokens:
-            compressed, _ = self.spatial(ct)             # [r_i, 3584]
-            window_vectors.append(compressed.mean(dim=0))  # [3584]
-        window_vectors = torch.stack(window_vectors, dim=0)  # [B*T_total, 3584]
+        window_vecs = torch.stack(
+            [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
+        )                                                            # [n_valid, 3584]
 
-        # 4. reshape to [B, max_T, 3584]
-        B = len(per_video_T)
-        max_T = max(per_video_T)
-        device = window_vectors.device
-        pad_val = torch.zeros(1, self.llm_hidden, device=device)
-        batches: List[torch.Tensor] = []
-        pos = 0
-        for t in per_video_T:
-            vecs = window_vectors[pos: pos + t]
-            if t < max_T:
-                vecs = torch.cat([vecs, pad_val.expand(max_T - t, -1)], dim=0)
-            batches.append(vecs)
-            pos += t
-        window_batch = torch.stack(batches, dim=0)         # [B, max_T, 3584]
+        # 3. scatter to [B, max_w, 3584]
+        valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
+        window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
+        window_batch[valid_b, valid_w] = window_vecs
 
-        # 5. SSM + residual (semantic fidelity: preserve ViT content)
-        ssm_out = self.ssm(window_batch)                   # [B, max_T, llm_hidden]
-        ssm_out = ssm_out + window_batch                    # residual: delta only
+        # 4. SSM + residual
+        ssm_out = self.ssm(window_batch)
+        ssm_out = ssm_out + window_batch
 
-        # 6. adapter: SSM dim → LLM embedding space
-        llm_embeds = self.adapter(ssm_out)                 # [B, max_T, llm_hidden]
-
-        # 7. LLM (inputs_embeds, full bidirectional)
-        attn_mask = torch.ones(B, max_T, device=device)
+        # 5. adapter → LLM → score head
+        llm_embeds = self.adapter(ssm_out)
+        attn_mask = torch.ones(B, max_w, device=device)
         llm_out = self.llm(
-            inputs_embeds=llm_embeds,
-            attention_mask=attn_mask,
-        ).last_hidden_state                                 # [B, max_T, llm_hidden]
+            inputs_embeds=llm_embeds, attention_mask=attn_mask,
+        ).last_hidden_state
+        scores = self.score_head(llm_out).squeeze(-1)              # [B, max_w]
 
-        # 7. score head
-        scores = self.score_head(llm_out).squeeze(-1)      # [B, max_T]
         if return_stats:
             return scores, window_batch, stats
         return scores, window_batch
@@ -196,53 +187,62 @@ def validate(
     all_labels: List[int] = []
     total_loss = 0.0
     n_valid = 0
+    chunk_preds: dict = {}  # video_id → {window_idx → score}
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        frames_list = batch["frames"]
-        labels_list = batch["binary"]                    # hard 0/1 for AUC
-        per_video_T = [f.shape[0] for f in frames_list if f.shape[0] > 0]
-        if not per_video_T:
+        frames = batch["frames"]                         # [B, max_w, F, C, H, W]
+        binary = batch["binary"]                         # [B, max_w]
+        valid_mask = batch["valid_mask"].to(device)      # [B, max_w]
+
+        B, max_w = frames.shape[:2]
+
+        # extract valid clips
+        all_clips: List[torch.Tensor] = []
+        for b in range(B):
+            for w in range(max_w):
+                if valid_mask[b, w]:
+                    all_clips.append(frames[b, w])
+
+        if not all_clips:
             continue
 
-        # flat list of clips (no cat — different videos can differ in H,W)
-        all_videos: List[torch.Tensor] = []
-        all_labels_list: List[torch.Tensor] = []
-        for f, l in zip(frames_list, labels_list):
-            if f.shape[0] == 0:
-                continue
-            for clip in f:
-                all_videos.append(clip)               # [F, C, H, W]
-            all_labels_list.append(l)
-        all_labels_t = torch.cat(all_labels_list, dim=0)
-
-        # processor on CPU
         processed = processor(
-            videos=all_videos,
+            videos=all_clips,
             return_tensors="pt",
             size={"height": 448, "width": 448},
         )
         pixel_vals = processed["pixel_values_videos"].to(device)
         grid_thw = processed["video_grid_thw"].to(device)
+        binary = binary.to(device)
 
-        scores, _ = model(pixel_vals, grid_thw, per_video_T)
+        scores, _ = model(pixel_vals, grid_thw, valid_mask)
 
-        B = len(per_video_T)
-        max_T = max(per_video_T)
-        label_mat = torch.full((B, max_T), -1.0, device=device)
-        pos = 0
-        for bi, t in enumerate(per_video_T):
-            label_mat[bi, :t] = all_labels_t[pos: pos + t]
-            pos += t
-        valid = label_mat >= 0
-
+        valid = valid_mask & (binary >= 0)
         loss = F.binary_cross_entropy_with_logits(
-            scores[valid], label_mat[valid], pos_weight=pos_weight
+            scores[valid], binary[valid], pos_weight=pos_weight,
         )
         total_loss += loss.item() * valid.sum().item()
         n_valid += valid.sum().item()
 
         all_scores.extend(scores[valid].cpu().tolist())
-        all_labels.extend(label_mat[valid].long().cpu().tolist())
+        all_labels.extend(binary[valid].long().cpu().tolist())
+
+        # accumulate per-video predictions for reconstruction
+        for b in range(B):
+            vid = batch["video_id"][b]
+            cs = batch["chunk_start"][b]
+            ntw = batch["n_total_windows"][b]
+            for w in range(max_w):
+                if valid_mask[b, w]:
+                    chunk_preds.setdefault(vid, {})[cs + w] = scores[b, w].item()
+
+    # sanity: per-video window coverage
+    for vid, preds in chunk_preds.items():
+        n_expected = max(preds.keys()) + 1
+        n_got = len(preds)
+        assert n_got == n_expected, (
+            f"{vid}: predicted {n_got} windows, expected {n_expected}"
+        )
 
     model.train()
 
@@ -336,20 +336,13 @@ def main():
         max_windows=args.max_windows,
     )
 
-    def collate_videos(batch: List[dict]) -> dict:
-        """Keep each video as a separate tensor — no pixel padding."""
-        return {
-            "video_path": [b["video_path"] for b in batch],
-            "frames": [b["frames"] for b in batch],
-            "labels": [b["labels"] for b in batch],    # soft ratio
-            "binary": [b["binary"] for b in batch],    # hard 0/1 for eval
-        }
+    from hivau_dataset import hivau_collate  # noqa: E402
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        collate_fn=collate_videos,
+        collate_fn=hivau_collate,
     )
 
     # ---- pos_weight for class imbalance ----
@@ -373,7 +366,7 @@ def main():
         )
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size,
-            shuffle=False, collate_fn=collate_videos,
+            shuffle=False, collate_fn=hivau_collate,
         )
         print(f"Val videos: {len(val_ds)}")
 
@@ -402,33 +395,22 @@ def main():
         clip_anomaly_ratios: List[float] = []
 
         for step, batch in enumerate(pbar):
-            frames_list: List[torch.Tensor] = []
-            labels_list: List[torch.Tensor] = []
-            binary_list: List[torch.Tensor] = []
-            per_video_T: List[int] = []
+            frames = batch["frames"]                         # [B, max_w, F, C, H, W]
+            labels = batch["labels"]                         # [B, max_w] soft
+            binary = batch["binary"]                        # [B, max_w] hard
+            valid_mask = batch["valid_mask"].to(device)     # [B, max_w] bool
 
-            for i in range(len(batch["frames"])):
-                f = batch["frames"][i]                       # [T, F, C, H, W]
-                l = batch["labels"][i]                       # [T] soft ratio
-                b = batch["binary"][i]                       # [T] hard 0/1
-                T = f.shape[0]
-                if T == 0:
-                    continue
-                per_video_T.append(T)
-                frames_list.append(f)
-                labels_list.append(l)
-                binary_list.append(b)
+            B, max_w = frames.shape[:2]
 
-            if not frames_list:
-                continue
-
-            # flat clip list (no cat — different resolutions safe)
+            # extract valid clips → flat list for processor
             all_clips: List[torch.Tensor] = []
-            for video_frames in frames_list:
-                for clip in video_frames:
-                    all_clips.append(clip)                  # [F, C, H, W]
-            all_labels = torch.cat(labels_list, dim=0)
-            all_binary = torch.cat(binary_list, dim=0)
+            for b in range(B):
+                for w in range(max_w):
+                    if valid_mask[b, w]:
+                        all_clips.append(frames[b, w])      # [F, C, H, W]
+
+            if not all_clips:
+                continue
 
             processed = processor(
                 videos=all_clips,
@@ -437,21 +419,16 @@ def main():
             )
             pixel_vals = processed["pixel_values_videos"].to(device)
             grid_thw = processed["video_grid_thw"].to(device)
+            labels = labels.to(device)
+            binary = binary.to(device)
 
             with torch.autocast(device_type=device.type, dtype=dtype):
-                fwd_out = model(pixel_vals, grid_thw, per_video_T, return_stats=True)
-                scores, _, stats = fwd_out
+                fwd_out = model(pixel_vals, grid_thw, valid_mask, return_stats=True)
+                scores, _, stats = fwd_out                  # [B, max_w]
 
-                max_T = max(per_video_T)
-                label_mat = torch.full((len(per_video_T), max_T), -1.0, device=device)
-                pos = 0
-                for bi, t in enumerate(per_video_T):
-                    label_mat[bi, :t] = all_labels[pos: pos + t]
-                    pos += t
-                valid = label_mat >= 0
-
+                valid = valid_mask & (labels >= 0)
                 loss = F.binary_cross_entropy_with_logits(
-                    scores[valid], label_mat[valid], pos_weight=pos_weight,
+                    scores[valid], labels[valid], pos_weight=pos_weight,
                 )
 
             loss = loss / args.grad_accum
@@ -467,18 +444,19 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-            # track per-batch stats for TensorBoard
+            # track per-batch stats
             with torch.no_grad():
                 train_losses.append(loss.item() * args.grad_accum)
-                valid_scores = scores[valid].cpu()        # [sum(T_i)]
-                pos_mask = all_binary > 0
-                if pos_mask.any():
-                    train_pos_scores.extend(valid_scores[pos_mask].tolist())
-                if (~pos_mask).any():
-                    train_neg_scores.extend(valid_scores[~pos_mask].tolist())
+                vs = scores[valid].cpu()
+                bl = binary[valid].cpu()
+                pos_m = bl > 0
+                if pos_m.any():
+                    train_pos_scores.extend(vs[pos_m].tolist())
+                if (~pos_m).any():
+                    train_neg_scores.extend(vs[~pos_m].tolist())
                 # compression stats
                 clip_keep_ratios.extend(stats["clip_keep_ratios"])
-                clip_anomaly_ratios.extend(all_labels.cpu().tolist())
+                clip_anomaly_ratios.extend(labels[valid].cpu().tolist())
 
             pbar.set_postfix(
                 loss=sum(train_losses[-10:]) / min(10, len(train_losses))
