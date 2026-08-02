@@ -23,7 +23,7 @@ Architecture:
 import argparse
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -62,7 +62,7 @@ def _find_visual(model: Qwen2VLForConditionalGeneration) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 class StreamingVADModel(nn.Module):
-    """ViT → spatial → pool → SSM → adapter → LLM → score head."""
+    """ViT → spatial → per-clip pool → SSM → LLM → score head."""
 
     def __init__(
         self,
@@ -78,7 +78,13 @@ class StreamingVADModel(nn.Module):
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
         self.ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
-                            n_layers=n_ssm, llm_hidden=llm_hidden)
+                            n_layers=n_ssm, llm_hidden=llm_hidden)  # same dim as input
+        self.adapter = nn.Sequential(
+            nn.Linear(llm_hidden, llm_hidden),
+            nn.GELU(),
+            nn.Linear(llm_hidden, llm_hidden),
+            nn.LayerNorm(llm_hidden),
+        )
         self.score_head = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden // 4),
             nn.GELU(),
@@ -86,38 +92,40 @@ class StreamingVADModel(nn.Module):
         )
         self.llm_hidden = llm_hidden
 
+        # Reference to the LLM transformer (set by trainer after init)
+        self.llm: Optional[nn.Module] = None
+
     def forward(
         self,
-        frames: torch.Tensor,                    # [B*T, F, C, H, W]
-        video_grid_thw: torch.Tensor,            # [B*T, 3]
+        frames: torch.Tensor,                    # [B*T_total, F, C, H, W]
+        video_grid_thw: torch.Tensor,            # [B*T_total, 3]
         per_video_T: List[int],                  # true T per video
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(scores, pooled)`` where ``scores`` is [B, max_T]."""
         # 1. ViT packed forward
-        pixel_values = frames.flatten(0, 1) if frames.dim() == 6 else frames
-        # frames are already raw pixels — reshape if needed
         tokens, merged_counts = self.vit.forward_batch(
-            pixel_values.flatten(1, -3)          # hack: needs proper pixel reshape
-            if pixel_values.dim() > 3 else pixel_values,
-            video_grid_thw,
+            frames, video_grid_thw,
         )                                        # [L, 3584]
 
-        # 2. per-clip split  (same logic as user spec §3)
-        T_g_per_clip = video_grid_thw[:, 0].tolist()          # list[int], len = B*T_total
-        seqlens_per_clip = []
+        # 2. per-clip split
+        T_g_per_clip = video_grid_thw[:, 0].tolist()
+        clip_token_counts: List[int] = []
         ptr = 0
         for tg in T_g_per_clip:
-            seqlens_per_clip.append(merged_counts[ptr: ptr + tg.item()].sum().item())
-            ptr += tg.item()
-        clip_token_counts = [(s + 3) // 4 for s in seqlens_per_clip]  # ceil(/4)
+            count = int(merged_counts[ptr: ptr + tg].sum().item())
+            clip_token_counts.append(count)
+            ptr += tg
+        assert sum(clip_token_counts) == tokens.shape[0]
+        clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
 
-        clip_tokens = torch.split(tokens, clip_token_counts, dim=0)   # list of [n_i, 3584]
+        # 3. per-clip: spatial compress → pool → window vector
+        window_vectors: List[torch.Tensor] = []
+        for ct in clip_tokens:
+            compressed, _ = self.spatial(ct)             # [r_i, 3584]
+            window_vectors.append(compressed.mean(dim=0))  # [3584]
+        window_vectors = torch.stack(window_vectors, dim=0)  # [B*T_total, 3584]
 
-        window_vectors = torch.stack(
-            [ct.mean(dim=0) for ct in clip_tokens], dim=0
-        )                                                            # [B*T_total, 3584]
-
-        # 3. reshape to batched windows  [B, max_T, 3584]
+        # 4. reshape to [B, max_T, 3584]
         B = len(per_video_T)
         max_T = max(per_video_T)
         device = window_vectors.device
@@ -125,18 +133,29 @@ class StreamingVADModel(nn.Module):
         batches: List[torch.Tensor] = []
         pos = 0
         for t in per_video_T:
-            vecs = window_vectors[pos: pos + t]                      # [t, 3584]
+            vecs = window_vectors[pos: pos + t]
             if t < max_T:
                 vecs = torch.cat([vecs, pad_val.expand(max_T - t, -1)], dim=0)
             batches.append(vecs)
             pos += t
-        window_batch = torch.stack(batches, dim=0)                   # [B, max_T, 3584]
+        window_batch = torch.stack(batches, dim=0)         # [B, max_T, 3584]
 
-        # 4. SSM
-        ssm_out = self.ssm(window_batch)                             # [B, max_T, llm_hidden]
+        # 5. SSM + residual (semantic fidelity: preserve ViT content)
+        ssm_out = self.ssm(window_batch)                   # [B, max_T, llm_hidden]
+        ssm_out = ssm_out + window_batch                    # residual: delta only
 
-        # 5. score head
-        scores = self.score_head(ssm_out).squeeze(-1)                # [B, max_T]
+        # 6. adapter: SSM dim → LLM embedding space
+        llm_embeds = self.adapter(ssm_out)                 # [B, max_T, llm_hidden]
+
+        # 7. LLM (inputs_embeds, full bidirectional)
+        attn_mask = torch.ones(B, max_T, device=device)
+        llm_out = self.llm(
+            inputs_embeds=llm_embeds,
+            attention_mask=attn_mask,
+        ).last_hidden_state                                 # [B, max_T, llm_hidden]
+
+        # 7. score head
+        scores = self.score_head(llm_out).squeeze(-1)      # [B, max_T]
         return scores, window_batch
 
 
@@ -199,6 +218,12 @@ def main():
         qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
     ).to(device)
 
+    # Set LLM transformer (LoRA-aware path so LoRA layers get gradients)
+    if hasattr(qwen, "base_model"):
+        model.llm = qwen.base_model.model.model   # PeftModel → Qwen2VLModel
+    else:
+        model.llm = qwen.model.model               # bare Qwen2VLForConditionalGeneration
+
     # ---- data ----
     train_ds = HIVAUDataset(
         args.train_json, args.video_root,
@@ -243,7 +268,7 @@ def main():
                 continue
 
             # flatten to [B*T, F, C, H, W]
-            all_frames = torch.cat(frames_list, dim=0).to(device)
+            all_frames = torch.cat(frames_list, dim=0)  # keep on CPU for processor
             all_labels = torch.cat(labels_list, dim=0)
 
             # ---- processor: resize + grid_thw ----
