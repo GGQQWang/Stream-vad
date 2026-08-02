@@ -77,13 +77,12 @@ class TemporalTokenReducer(nn.Module):
                 avg_diff = diffs[1:].mean(dim=0)              # [h*w//s]
                 static = avg_diff < self.threshold            # [h*w//s]
 
-                mask_coarse = torch.ones(t, h * w // s, device=device)
-                mask_coarse[1:, static] = 0.0
-                # upsample mask back to original patch resolution
+                mask_coarse = torch.ones(t, h * w // s, device=device, dtype=torch.bool)
+                mask_coarse[1:, static] = False
                 mask = torch.repeat_interleave(mask_coarse, s, dim=1)
                 mask = mask.reshape(t, h, w)                  # [t, h, w]
             else:
-                mask = torch.ones(t, h, w, device=device)
+                mask = torch.ones(t, h, w, device=device, dtype=torch.bool)
 
             all_masks.append(mask.flatten())                  # [t*h*w]
             counts = mask.reshape(t, -1).sum(dim=1).int()     # [t]

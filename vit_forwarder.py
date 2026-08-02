@@ -8,12 +8,10 @@ Qwen2-VL's ViT transformer blocks and merger.  Two modes:
 - ``forward_streaming()`` inference: pre-filtered patches → ViT blocks
                          → merger.
 
-Handles both old ``rotary_pos_emb`` and new ``position_embeddings=(cos,sin)``
-ViT-block APIs, and both single-tensor / tuple return from ``rot_pos_emb()``.
+Tested with transformers==4.46.2 (``rotary_pos_emb`` API).
 """
 
-import inspect
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -22,32 +20,11 @@ import torch.nn.functional as F
 from .temporal import TemporalTokenReducer
 
 
-def _detect_vit_api(visual: nn.Module) -> str:
-    """Check which keyword the ViT blocks expect."""
-    sig = inspect.signature(visual.blocks[0].forward)
-    if "position_embeddings" in sig.parameters:
-        return "position_embeddings"
-    return "rotary_pos_emb"
-
-
-def _to_position_embeddings(rotary: torch.Tensor):
-    """Convert a flat RoPE tensor to ``(cos, sin)`` if needed.
-
-    Some Qwen2-VL versions return ``(cos, sin)`` from rot_pos_emb(),
-    others return a single concatenated tensor.  Normalise here.
-    """
-    if isinstance(rotary, tuple):
-        return rotary                     # already (cos, sin)
-    # Legacy single-tensor format — split along last dim
-    cos, sin = rotary.chunk(2, dim=-1)
-    return cos, sin
-
-
 class ViTForwarder(nn.Module):
     """Qwen2-VL ViT blocks + merger, batch & streaming.
 
     Args:
-        visual: Qwen2-VL ``self.visual`` module (from a loaded model).
+        visual: Qwen2-VL ``self.visual`` module.
         temporal_reducer: TemporalTokenReducer for batch mode.
     """
 
@@ -59,7 +36,6 @@ class ViTForwarder(nn.Module):
         super().__init__()
         self.visual = visual
         self.temporal_reducer = temporal_reducer or TemporalTokenReducer()
-        self._block_api = _detect_vit_api(visual)  # "rotary_pos_emb" or "position_embeddings"
 
     # ------------------------------------------------------------------
     # Batch mode (training: uniform clip sampling)
@@ -68,32 +44,54 @@ class ViTForwarder(nn.Module):
         self,
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_stats: bool = False,
+    ):
         """Process a batch of video clips.
 
         Args:
             pixel_values: ``[total_pixels, C=3]``.
             grid_thw: ``[B, 3]``  rows ``(t_frames, h, w)``.
+            return_stats: if True, also return a compression-stats dict.
 
         Returns:
             visual_tokens:  ``[total_tokens, D_llm]``.
             merged_counts:  ``[sum(t_i)]``  tokens / frame post-merger.
+            stats (only if return_stats): dict with per-clip keep_ratios
+                  and per-clip anomaly-friendly breakdown.
         """
         patches = self.visual.patch_embed(pixel_values)          # [total, 1280]
-        rotary_raw = self.visual.rot_pos_emb(grid_thw)           # tensor or (cos,sin)
+        rotary = self.visual.rot_pos_emb(grid_thw)               # [total, 1280]
 
         mask, seqlens = self.temporal_reducer(patches, grid_thw)
 
-        patches = patches[mask.bool()]
-        rotary_raw = self._slice_rotary(rotary_raw, mask)
+        patches = patches[mask]
+        rotary = rotary[mask]
 
         cu = F.pad(seqlens.cumsum(dim=0), (1, 0), value=0).int()
 
-        patches = self._run_blocks(patches, cu, rotary_raw)
+        for blk in self.visual.blocks:
+            patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
 
         tokens = self.visual.merger(patches)                     # [L/4, D_llm]
         merged_counts = torch.ceil(seqlens.float() / 4).int()
-        return tokens, merged_counts
+
+        result = (tokens, merged_counts)
+
+        if return_stats:
+            # per-clip keep ratios
+            tg_list = grid_thw[:, 0].tolist()                    # list[int]
+            ptr = 0
+            clip_ratios: List[float] = []
+            for tg in tg_list:
+                n = tg * grid_thw[0, 1].item() * grid_thw[0, 2].item()
+                clip_ratios.append(mask[ptr: ptr + n].float().mean().item())
+                ptr += n
+            result = result + ({
+                "keep_mask": mask.cpu(),
+                "clip_keep_ratios": clip_ratios,
+            },)
+
+        return result
 
     # ------------------------------------------------------------------
     # Streaming mode (inference: adaptive flush)
@@ -116,42 +114,11 @@ class ViTForwarder(nn.Module):
         Returns:
             visual_tokens: ``[L/4, D_llm]``.
         """
-        rotary_full = self.visual.rot_pos_emb(grid_thw)          # [N_full, ...]
-        rotary_sel = self._slice_rotary(rotary_full, all_indices)
+        rotary_full = self.visual.rot_pos_emb(grid_thw)          # [N_full, 1280]
+        rotary = rotary_full[all_indices]                         # [L, 1280]
 
-        all_patches = self._run_blocks(all_patches, cu_seqlens, rotary_sel)
+        for blk in self.visual.blocks:
+            all_patches = blk(
+                all_patches, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary,
+            )
         return self.visual.merger(all_patches)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _run_blocks(
-        self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run all ViT blocks, adapting to the detected API."""
-        if self._block_api == "position_embeddings":
-            pos = _to_position_embeddings(rotary)
-            for blk in self.visual.blocks:
-                x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=pos)
-        else:
-            for blk in self.visual.blocks:
-                x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary)
-        return x
-
-    @staticmethod
-    def _slice_rotary(
-        rotary,
-        mask_or_indices: torch.Tensor,
-    ):
-        """Select positions from a RoPE tensor (handles both formats)."""
-        if isinstance(rotary, tuple):
-            # (cos, sin) — index each
-            idx = mask_or_indices
-            if idx.dtype == torch.bool:
-                idx = torch.where(idx)[0]
-            return (rotary[0][idx], rotary[1][idx])
-        # flat tensor
-        return rotary[mask_or_indices]

@@ -9,6 +9,7 @@ Collate:  ``hivau_collate`` pads uneven clip counts to ``max_T`` per batch.
 """
 
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -46,6 +47,8 @@ class HIVAUDataset(Dataset):
         total_sampled_frames: frames per clip.  Default 8.
         sample_interval: stride between sampled frames (original units).
                          Default 4.
+        max_windows: max consecutive clips per sample.  Long videos are
+                    randomly truncated to this many clips.  Default 32.
         fps: fallback frame rate when annotation lacks ``fps``.
     """
 
@@ -55,12 +58,14 @@ class HIVAUDataset(Dataset):
         video_root: str | Path,
         total_sampled_frames: int = 8,
         sample_interval: int = 4,
+        max_windows: int = 32,
         fps: float = 30.0,
     ):
         super().__init__()
         self.video_root = Path(video_root)
         self.total_frames = total_sampled_frames
         self.sample_interval = sample_interval
+        self.max_windows = max_windows
         self.fps = fps
         self.clip_span = total_sampled_frames * sample_interval   # original frames
 
@@ -81,13 +86,15 @@ class HIVAUDataset(Dataset):
                 n, meta.get("fps", fps), meta.get("events", [])
             )
             # pre-compute clip labels
-            clip_labels: List[int] = []
+            clip_labels: List[float] = []
+            clip_binary: List[int] = []
             n_clips = 0
             for start in range(0, n - self.clip_span + 1, self.clip_span):
                 clip_fl = frame_labels[
                     start : start + self.clip_span : sample_interval
                 ]
-                clip_labels.append(1 if clip_fl.any() else 0)
+                clip_labels.append(float(clip_fl.float().mean()))   # soft ratio
+                clip_binary.append(1 if clip_fl.any() else 0)       # hard for AUC
                 n_clips += 1
 
             if n_clips == 0:
@@ -97,7 +104,8 @@ class HIVAUDataset(Dataset):
                 "video_path": str(video_path),
                 "n_frames": n,
                 "fps": meta.get("fps", fps),
-                "clip_labels": clip_labels,           # list[int], len = T
+                "clip_labels": clip_labels,           # list[float], soft ratio
+                "clip_binary": clip_binary,           # list[int], hard label
                 "n_clips": n_clips,
             })
 
@@ -112,11 +120,22 @@ class HIVAUDataset(Dataset):
         except ImportError:
             raise ImportError("decord is required for video reading")
 
+        n_total = meta["n_clips"]
+        max_w = min(self.max_windows, n_total)
+
+        # Random consecutive chunk for long videos
+        if n_total > max_w:
+            ci_start = random.randint(0, n_total - max_w)
+        else:
+            ci_start = 0
+
+        ci_end = ci_start + max_w
+
         vr = VideoReader(meta["video_path"], ctx=cpu(0))
         total_video_frames = len(vr)
 
         clips: List[torch.Tensor] = []
-        for ci in range(meta["n_clips"]):
+        for ci in range(ci_start, ci_end):
             start = ci * self.clip_span
             pts = list(range(start, start + self.clip_span, self.sample_interval))
             pts = [min(p, total_video_frames - 1) for p in pts]
@@ -125,13 +144,15 @@ class HIVAUDataset(Dataset):
             f = torch.from_numpy(f).permute(0, 3, 1, 2)          # [T, C, H, W]
             clips.append(f)
 
-        frames = torch.stack(clips, dim=0)                  # [T, Tf, C, H, W]
-        labels = torch.tensor(meta["clip_labels"], dtype=torch.float32)  # [T]
+        frames = torch.stack(clips, dim=0)                  # [max_w, Tf, C, H, W]
+        chunk_ratio = meta["clip_labels"][ci_start:ci_end]
+        chunk_bin = meta["clip_binary"][ci_start:ci_end]
 
         return {
             "video_path": meta["video_path"],
             "frames": frames,
-            "labels": labels,
+            "labels": torch.tensor(chunk_ratio, dtype=torch.float32),   # soft ratio
+            "binary": torch.tensor(chunk_bin, dtype=torch.float32),    # hard for AUC
         }
 
 

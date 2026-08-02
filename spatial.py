@@ -92,7 +92,7 @@ class SpatialTokenCompressor(nn.Module):
 
         # attention within each cluster
         attn = centres @ embeds.t() / scale                     # [R, L]
-        attn = -attn                                            # closer → higher
+        attn = -attn                                            # negate: dot → distance proxy
         attn = attn.masked_fill(~cluster_mask, -1e9)
         weights = torch.softmax(attn, dim=1)                    # [R, L]
         merged = weights @ embeds                               # [R, C]

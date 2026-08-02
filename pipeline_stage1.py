@@ -21,16 +21,24 @@ Architecture:
 """
 
 import argparse
+import math
 import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+try:
+    from sklearn.metrics import roc_auc_score, average_precision_score
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -97,15 +105,20 @@ class StreamingVADModel(nn.Module):
 
     def forward(
         self,
-        frames: torch.Tensor,                    # [B*T_total, F, C, H, W]
-        video_grid_thw: torch.Tensor,            # [B*T_total, 3]
-        per_video_T: List[int],                  # true T per video
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(scores, pooled)`` where ``scores`` is [B, max_T]."""
+        frames: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        per_video_T: List[int],
+        return_stats: bool = False,
+    ):
+        """Returns ``(scores, pooled)`` + optional compression stats dict."""
         # 1. ViT packed forward
-        tokens, merged_counts = self.vit.forward_batch(
-            frames, video_grid_thw,
-        )                                        # [L, 3584]
+        vit_out = self.vit.forward_batch(
+            frames, video_grid_thw, return_stats=return_stats,
+        )
+        if return_stats:
+            tokens, merged_counts, stats = vit_out
+        else:
+            tokens, merged_counts = vit_out
 
         # 2. per-clip split
         T_g_per_clip = video_grid_thw[:, 0].tolist()
@@ -156,12 +169,98 @@ class StreamingVADModel(nn.Module):
 
         # 7. score head
         scores = self.score_head(llm_out).squeeze(-1)      # [B, max_T]
+        if return_stats:
+            return scores, window_batch, stats
         return scores, window_batch
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def validate(
+    model: StreamingVADModel,
+    loader: DataLoader,
+    processor: Qwen2VLProcessor,
+    device: torch.device,
+    pos_weight: torch.Tensor,
+) -> dict:
+    """Return ``{auc, ap, loss, pos_score, neg_score}``."""
+    model.eval()
+    all_scores: List[float] = []
+    all_labels: List[int] = []
+    total_loss = 0.0
+    n_valid = 0
+
+    for batch in tqdm(loader, desc="Val", leave=False):
+        frames_list = batch["frames"]
+        labels_list = batch["binary"]                    # hard 0/1 for AUC
+        per_video_T = [f.shape[0] for f in frames_list if f.shape[0] > 0]
+        if not per_video_T:
+            continue
+
+        all_frames = torch.cat(
+            [f for f in frames_list if f.shape[0] > 0], dim=0
+        )
+        all_labels_t = torch.cat(
+            [l for i, l in enumerate(labels_list)
+             if frames_list[i].shape[0] > 0], dim=0
+        )
+
+        # processor on CPU
+        processed = processor(
+            videos=list(all_frames.unbind(0)),
+            return_tensors="pt",
+            size={"height": 448, "width": 448},
+        )
+        pixel_vals = processed["pixel_values_videos"].to(device)
+        grid_thw = processed["video_grid_thw"].to(device)
+
+        scores, _ = model(pixel_vals, grid_thw, per_video_T)
+
+        B = len(per_video_T)
+        max_T = max(per_video_T)
+        label_mat = torch.full((B, max_T), -1.0, device=device)
+        pos = 0
+        for bi, t in enumerate(per_video_T):
+            label_mat[bi, :t] = all_labels_t[pos: pos + t]
+            pos += t
+        valid = label_mat >= 0
+
+        loss = F.binary_cross_entropy_with_logits(
+            scores[valid], label_mat[valid], pos_weight=pos_weight
+        )
+        total_loss += loss.item() * valid.sum().item()
+        n_valid += valid.sum().item()
+
+        all_scores.extend(scores[valid].cpu().tolist())
+        all_labels.extend(label_mat[valid].long().cpu().tolist())
+
+    model.train()
+
+    scores_arr = np.array(all_scores)
+    labels_arr = np.array(all_labels)
+
+    metrics = {"loss": total_loss / max(n_valid, 1)}
+    pos_mask = labels_arr == 1
+    neg_mask = labels_arr == 0
+    metrics["pos_score"] = scores_arr[pos_mask].mean().item() if pos_mask.any() else 0.0
+    metrics["neg_score"] = scores_arr[neg_mask].mean().item() if neg_mask.any() else 0.0
+
+    if HAS_SKLEARN:
+        metrics["auc"] = roc_auc_score(labels_arr, scores_arr) if len(set(labels_arr)) > 1 else 0.5
+        metrics["ap"] = average_precision_score(labels_arr, scores_arr) if len(set(labels_arr)) > 1 else 0.0
+    else:
+        metrics["auc"] = 0.5
+        metrics["ap"] = 0.0
+
+    return metrics
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -179,21 +278,23 @@ def main():
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--d-ssm", type=int, default=256)
     parser.add_argument("--frames-per-clip", type=int, default=20)
+    parser.add_argument("--max-windows", type=int, default=32,
+                       help="max consecutive clips per video sample")
     parser.add_argument("--image-size", type=int, default=448)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--precision", default="bf16")
     parser.add_argument("--save-every", type=int, default=1)
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
+    assert device.type == "cuda", "Stage-1 requires CUDA"
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
 
     # ---- model ----
     print("Loading Qwen2-VL ...")
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.precision]
+    dtype = torch.bfloat16
     qwen = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_path, torch_dtype=dtype,
         device_map=None, low_cpu_mem_usage=True,
@@ -228,97 +329,203 @@ def main():
     train_ds = HIVAUDataset(
         args.train_json, args.video_root,
         total_sampled_frames=args.frames_per_clip,
-        sample_interval=1,              # every frame within the clip span
+        sample_interval=1,
+        max_windows=args.max_windows,
     )
-    train_loader = DataLoader(train_ds, shuffle=True)
 
-    # ---- optimizer ----
-    trainable = list(model.parameters()) + \
-                [p for p in qwen.parameters() if p.requires_grad]
+    def collate_videos(batch: List[dict]) -> dict:
+        """Keep each video as a separate tensor — no pixel padding."""
+        return {
+            "video_path": [b["video_path"] for b in batch],
+            "frames": [b["frames"] for b in batch],
+            "labels": [b["labels"] for b in batch],    # soft ratio
+            "binary": [b["binary"] for b in batch],    # hard 0/1 for eval
+        }
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate_videos,
+    )
+
+    # ---- pos_weight for class imbalance ----
+    n_pos = sum(
+        sum(b for b in s["clip_binary"]) for s in train_ds.samples
+    )
+    n_neg = sum(
+        sum(1 - b for b in s["clip_binary"]) for s in train_ds.samples
+    )
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+    print(f"Pos/Neg windows: {n_pos} / {n_neg}  (ratio {n_pos/max(n_pos+n_neg,1):.3f})  pos_weight={pos_weight.item():.3f}")
+
+    # ---- validation ----
+    val_loader = None
+    if args.val_json:
+        val_ds = HIVAUDataset(
+            args.val_json, args.video_root,
+            total_sampled_frames=args.frames_per_clip,
+            sample_interval=1,
+            max_windows=args.max_windows,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=args.batch_size,
+            shuffle=False, collate_fn=collate_videos,
+        )
+        print(f"Val videos: {len(val_ds)}")
+
+    # ---- optimizer (model.parameters() already covers LoRA via model.llm) ----
+    trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-5)
-    total_steps = args.epochs * len(train_loader) // args.grad_accum
-    scheduler = get_linear_schedule_with_warmup(optimizer, 100, total_steps)
+    updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    total_steps = args.epochs * updates_per_epoch
+    warmup_steps = max(10, int(0.03 * total_steps))          # 3% of total, min 10
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, warmup_steps, total_steps
+    )
 
     # ---- loop ----
     model.train()
     qwen.train()
     global_step = 0
+    best_auc = 0.0
 
     for epoch in range(args.epochs):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
-        losses = []
+        train_losses: List[float] = []
+        train_pos_scores: List[float] = []
+        train_neg_scores: List[float] = []
+        clip_keep_ratios: List[float] = []
+        clip_anomaly_ratios: List[float] = []
 
         for step, batch in enumerate(pbar):
-            # batch from HIVAUDataset (per-video, no collate pad)
             frames_list: List[torch.Tensor] = []
             labels_list: List[torch.Tensor] = []
+            binary_list: List[torch.Tensor] = []
             per_video_T: List[int] = []
 
-            for i in range(len(batch["frames"])):            # iterate videos in batch
+            for i in range(len(batch["frames"])):
                 f = batch["frames"][i]                       # [T, F, C, H, W]
-                l = batch["labels"][i]                       # [T]
+                l = batch["labels"][i]                       # [T] soft ratio
+                b = batch["binary"][i]                       # [T] hard 0/1
                 T = f.shape[0]
                 if T == 0:
                     continue
                 per_video_T.append(T)
                 frames_list.append(f)
                 labels_list.append(l)
+                binary_list.append(b)
 
             if not frames_list:
                 continue
 
-            # flatten to [B*T, F, C, H, W]
-            all_frames = torch.cat(frames_list, dim=0)  # keep on CPU for processor
+            all_frames = torch.cat(frames_list, dim=0)  # CPU for processor
             all_labels = torch.cat(labels_list, dim=0)
+            all_binary = torch.cat(binary_list, dim=0)
 
-            # ---- processor: resize + grid_thw ----
-            # Convert frames [B*T, F, C, H, W] to list of video tensors
-            # one video per "clip" for the processor
             processed = processor(
-                videos=list(all_frames.unbind(0)),    # list of [F, C, H, W]
+                videos=list(all_frames.unbind(0)),
                 return_tensors="pt",
                 size={"height": args.image_size, "width": args.image_size},
             )
             pixel_vals = processed["pixel_values_videos"].to(device)
-            grid_thw = processed["video_grid_thw"].to(device)    # [B*T, 3]
+            grid_thw = processed["video_grid_thw"].to(device)
 
-            with torch.autocast(device_type="cuda", dtype=dtype):
-                scores, _ = model(pixel_vals, grid_thw, per_video_T)  # [B, max_T]
+            with torch.autocast(device_type=device.type, dtype=dtype):
+                fwd_out = model(pixel_vals, grid_thw, per_video_T, return_stats=True)
+                scores, _, stats = fwd_out
 
-                # build per-window label tensor [B, max_T]
                 max_T = max(per_video_T)
                 label_mat = torch.full((len(per_video_T), max_T), -1.0, device=device)
                 pos = 0
                 for bi, t in enumerate(per_video_T):
                     label_mat[bi, :t] = all_labels[pos: pos + t]
                     pos += t
-
                 valid = label_mat >= 0
+
                 loss = F.binary_cross_entropy_with_logits(
-                    scores[valid], label_mat[valid]
+                    scores[valid], label_mat[valid], pos_weight=pos_weight,
                 )
 
             loss = loss / args.grad_accum
             loss.backward()
 
-            if (step + 1) % args.grad_accum == 0:
+            is_update = (
+                (step + 1) % args.grad_accum == 0
+                or step + 1 == len(train_loader)
+            )
+            if is_update:
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-            losses.append(loss.item() * args.grad_accum)
-            pbar.set_postfix(loss=sum(losses[-10:]) / min(10, len(losses)))
+            # track per-batch stats for TensorBoard
+            with torch.no_grad():
+                train_losses.append(loss.item() * args.grad_accum)
+                bin_mask = all_binary > 0
+                flat = scores.flatten().cpu()
+                if bin_mask.any():
+                    train_pos_scores.extend(flat[bin_mask].tolist())
+                if (~bin_mask).any():
+                    train_neg_scores.extend(flat[~bin_mask].tolist())
+                # compression stats
+                clip_keep_ratios.extend(stats["clip_keep_ratios"])
+                clip_anomaly_ratios.extend(all_labels.cpu().tolist())
 
-        # ---- save ----
+            pbar.set_postfix(
+                loss=sum(train_losses[-10:]) / min(10, len(train_losses))
+            )
+
+        # ---- end of epoch: log & validate ----
+        lr = scheduler.get_last_lr()[0]
+        writer.add_scalar("train/loss", np.mean(train_losses), epoch)
+        writer.add_scalar("train/lr", lr, epoch)
+        if train_pos_scores:
+            writer.add_scalar("train/pos_score", np.mean(train_pos_scores), epoch)
+        if train_neg_scores:
+            writer.add_scalar("train/neg_score", np.mean(train_neg_scores), epoch)
+
+        # compression stats: keep_ratio vs anomaly_ratio
+        if clip_keep_ratios:
+            keep_arr = np.array(clip_keep_ratios)
+            anom_arr = np.array(clip_anomaly_ratios)
+            writer.add_scalar("compress/keep_mean", keep_arr.mean(), epoch)
+
+            # per-bucket breakdown
+            buckets = [(0, 0), (0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)]
+            for lo, hi in buckets:
+                mask = (anom_arr >= lo) & (anom_arr < hi)
+                if mask.any():
+                    tag = f"compress/keep_anom_{lo:.0f}_{hi:.0f}".replace("0.0", "0").replace("1.0", "1")
+                    writer.add_scalar(tag, keep_arr[mask].mean(), epoch)
+
+            # overall stats
+            writer.add_scalar("compress/keep_normal", keep_arr[anom_arr == 0].mean() if (anom_arr == 0).any() else 0, epoch)
+            writer.add_scalar("compress/keep_abnormal", keep_arr[anom_arr > 0].mean() if (anom_arr > 0).any() else 0, epoch)
+
+        ckpt = {
+            "model": model.state_dict(),
+            "qwen_lora": qwen.state_dict(),
+            "epoch": epoch,
+        }
+
+        if val_loader is not None:
+            metrics = validate(model, val_loader, processor, device, pos_weight)
+            print(f"  val loss={metrics['loss']:.4f}  auc={metrics['auc']:.4f}  "
+                  f"ap={metrics['ap']:.4f}  pos={metrics['pos_score']:.3f}  "
+                  f"neg={metrics['neg_score']:.3f}")
+            for k, v in metrics.items():
+                writer.add_scalar(f"val/{k}", v, epoch)
+            ckpt["val_auc"] = metrics["auc"]
+
+            if metrics["auc"] > best_auc:
+                best_auc = metrics["auc"]
+                torch.save(ckpt, os.path.join(args.log_dir, "best.pt"))
+                print(f"  best auc={best_auc:.4f}")
+
         if (epoch + 1) % args.save_every == 0:
-            ckpt = {
-                "model": model.state_dict(),
-                "qwen_lora": qwen.state_dict(),
-                "epoch": epoch,
-            }
             torch.save(ckpt, os.path.join(args.log_dir, f"ckpt_epoch{epoch}.pt"))
-            print(f"  saved epoch {epoch}")
 
     writer.close()
     print("Done.")
