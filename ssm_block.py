@@ -90,13 +90,19 @@ def _mamba_chunk_forward(
     )
 
     # 2. causal conv1d with state carry
-    xBC_t = rearrange(xBC, "b l d -> b d l")                     # [B, conv_dim, L]
+    # channel-last layout is REQUIRED when using initial_states
+    # → transpose but DO NOT call .contiguous() or .clone()
+    xBC = xBC.contiguous(memory_format=torch.contiguous_format)   # [B, L, D]
+    xBC_t = xBC.transpose(1, 2)                                   # [B, D, L]  channel-last
 
-    hist = (
-        conv_state[..., -(blk.d_conv - 1):]
-        if conv_state is not None
-        else xBC_t.new_zeros(batch, xBC_t.shape[1], blk.d_conv - 1)
-    )                                                              # [B, conv_dim, d_conv-1]
+    if conv_state is not None:
+        hist = conv_state[..., -(blk.d_conv - 1):]                # [B, D, d_conv-1] channel-last
+    else:
+        hist = xBC.new_zeros(batch, blk.d_conv - 1, xBC.shape[-1])  # [B, d_conv-1, D]
+        hist = hist.transpose(1, 2)                                # [B, D, d_conv-1] channel-last
+
+    assert xBC_t.stride(1) == 1, f"xBC_t stride {xBC_t.stride()}"
+    assert hist.stride(1) == 1, f"hist stride {hist.stride()}"
 
     if causal_conv1d_fn is not None:
         xBC_conv = causal_conv1d_fn(
@@ -105,20 +111,22 @@ def _mamba_chunk_forward(
             blk.conv1d.bias,
             initial_states=hist,
             activation="silu",
-        )                                                          # [B, conv_dim, L]
+        )                                                          # [B, D, L] channel-last
     else:
-        xBC_padded = torch.cat([hist, xBC_t], dim=-1)             # [B, conv_dim, L+d_conv-1]
+        # fallback: F.conv1d needs contiguous; build padded tensor in-place
+        xBC_padded = torch.cat([hist, xBC_t], dim=-1)             # [B, D, L+d_conv-1]
         xBC_conv = F.conv1d(
-            xBC_padded, blk.conv1d.weight, blk.conv1d.bias,
+            xBC_padded.contiguous(), blk.conv1d.weight, blk.conv1d.bias,
             padding=0, groups=blk.conv1d.groups,
         )
-        xBC_conv = blk.act(xBC_conv)                              # [B, conv_dim, L]
+        xBC_conv = blk.act(xBC_conv)                              # [B, D, L]
 
-    xBC = rearrange(xBC_conv, "b d l -> b l d")                  # [B, L, conv_dim]
+    xBC = xBC_conv.transpose(1, 2)                                # [B, L, D]
 
-    # store new conv state: last d_conv inputs of history+current
-    state_input = torch.cat([hist, xBC_t], dim=-1)               # [B, conv_dim, L+d_conv-1]
-    new_conv_state = state_input[..., -blk.d_conv:]              # [B, conv_dim, d_conv]
+    # store new conv state — must stay channel-last [B, D, d_conv]
+    state_bld = torch.cat([hist.transpose(1, 2), xBC], dim=1)     # [B, L+d_conv-1, D]
+    new_conv_state = state_bld[:, -blk.d_conv:, :].transpose(1, 2)  # [B, D, d_conv] channel-last
+    assert new_conv_state.stride(1) == 1, f"new_conv_state stride {new_conv_state.stride()}"
 
     # 3. SSM scan
     dt = F.softplus(dt + blk.dt_bias)
