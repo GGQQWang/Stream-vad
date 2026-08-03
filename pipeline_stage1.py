@@ -316,6 +316,8 @@ def main():
     parser.add_argument("--train-json", required=True)
     parser.add_argument("--val-json", default="")
     parser.add_argument("--video-root", required=True)
+    parser.add_argument("--val-video-root", default="",
+                       help="validation video root; defaults to --video-root")
     parser.add_argument("--log-dir", default="./logs/stage1")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -411,8 +413,9 @@ def main():
     # ---- validation ----
     val_loader = None
     if args.val_json:
+        val_root = args.val_video_root or args.video_root
         val_ds = HIVAUDataset(
-            args.val_json, args.video_root,
+            args.val_json, val_root,
             total_sampled_frames=args.frames_per_clip,
             sample_interval=1,
             max_windows=args.max_windows,
