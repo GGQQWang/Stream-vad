@@ -244,10 +244,15 @@ def validate(
         grid_thw = processed["video_grid_thw"].to(device)
         binary = binary.to(device)
 
-        scores, _, ssm_cache = model(pixel_vals, grid_thw, valid_mask,
-                                     training=False,
-                                     chunk_video_ids=batch["video_id"],
-                                     ssm_state_cache=ssm_cache)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=(device.type == "cuda"),
+        ):
+            scores, _, ssm_cache = model(pixel_vals, grid_thw, valid_mask,
+                                         training=False,
+                                         chunk_video_ids=batch["video_id"],
+                                         ssm_state_cache=ssm_cache)
 
         # release cache for finished videos
         for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
@@ -473,7 +478,11 @@ def main():
             labels = labels.to(device)
             binary = binary.to(device)
 
-            with torch.autocast(device_type=device.type, dtype=dtype):
+            with torch.autocast(
+                device_type=device.type,
+                dtype=dtype,
+                enabled=(device.type == "cuda"),
+            ):
                 scores, _, stats = model(
                     pixel_vals, grid_thw, valid_mask,
                     training=True, return_stats=True,
