@@ -92,30 +92,33 @@ def _mamba_chunk_forward(
     # 2. causal conv1d with state carry
     xBC_t = rearrange(xBC, "b l d -> b d l")                     # [B, conv_dim, L]
 
-    if conv_state is not None:
-        hist = conv_state[..., -(blk.d_conv - 1):]               # [B, conv_dim, d_conv-1]
-    else:
-        hist = xBC_t.new_zeros(batch, xBC_t.shape[1], blk.d_conv - 1)
-    xBC_padded = torch.cat([hist, xBC_t], dim=-1)                # [B, conv_dim, L+d_conv-1]
+    hist = (
+        conv_state[..., -(blk.d_conv - 1):]
+        if conv_state is not None
+        else xBC_t.new_zeros(batch, xBC_t.shape[1], blk.d_conv - 1)
+    )                                                              # [B, conv_dim, d_conv-1]
 
     if causal_conv1d_fn is not None:
         xBC_conv = causal_conv1d_fn(
-            xBC_padded,
+            xBC_t,
             rearrange(blk.conv1d.weight, "d 1 w -> d w"),
             blk.conv1d.bias,
+            initial_states=hist,
             activation="silu",
-        )                                                         # [B, conv_dim, L]
+        )                                                          # [B, conv_dim, L]
     else:
-        # fallback — history already prepended, so padding=0 gives exact L output
+        xBC_padded = torch.cat([hist, xBC_t], dim=-1)             # [B, conv_dim, L+d_conv-1]
         xBC_conv = F.conv1d(
             xBC_padded, blk.conv1d.weight, blk.conv1d.bias,
             padding=0, groups=blk.conv1d.groups,
         )
         xBC_conv = blk.act(xBC_conv)                              # [B, conv_dim, L]
+
     xBC = rearrange(xBC_conv, "b d l -> b l d")                  # [B, L, conv_dim]
 
-    # store new conv state: last d_conv inputs  [B, conv_dim, d_conv]
-    new_conv_state = xBC_padded[..., -blk.d_conv:]
+    # store new conv state: last d_conv inputs of history+current
+    state_input = torch.cat([hist, xBC_t], dim=-1)               # [B, conv_dim, L+d_conv-1]
+    new_conv_state = state_input[..., -blk.d_conv:]              # [B, conv_dim, d_conv]
 
     # 3. SSM scan
     dt = F.softplus(dt + blk.dt_bias)
