@@ -108,19 +108,22 @@ class StreamingVADModel(nn.Module):
         pixel_values: torch.Tensor,              # [total_pixels, 3]  valid clips only
         video_grid_thw: torch.Tensor,            # [n_valid, 3]
         valid_mask: torch.Tensor,                # [B, max_w]  bool
-        chunk_video_ids: List[str],              # [B]  video_id per chunk
-        ssm_state_cache: dict,                   # video_id → SSM cache
         training: bool = True,
+        chunk_video_ids: List[str] | None = None,
+        ssm_state_cache: dict | None = None,     # only used when training=False
         return_stats: bool = False,
     ):
-        """Returns ``(scores, pooled, updated_ssm_cache)``."""
+        """Returns ``(scores, pooled, ...)``."""
         B, max_w = valid_mask.shape
         device = valid_mask.device
 
         n_valid = video_grid_thw.shape[0]
         if n_valid == 0:
             scores = torch.zeros(B, max_w, device=device)
-            return (scores, None, ssm_state_cache) if not return_stats else (scores, None, {}, ssm_state_cache)
+            out = (scores, None, ssm_state_cache) if ssm_state_cache is not None else (scores, None)
+            if return_stats:
+                out = out + ({},)
+            return out
 
         # 1. ViT packed forward
         vit_out = self.vit.forward_batch(
@@ -131,7 +134,7 @@ class StreamingVADModel(nn.Module):
         else:
             tokens, merged_counts = vit_out
 
-        # 2. per-clip split + spatial compress + pool → [n_valid, 3584]
+        # 2. per-clip split + spatial compress + pool → scatter → [B, max_w, 3584]
         tg_list = video_grid_thw[:, 0].tolist()
         clip_token_counts: List[int] = []
         ptr = 0
@@ -143,36 +146,34 @@ class StreamingVADModel(nn.Module):
         window_vecs = torch.stack(
             [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
         )
-
-        # 3. SSM per-video with state cache
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
-        window_raw = torch.zeros(B, max_w, self.llm_hidden, device=device)  # pre-SSM
-        window_raw[valid_b, valid_w] = window_vecs
-        window_ssm = torch.zeros(B, max_w, self.llm_hidden, device=device)  # post-SSM
+        window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
+        window_batch[valid_b, valid_w] = window_vecs
 
-        for b in range(B):
-            vid = chunk_video_ids[b]
-            bw_indices = valid_w[valid_b == b]
-            if len(bw_indices) == 0:
-                continue
+        # 3. SSM — training: forward(), inference: step() with cache
+        if training:
+            ssm_out = self.ssm(window_batch)               # differentiable scan
+        else:
+            assert chunk_video_ids is not None and ssm_state_cache is not None
+            ssm_out = torch.zeros_like(window_batch)
+            for b in range(B):
+                vid = chunk_video_ids[b]
+                bw = valid_w[valid_b == b]
+                if len(bw) == 0:
+                    continue
+                cache = ssm_state_cache.get(vid)
+                if cache is not None:
+                    self.ssm.set_cache(cache)
+                else:
+                    self.ssm.allocate_cache(batch_size=1, max_windows=max_w)
+                for _, gi in enumerate(bw.tolist()):
+                    wv = window_vecs[valid_b == b][_].unsqueeze(0).unsqueeze(0)
+                    ssm_out[b, gi] = self.ssm.forward_step(wv, seq_idx=gi).squeeze(0)
+                ssm_state_cache[vid] = self.ssm.get_cache(detach=False)
 
-            cache = ssm_state_cache.get(vid)
-            if cache is not None:
-                self.ssm.set_cache(cache)
-            else:
-                self.ssm.allocate_cache(batch_size=1, max_windows=max_w)
-
-            for _, glob_idx in enumerate(bw_indices.tolist()):
-                wv = window_vecs[valid_b == b][_].unsqueeze(0).unsqueeze(0)  # [1, 1, 3584]
-                out = self.ssm.forward_step(wv, seq_idx=glob_idx)             # [1, 1, llm_hidden]
-                window_ssm[b, glob_idx] = out.squeeze(0)
-
-            ssm_state_cache[vid] = self.ssm.get_cache(detach=training)
-
-        # 4. semantic-fidelity residual
-        window_batch = window_raw + window_ssm
-
-        llm_embeds = self.adapter(window_batch)
+        # 4. semantic-fidelity residual + adapter
+        ssm_out = ssm_out + window_batch
+        llm_embeds = self.adapter(ssm_out)
 
         # 5. LLM → score head
         llm_out = self.llm(
@@ -182,9 +183,14 @@ class StreamingVADModel(nn.Module):
         ).last_hidden_state
         scores = self.score_head(llm_out).squeeze(-1)
 
-        if return_stats:
-            return scores, window_batch, stats, ssm_state_cache
-        return scores, window_batch, ssm_state_cache
+        if training:
+            if return_stats:
+                return scores, window_batch, stats
+            return scores, window_batch
+        else:
+            if return_stats:
+                return scores, window_batch, stats, ssm_state_cache
+            return scores, window_batch, ssm_state_cache
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +248,15 @@ def validate(
         grid_thw = processed["video_grid_thw"].to(device)
         binary = binary.to(device)
 
-        chunk_video_ids = batch["video_id"]
         scores, _, ssm_cache = model(pixel_vals, grid_thw, valid_mask,
-                                     chunk_video_ids, ssm_cache,
-                                     training=False)
+                                     training=False,
+                                     chunk_video_ids=batch["video_id"],
+                                     ssm_state_cache=ssm_cache)
+
+        # release cache for finished videos
+        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+            if is_last:
+                ssm_cache.pop(vid, None)
 
         valid = valid_mask & (binary >= 0)
         loss = F.binary_cross_entropy_with_logits(
@@ -373,11 +384,12 @@ def main():
     )
 
     from hivau_dataset import hivau_collate  # noqa: E402
+    from hivau_sampler import VideoChunkSampler
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=VideoChunkSampler(train_ds.samples, shuffle=True),
         collate_fn=hivau_collate,
     )
 
@@ -421,10 +433,8 @@ def main():
     qwen.train()
     global_step = 0
     best_auc = 0.0
-    ssm_cache: dict = {}  # video_id → Mamba2 state  (training: detached per chunk)
 
     for epoch in range(args.epochs):
-        ssm_cache = {}  # fresh cache each epoch (train shuffle changes chunk order)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         train_losses: List[float] = []
         train_pos_scores: List[float] = []
@@ -462,13 +472,9 @@ def main():
             labels = labels.to(device)
             binary = binary.to(device)
 
-            chunk_video_ids = batch["video_id"]
-
             with torch.autocast(device_type=device.type, dtype=dtype):
-                fwd_out = model(pixel_vals, grid_thw, valid_mask,
-                                chunk_video_ids, ssm_cache,
-                                training=True, return_stats=True)
-                scores, _, stats, ssm_cache = fwd_out
+                scores, _, stats = model(pixel_vals, grid_thw, valid_mask,
+                                         training=True, return_stats=True)
 
                 valid = valid_mask & (labels >= 0)
                 loss = F.binary_cross_entropy_with_logits(
