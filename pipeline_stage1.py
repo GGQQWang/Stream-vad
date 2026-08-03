@@ -3,7 +3,7 @@
 Multi-window per video, B×T packed ViT forward, per-clip pool → SSM → LLM.
 
 Architecture:
-  [B, T, F, C, H, W]  raw frames (F=20, H=W=448)
+  [B, T, F, C, H, W]  raw frames (F=20, resolution via min/max_pixels)
        ↓  flatten
   [B*T, F, C, H, W]
        ↓  Qwen2-VL processor → pixel_values + video_grid_thw
@@ -108,18 +108,21 @@ class StreamingVADModel(nn.Module):
         pixel_values: torch.Tensor,              # [total_pixels, 3]  valid clips only
         video_grid_thw: torch.Tensor,            # [n_valid, 3]
         valid_mask: torch.Tensor,                # [B, max_w]  bool
+        chunk_video_ids: List[str],              # [B]  video_id per chunk
+        ssm_state_cache: dict,                   # video_id → SSM cache
+        training: bool = True,
         return_stats: bool = False,
     ):
-        """Returns ``(scores, pooled)`` where ``scores`` is ``[B, max_w]``."""
+        """Returns ``(scores, pooled, updated_ssm_cache)``."""
         B, max_w = valid_mask.shape
         device = valid_mask.device
 
         n_valid = video_grid_thw.shape[0]
         if n_valid == 0:
             scores = torch.zeros(B, max_w, device=device)
-            return (scores, None) if not return_stats else (scores, None, {})
+            return (scores, None, ssm_state_cache) if not return_stats else (scores, None, {}, ssm_state_cache)
 
-        # 1. ViT packed forward (same as LAVIDA)
+        # 1. ViT packed forward
         vit_out = self.vit.forward_batch(
             pixel_values, video_grid_thw, return_stats=return_stats,
         )
@@ -128,7 +131,7 @@ class StreamingVADModel(nn.Module):
         else:
             tokens, merged_counts = vit_out
 
-        # 2. per-clip split + spatial compress + pool
+        # 2. per-clip split + spatial compress + pool → [n_valid, 3584]
         tg_list = video_grid_thw[:, 0].tolist()
         clip_token_counts: List[int] = []
         ptr = 0
@@ -136,33 +139,52 @@ class StreamingVADModel(nn.Module):
             count = int(merged_counts[ptr: ptr + tg].sum().item())
             clip_token_counts.append(count)
             ptr += tg
-        assert sum(clip_token_counts) == tokens.shape[0]
         clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
-
         window_vecs = torch.stack(
             [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
-        )                                                            # [n_valid, 3584]
+        )
 
-        # 3. scatter to [B, max_w, 3584]
+        # 3. SSM per-video with state cache
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
-        window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
-        window_batch[valid_b, valid_w] = window_vecs
+        window_raw = torch.zeros(B, max_w, self.llm_hidden, device=device)  # pre-SSM
+        window_raw[valid_b, valid_w] = window_vecs
+        window_ssm = torch.zeros(B, max_w, self.llm_hidden, device=device)  # post-SSM
 
-        # 4. SSM + residual
-        ssm_out = self.ssm(window_batch)
-        ssm_out = ssm_out + window_batch
+        for b in range(B):
+            vid = chunk_video_ids[b]
+            bw_indices = valid_w[valid_b == b]
+            if len(bw_indices) == 0:
+                continue
 
-        # 5. adapter → LLM → score head
-        llm_embeds = self.adapter(ssm_out)
-        attn_mask = torch.ones(B, max_w, device=device)
+            cache = ssm_state_cache.get(vid)
+            if cache is not None:
+                self.ssm.set_cache(cache)
+            else:
+                self.ssm.allocate_cache(batch_size=1, max_windows=max_w)
+
+            for _, glob_idx in enumerate(bw_indices.tolist()):
+                wv = window_vecs[valid_b == b][_].unsqueeze(0).unsqueeze(0)  # [1, 1, 3584]
+                out = self.ssm.forward_step(wv, seq_idx=glob_idx)             # [1, 1, llm_hidden]
+                window_ssm[b, glob_idx] = out.squeeze(0)
+
+            ssm_state_cache[vid] = self.ssm.get_cache(detach=training)
+
+        # 4. semantic-fidelity residual
+        window_batch = window_raw + window_ssm
+
+        llm_embeds = self.adapter(window_batch)
+
+        # 5. LLM → score head
         llm_out = self.llm(
-            inputs_embeds=llm_embeds, attention_mask=attn_mask,
+            inputs_embeds=llm_embeds,
+            attention_mask=valid_mask.long(),
+            use_cache=False,
         ).last_hidden_state
-        scores = self.score_head(llm_out).squeeze(-1)              # [B, max_w]
+        scores = self.score_head(llm_out).squeeze(-1)
 
         if return_stats:
-            return scores, window_batch, stats
-        return scores, window_batch
+            return scores, window_batch, stats, ssm_state_cache
+        return scores, window_batch, ssm_state_cache
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +202,8 @@ def validate(
     processor: Qwen2VLProcessor,
     device: torch.device,
     pos_weight: torch.Tensor,
+    min_pixels: int = 200704,
+    max_pixels: int = 802816,
 ) -> dict:
     """Return ``{auc, ap, loss, pos_score, neg_score}``."""
     model.eval()
@@ -187,21 +211,23 @@ def validate(
     all_labels: List[int] = []
     total_loss = 0.0
     n_valid = 0
-    chunk_preds: dict = {}  # video_id → {window_idx → score}
+    chunk_preds: dict = {}
+    expected_windows: dict = {}
+    ssm_cache: dict = {}  # val: continuous state, no detach
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        frames = batch["frames"]                         # [B, max_w, F, C, H, W]
+        frames_list = batch["frames"]                    # list of [max_w, F, C, H, W]
         binary = batch["binary"]                         # [B, max_w]
         valid_mask = batch["valid_mask"].to(device)      # [B, max_w]
 
-        B, max_w = frames.shape[:2]
+        B, max_w = binary.shape[:2]
 
-        # extract valid clips
         all_clips: List[torch.Tensor] = []
         for b in range(B):
+            f = frames_list[b]
             for w in range(max_w):
                 if valid_mask[b, w]:
-                    all_clips.append(frames[b, w])
+                    all_clips.append(f[w])
 
         if not all_clips:
             continue
@@ -209,13 +235,17 @@ def validate(
         processed = processor(
             videos=all_clips,
             return_tensors="pt",
-            size={"height": 448, "width": 448},
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
         )
         pixel_vals = processed["pixel_values_videos"].to(device)
         grid_thw = processed["video_grid_thw"].to(device)
         binary = binary.to(device)
 
-        scores, _ = model(pixel_vals, grid_thw, valid_mask)
+        chunk_video_ids = batch["video_id"]
+        scores, _, ssm_cache = model(pixel_vals, grid_thw, valid_mask,
+                                     chunk_video_ids, ssm_cache,
+                                     training=False)
 
         valid = valid_mask & (binary >= 0)
         loss = F.binary_cross_entropy_with_logits(
@@ -232,16 +262,19 @@ def validate(
             vid = batch["video_id"][b]
             cs = batch["chunk_start"][b]
             ntw = batch["n_total_windows"][b]
+            expected_windows[vid] = ntw
             for w in range(max_w):
                 if valid_mask[b, w]:
                     chunk_preds.setdefault(vid, {})[cs + w] = scores[b, w].item()
 
-    # sanity: per-video window coverage
+    # sanity: every video is fully covered (no gaps, no truncation)
     for vid, preds in chunk_preds.items():
-        n_expected = max(preds.keys()) + 1
-        n_got = len(preds)
-        assert n_got == n_expected, (
-            f"{vid}: predicted {n_got} windows, expected {n_expected}"
+        expected = expected_windows[vid]
+        assert len(preds) == expected, (
+            f"{vid}: predicted {len(preds)} windows, expected {expected}"
+        )
+        assert set(preds.keys()) == set(range(expected)), (
+            f"{vid}: missing windows {set(range(expected)) - set(preds.keys())}"
         )
 
     model.train()
@@ -283,7 +316,10 @@ def main():
     parser.add_argument("--frames-per-clip", type=int, default=20)
     parser.add_argument("--max-windows", type=int, default=32,
                        help="max consecutive clips per video sample")
-    parser.add_argument("--image-size", type=int, default=448)
+    parser.add_argument("--min-pixels", type=int, default=200704,
+                       help="Qwen2-VL min_pixels (448*448=200704)")
+    parser.add_argument("--max-pixels", type=int, default=802816,
+                       help="Qwen2-VL max_pixels (896*896=802816)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
@@ -347,10 +383,10 @@ def main():
 
     # ---- pos_weight for class imbalance ----
     n_pos = sum(
-        sum(b for b in s["clip_binary"]) for s in train_ds.samples
+        sum(b for b in s["clip_bin"]) for s in train_ds.samples
     )
     n_neg = sum(
-        sum(1 - b for b in s["clip_binary"]) for s in train_ds.samples
+        sum(1 - b for b in s["clip_bin"]) for s in train_ds.samples
     )
     pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
     print(f"Pos/Neg windows: {n_pos} / {n_neg}  (ratio {n_pos/max(n_pos+n_neg,1):.3f})  pos_weight={pos_weight.item():.3f}")
@@ -385,8 +421,10 @@ def main():
     qwen.train()
     global_step = 0
     best_auc = 0.0
+    ssm_cache: dict = {}  # video_id → Mamba2 state  (training: detached per chunk)
 
     for epoch in range(args.epochs):
+        ssm_cache = {}  # fresh cache each epoch (train shuffle changes chunk order)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         train_losses: List[float] = []
         train_pos_scores: List[float] = []
@@ -395,19 +433,20 @@ def main():
         clip_anomaly_ratios: List[float] = []
 
         for step, batch in enumerate(pbar):
-            frames = batch["frames"]                         # [B, max_w, F, C, H, W]
+            frames_list = batch["frames"]                   # list of [max_w, F, C, H, W]
             labels = batch["labels"]                         # [B, max_w] soft
             binary = batch["binary"]                        # [B, max_w] hard
             valid_mask = batch["valid_mask"].to(device)     # [B, max_w] bool
 
-            B, max_w = frames.shape[:2]
+            B, max_w = labels.shape[:2]
 
-            # extract valid clips → flat list for processor
+            # extract valid clips → flat list (safe across resolutions)
             all_clips: List[torch.Tensor] = []
             for b in range(B):
+                f = frames_list[b]
                 for w in range(max_w):
                     if valid_mask[b, w]:
-                        all_clips.append(frames[b, w])      # [F, C, H, W]
+                        all_clips.append(f[w])              # [F, C, H, W]
 
             if not all_clips:
                 continue
@@ -415,23 +454,31 @@ def main():
             processed = processor(
                 videos=all_clips,
                 return_tensors="pt",
-                size={"height": args.image_size, "width": args.image_size},
+                min_pixels=args.min_pixels,
+                max_pixels=args.max_pixels,
             )
             pixel_vals = processed["pixel_values_videos"].to(device)
             grid_thw = processed["video_grid_thw"].to(device)
             labels = labels.to(device)
             binary = binary.to(device)
 
+            chunk_video_ids = batch["video_id"]
+
             with torch.autocast(device_type=device.type, dtype=dtype):
-                fwd_out = model(pixel_vals, grid_thw, valid_mask, return_stats=True)
-                scores, _, stats = fwd_out                  # [B, max_w]
+                fwd_out = model(pixel_vals, grid_thw, valid_mask,
+                                chunk_video_ids, ssm_cache,
+                                training=True, return_stats=True)
+                scores, _, stats, ssm_cache = fwd_out
 
                 valid = valid_mask & (labels >= 0)
                 loss = F.binary_cross_entropy_with_logits(
                     scores[valid], labels[valid], pos_weight=pos_weight,
                 )
 
-            loss = loss / args.grad_accum
+            group_start = (step // args.grad_accum) * args.grad_accum
+            group_size = min(args.grad_accum, len(train_loader) - group_start)
+            raw_loss = loss.detach()
+            loss = loss / group_size
             loss.backward()
 
             is_update = (
@@ -446,7 +493,7 @@ def main():
 
             # track per-batch stats
             with torch.no_grad():
-                train_losses.append(loss.item() * args.grad_accum)
+                train_losses.append(raw_loss.item())
                 vs = scores[valid].cpu()
                 bl = binary[valid].cpu()
                 pos_m = bl > 0
@@ -477,39 +524,52 @@ def main():
             anom_arr = np.array(clip_anomaly_ratios)
             writer.add_scalar("compress/keep_mean", keep_arr.mean(), epoch)
 
-            # per-bucket breakdown
-            buckets = [(0, 0), (0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.01)]
-            for lo, hi in buckets:
-                mask = (anom_arr >= lo) & (anom_arr < hi)
-                if mask.any():
-                    tag = f"compress/keep_anom_{lo:.0f}_{hi:.0f}".replace("0.0", "0").replace("1.0", "1")
-                    writer.add_scalar(tag, keep_arr[mask].mean(), epoch)
+            # per-bucket breakdown (explicit names — no tag collisions)
+            buckets = [
+                ("0_025",  0.0, 0.25),
+                ("025_050", 0.25, 0.5),
+                ("050_075", 0.5, 0.75),
+                ("075_100", 0.75, 1.01),
+            ]
+            for tag, lo, hi in buckets:
+                m = (anom_arr >= lo) & (anom_arr < hi)
+                if m.any():
+                    writer.add_scalar(f"compress/keep_anom_{tag}", keep_arr[m].mean(), epoch)
 
-            # overall stats
+            # normal vs abnormal
             writer.add_scalar("compress/keep_normal", keep_arr[anom_arr == 0].mean() if (anom_arr == 0).any() else 0, epoch)
             writer.add_scalar("compress/keep_abnormal", keep_arr[anom_arr > 0].mean() if (anom_arr > 0).any() else 0, epoch)
 
+        # trainable-weights only (SSM + adapter + score head; ViT frozen, LoRA via PEFT)
         ckpt = {
-            "model": model.state_dict(),
-            "qwen_lora": qwen.state_dict(),
+            "ssm": model.ssm.state_dict(),
+            "adapter": model.adapter.state_dict(),
+            "score_head": model.score_head.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "epoch": epoch,
+            "global_step": global_step,
+            "best_auc": best_auc,
         }
 
         if val_loader is not None:
-            metrics = validate(model, val_loader, processor, device, pos_weight)
+            metrics = validate(model, val_loader, processor, device, pos_weight,
+                              min_pixels=args.min_pixels, max_pixels=args.max_pixels)
             print(f"  val loss={metrics['loss']:.4f}  auc={metrics['auc']:.4f}  "
                   f"ap={metrics['ap']:.4f}  pos={metrics['pos_score']:.3f}  "
                   f"neg={metrics['neg_score']:.3f}")
             for k, v in metrics.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
-            ckpt["val_auc"] = metrics["auc"]
 
             if metrics["auc"] > best_auc:
                 best_auc = metrics["auc"]
+                ckpt["best_auc"] = best_auc
+                qwen.save_pretrained(os.path.join(args.log_dir, "lora_best"))
                 torch.save(ckpt, os.path.join(args.log_dir, "best.pt"))
                 print(f"  best auc={best_auc:.4f}")
 
         if (epoch + 1) % args.save_every == 0:
+            qwen.save_pretrained(os.path.join(args.log_dir, f"lora_epoch{epoch}"))
             torch.save(ckpt, os.path.join(args.log_dir, f"ckpt_epoch{epoch}.pt"))
 
     writer.close()

@@ -175,3 +175,26 @@ class SSMBlock(nn.Module):
     def reset_cache(self) -> None:
         """Release inference cache (call at end of video)."""
         self._cache = None
+
+    def get_cache(self, detach: bool = False):
+        """Return a copy of the current per-block (conv_state, ssm_state)."""
+        if self._cache is None:
+            return None
+        out = {}
+        for i, (cs, ss) in self._cache.items():
+            if detach:
+                out[i] = (cs.detach().clone(), ss.detach().clone())
+            else:
+                out[i] = (cs.clone(), ss.clone())
+        return out
+
+    def set_cache(self, cache: dict | None) -> None:
+        """Restore per-block (conv_state, ssm_state) from a previous get_cache()."""
+        if cache is None:
+            self._cache = None
+            return
+        # move to the device of the first block's parameter
+        dev = next(self.blocks[0].parameters()).device
+        self._cache = {}
+        for i, (cs, ss) in cache.items():
+            self._cache[i] = (cs.to(dev), ss.to(dev))
