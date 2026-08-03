@@ -147,7 +147,10 @@ class StreamingVADModel(nn.Module):
             [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
         )
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
-        window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
+        window_batch = torch.zeros(
+            B, max_w, self.llm_hidden,
+            device=device, dtype=window_vecs.dtype,
+        )
         window_batch[valid_b, valid_w] = window_vecs
 
         # 3. SSM — both paths use forward_chunk() with state carry
@@ -163,7 +166,7 @@ class StreamingVADModel(nn.Module):
             if training and prev is not None:
                 prev = {i: s.detach() for i, s in prev.items()}         # truncated BPTT
             out, new_st = self.ssm.forward_chunk(wv, state=prev)
-            ssm_out[b, bw] = out.squeeze(0)
+            ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
         # 4. semantic-fidelity residual + adapter
