@@ -90,10 +90,9 @@ def _mamba_chunk_forward(
     )
 
     # 2. causal conv1d with state carry
-    # channel-last layout is REQUIRED when using initial_states
-    # → transpose but DO NOT call .contiguous() or .clone()
-    xBC = xBC.contiguous(memory_format=torch.contiguous_format)   # [B, L, D]
-    xBC_t = xBC.transpose(1, 2)                                   # [B, D, L]  channel-last
+    # channel-last layout is REQUIRED for initial_states
+    xBC_raw = xBC.contiguous()                                     # [B, L, D]  pre-conv, save for state
+    xBC_t = xBC_raw.transpose(1, 2)                                # [B, D, L]  channel-last
 
     if conv_state is not None:
         hist = conv_state[..., -(blk.d_conv - 1):]                # [B, D, d_conv-1] channel-last
@@ -113,7 +112,6 @@ def _mamba_chunk_forward(
             activation="silu",
         )                                                          # [B, D, L] channel-last
     else:
-        # fallback: F.conv1d needs contiguous; build padded tensor in-place
         xBC_padded = torch.cat([hist, xBC_t], dim=-1)             # [B, D, L+d_conv-1]
         xBC_conv = F.conv1d(
             xBC_padded.contiguous(), blk.conv1d.weight, blk.conv1d.bias,
@@ -121,17 +119,18 @@ def _mamba_chunk_forward(
         )
         xBC_conv = blk.act(xBC_conv)                              # [B, D, L]
 
-    xBC = xBC_conv.transpose(1, 2)                                # [B, L, D]
+    # conv output → used for SSM scan
+    xBC = xBC_conv.transpose(1, 2)                                # [B, L, D]  post-conv
 
-    # store new conv state — must stay channel-last [B, D, d_conv]
-    state_bld = torch.cat([hist.transpose(1, 2), xBC], dim=1)     # [B, L+d_conv-1, D]
+    # conv state stores PRE-convolution raw input, not conv output
+    state_bld = torch.cat([hist.transpose(1, 2), xBC_raw], dim=1)  # [B, L+d_conv-1, D]
     new_conv_state = state_bld[:, -blk.d_conv:, :].transpose(1, 2)  # [B, D, d_conv] channel-last
     assert new_conv_state.stride(1) == 1, f"new_conv_state stride {new_conv_state.stride()}"
 
     # 3. SSM scan  (match official non-fused path)
     A = -torch.exp(blk.A_log.float())
     x, B, C = torch.split(
-        xBC,
+        xBC,                                                        # post-conv for SSM
         [blk.d_ssm, blk.ngroups * blk.d_state, blk.ngroups * blk.d_state],
         dim=-1,
     )
