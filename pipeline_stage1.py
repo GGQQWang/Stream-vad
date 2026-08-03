@@ -219,7 +219,8 @@ def validate(
     for batch in tqdm(loader, desc="Val", leave=False):
         frames_list = batch["frames"]                    # list of [max_w, F, C, H, W]
         binary = batch["binary"]                         # [B, max_w]
-        valid_mask = batch["valid_mask"].to(device)      # [B, max_w]
+        valid_mask_cpu = batch["valid_mask"]              # CPU
+        valid_mask = valid_mask_cpu.to(device)
 
         B, max_w = binary.shape[:2]
 
@@ -227,7 +228,7 @@ def validate(
         for b in range(B):
             f = frames_list[b]
             for w in range(max_w):
-                if valid_mask[b, w]:
+                if valid_mask_cpu[b, w]:
                     all_clips.append(f[w])
 
         if not all_clips:
@@ -442,16 +443,17 @@ def main():
             frames_list = batch["frames"]                   # list of [max_w, F, C, H, W]
             labels = batch["labels"]                         # [B, max_w] soft
             binary = batch["binary"]                        # [B, max_w] hard
-            valid_mask = batch["valid_mask"].to(device)     # [B, max_w] bool
+            valid_mask_cpu = batch["valid_mask"]             # [B, max_w] on CPU
+            valid_mask = valid_mask_cpu.to(device)
 
             B, max_w = labels.shape[:2]
 
-            # extract valid clips → flat list (safe across resolutions)
+            # extract valid clips using CPU mask (no GPU sync per element)
             all_clips: List[torch.Tensor] = []
             for b in range(B):
                 f = frames_list[b]
                 for w in range(max_w):
-                    if valid_mask[b, w]:
+                    if valid_mask_cpu[b, w]:
                         all_clips.append(f[w])              # [F, C, H, W]
 
             if not all_clips:

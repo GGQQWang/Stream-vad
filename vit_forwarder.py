@@ -87,7 +87,6 @@ class ViTForwarder(nn.Module):
                 clip_ratios.append(mask[ptr: ptr + n].float().mean().item())
                 ptr += n
             result = result + ({
-                "keep_mask": mask.cpu(),
                 "clip_keep_ratios": clip_ratios,
             },)
 

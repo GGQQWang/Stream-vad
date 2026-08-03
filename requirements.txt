@@ -1,6 +1,7 @@
 torch>=2.2.0
 transformers==4.46.2
-mamba-ssm>=2.0.0
+mamba-ssm==2.2.2
+causal-conv1d==1.4.0
 einops
 decord>=0.6.0
 peft>=0.10.0
