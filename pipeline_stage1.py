@@ -232,7 +232,8 @@ def validate(
         if not all_clips:
             continue
 
-        processed = processor(
+        processed = processor.image_processor(
+            images=None,
             videos=all_clips,
             return_tensors="pt",
         )
@@ -459,7 +460,8 @@ def main():
             if not all_clips:
                 continue
 
-            processed = processor(
+            processed = processor.image_processor(
+                images=None,
                 videos=all_clips,
                 return_tensors="pt",
             )
