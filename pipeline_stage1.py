@@ -80,13 +80,14 @@ class StreamingVADModel(nn.Module):
         llm_hidden: int = 3584,
         reduction_ratio: float = 0.5,
         lof_k: int = 8,
+        vit_micro_batch: int = 1,
     ):
         super().__init__()
         visual = _find_visual(qwen)
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
         self.ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
-                            n_layers=n_ssm, llm_hidden=llm_hidden)  # same dim as input
+                            n_layers=n_ssm, llm_hidden=llm_hidden)
         self.adapter = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden),
             nn.GELU(),
@@ -99,6 +100,7 @@ class StreamingVADModel(nn.Module):
             nn.Linear(llm_hidden // 4, 1),
         )
         self.llm_hidden = llm_hidden
+        self.vit_micro_batch = vit_micro_batch
 
         # Reference to the LLM transformer (set by trainer after init)
         self.llm: Optional[nn.Module] = None
@@ -110,7 +112,7 @@ class StreamingVADModel(nn.Module):
         valid_mask: torch.Tensor,                # [B, max_w]  bool
         training: bool = True,
         chunk_video_ids: List[str] | None = None,
-        ssm_state_cache: dict | None = None,     # only used when training=False
+        ssm_state_cache: dict | None = None,
         return_stats: bool = False,
     ):
         """Returns ``(scores, pooled, ...)``."""
@@ -126,8 +128,10 @@ class StreamingVADModel(nn.Module):
             return out
 
         # 1. ViT packed forward
-        vit_out = self.vit.forward_batch(
-            pixel_values, video_grid_thw, return_stats=return_stats,
+        vit_out = self.vit.forward_batch_micro(
+            pixel_values, video_grid_thw,
+            micro_batch_size=self.vit_micro_batch,
+            return_stats=return_stats,
         )
         if return_stats:
             tokens, merged_counts, stats = vit_out
@@ -330,6 +334,12 @@ def main():
     parser.add_argument("--frames-per-clip", type=int, default=20)
     parser.add_argument("--max-windows", type=int, default=32,
                        help="max consecutive clips per video sample")
+    parser.add_argument(
+        "--vit-micro-batch",
+        type=int,
+        default=1,
+        help="number of clips processed by ViT at once",
+    )
     parser.add_argument("--min-pixels", type=int, default=200704,
                        help="Qwen2-VL min_pixels (448*448=200704)")
     parser.add_argument("--max-pixels", type=int, default=802816,
@@ -374,6 +384,7 @@ def main():
 
     model = StreamingVADModel(
         qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
+        vit_micro_batch=args.vit_micro_batch,
     ).to(device)
 
     # Set LLM transformer (LoRA-aware path so LoRA layers get gradients)

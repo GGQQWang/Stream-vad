@@ -92,6 +92,72 @@ class ViTForwarder(nn.Module):
 
         return result
 
+    def forward_batch_micro(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        micro_batch_size: int = 1,
+        return_stats: bool = False,
+    ):
+        """ViT forward in micro-batches to reduce peak attention memory.
+
+        Output is identical to ``forward_batch`` — only the execution
+        is split across multiple smaller calls.
+
+        Args:
+            pixel_values: ``[total_pixels, C=3]``.
+            grid_thw: ``[B, 3]``  rows ``(t_frames, h, w)``.
+            micro_batch_size: max clips per micro-batch.  Default 1.
+            return_stats: forwarded to ``forward_batch``.
+
+        Returns:
+            Same as ``forward_batch``.
+        """
+        num_clips = int(grid_thw.shape[0])
+        if micro_batch_size <= 0 or num_clips <= micro_batch_size:
+            return self.forward_batch(pixel_values, grid_thw, return_stats=return_stats)
+
+        patch_counts = (
+            grid_thw.detach()
+            .to(device="cpu", dtype=torch.long)
+            .prod(dim=1)
+            .tolist()
+        )
+        expected = sum(patch_counts)
+        actual = int(pixel_values.shape[0])
+        if expected != actual:
+            raise RuntimeError(
+                f"pixel/grid mismatch: expected {expected} patches, got {actual}"
+            )
+
+        pixel_clips = torch.split(pixel_values, patch_counts, dim=0)
+
+        token_parts = []
+        count_parts = []
+        ratio_parts = [] if return_stats else None
+
+        for start in range(0, num_clips, micro_batch_size):
+            end = min(start + micro_batch_size, num_clips)
+            micro_pixels = torch.cat(pixel_clips[start:end], dim=0)
+            micro_grid = grid_thw[start:end]
+
+            fwd = self.forward_batch(
+                micro_pixels, micro_grid, return_stats=return_stats,
+            )
+            if return_stats:
+                micro_tokens, micro_counts, micro_stats = fwd
+                ratio_parts.extend(micro_stats["clip_keep_ratios"])
+            else:
+                micro_tokens, micro_counts = fwd
+
+            token_parts.append(micro_tokens)
+            count_parts.append(micro_counts)
+
+        result = (torch.cat(token_parts, dim=0), torch.cat(count_parts, dim=0))
+        if return_stats:
+            result = result + ({"clip_keep_ratios": ratio_parts},)
+        return result
+
     # ------------------------------------------------------------------
     # Streaming mode (inference: adaptive flush)
     # ------------------------------------------------------------------
