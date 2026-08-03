@@ -128,8 +128,7 @@ def _mamba_chunk_forward(
     new_conv_state = state_bld[:, -blk.d_conv:, :].transpose(1, 2)  # [B, D, d_conv] channel-last
     assert new_conv_state.stride(1) == 1, f"new_conv_state stride {new_conv_state.stride()}"
 
-    # 3. SSM scan
-    dt = F.softplus(dt + blk.dt_bias)
+    # 3. SSM scan  (match official non-fused path)
     A = -torch.exp(blk.A_log.float())
     x, B, C = torch.split(
         xBC,
@@ -137,23 +136,31 @@ def _mamba_chunk_forward(
         dim=-1,
     )
 
+    dt_limit_kwargs = (
+        {} if blk.dt_limit == (0.0, float("inf")) else {"dt_limit": blk.dt_limit}
+    )
+
     y, final_ssm_state = mamba_chunk_scan_combined(
         rearrange(x, "b l (h p) -> b l h p", p=blk.headdim),
-        dt,
+        dt,           # raw dt — scan handles softplus internally
         A,
         rearrange(B, "b l (g n) -> b l g n", g=blk.ngroups),
         rearrange(C, "b l (g n) -> b l g n", g=blk.ngroups),
         chunk_size=blk.chunk_size,
         D=rearrange(blk.D, "(h p) -> h p", p=blk.headdim) if blk.D_has_hdim else blk.D,
-        z=None,
+        z=rearrange(z, "b l (h p) -> b l h p", p=blk.headdim) if not blk.rmsnorm else None,
+        dt_bias=blk.dt_bias,
+        dt_softplus=True,
         initial_states=ssm_state,
         return_final_states=True,
-    )                                                             # y:[B,L,H,P]  fss:[B,H,P,N]
+        **dt_limit_kwargs,
+    )
 
     y = rearrange(y, "b l h p -> b l (h p)")
 
     # 4. gate + merge
-    y = blk.norm(y, z)
+    if blk.rmsnorm:
+        y = blk.norm(y, z)
     if d_mlp > 0:
         y = torch.cat([F.silu(z0) * x0, y], dim=-1)
     out = blk.out_proj(y)
