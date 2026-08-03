@@ -200,14 +200,14 @@ class HIVAUDataset(Dataset):
         }
 
 def hivau_collate(batch: List[dict]) -> dict:
-    """Standard collate — all items already padded to max_windows."""
+    """Collate — frames stay as list (different resolutions safe)."""
     return {
         "video_path": [b["video_path"] for b in batch],
         "video_id": [b["video_id"] for b in batch],
         "chunk_start": [b["chunk_start"] for b in batch],
         "n_total_windows": [b["n_total_windows"] for b in batch],
         "is_last_chunk": [b["is_last_chunk"] for b in batch],
-        "frames": torch.stack([b["frames"] for b in batch], dim=0),
+        "frames": [b["frames"] for b in batch],     # list of [max_w, F, C, H, W]
         "labels": torch.stack([b["labels"] for b in batch], dim=0),
         "binary": torch.stack([b["binary"] for b in batch], dim=0),
         "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),

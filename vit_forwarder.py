@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .temporal import TemporalTokenReducer
+from temporal import TemporalTokenReducer
 
 
 class ViTForwarder(nn.Module):
@@ -78,12 +78,12 @@ class ViTForwarder(nn.Module):
         result = (tokens, merged_counts)
 
         if return_stats:
-            # per-clip keep ratios
-            tg_list = grid_thw[:, 0].tolist()                    # list[int]
+            # per-clip keep ratios (each clip may have different H,W)
             ptr = 0
             clip_ratios: List[float] = []
-            for tg in tg_list:
-                n = tg * grid_thw[0, 1].item() * grid_thw[0, 2].item()
+            for row in grid_thw.tolist():
+                tg, hg, wg = int(row[0]), int(row[1]), int(row[2])
+                n = tg * hg * wg
                 clip_ratios.append(mask[ptr: ptr + n].float().mean().item())
                 ptr += n
             result = result + ({
