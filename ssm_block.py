@@ -38,7 +38,7 @@ from einops import rearrange
 class SSMState:
     """Per-block Mamba2 state for cross-chunk carry.
 
-    conv_state: [B, d_conv, conv_dim]  causal-conv history
+    conv_state: [B, conv_dim, d_conv]  causal-conv history
     ssm_state:  [B, nheads, headdim, d_state]  SSM hidden state
     """
     conv_state: torch.Tensor
@@ -93,11 +93,10 @@ def _mamba_chunk_forward(
     xBC_t = rearrange(xBC, "b l d -> b d l")                     # [B, conv_dim, L]
 
     if conv_state is not None:
-        # prepend last d_conv-1 inputs from previous chunk
-        hist = conv_state[:, :, :blk.d_conv - 1]                 # [B, conv_dim, d_conv-1]
-        xBC_padded = torch.cat([hist, xBC_t], dim=-1)            # [B, conv_dim, L+d_conv-1]
+        hist = conv_state[..., -(blk.d_conv - 1):]               # [B, conv_dim, d_conv-1]
     else:
-        xBC_padded = xBC_t
+        hist = xBC_t.new_zeros(batch, xBC_t.shape[1], blk.d_conv - 1)
+    xBC_padded = torch.cat([hist, xBC_t], dim=-1)                # [B, conv_dim, L+d_conv-1]
 
     if causal_conv1d_fn is not None:
         xBC_conv = causal_conv1d_fn(
@@ -105,19 +104,18 @@ def _mamba_chunk_forward(
             rearrange(blk.conv1d.weight, "d 1 w -> d w"),
             blk.conv1d.bias,
             activation="silu",
-        )                                                         # [B, conv_dim, L+d_conv-1]
+        )                                                         # [B, conv_dim, L]
     else:
-        # fallback — slower, no fused kernel
-        xBC_conv = blk.act(blk.conv1d(xBC_padded))               # [B, conv_dim, L+d_conv-1]
-
-    # trim to current chunk  (last L positions)
-    xBC_conv = xBC_conv[..., -seqlen:]                            # [B, conv_dim, L]
+        # fallback — history already prepended, so padding=0 gives exact L output
+        xBC_conv = F.conv1d(
+            xBC_padded, blk.conv1d.weight, blk.conv1d.bias,
+            padding=0, groups=blk.conv1d.groups,
+        )
+        xBC_conv = blk.act(xBC_conv)                              # [B, conv_dim, L]
     xBC = rearrange(xBC_conv, "b d l -> b l d")                  # [B, L, conv_dim]
 
-    # store new conv state: last d_conv inputs
-    new_conv_state = xBC_padded[..., -blk.d_conv:]               # [B, conv_dim, d_conv]
-    # keep format [B, d_conv, conv_dim] for compatibility with allocate_cache
-    new_conv_state = new_conv_state.transpose(1, 2)              # [B, d_conv, conv_dim]
+    # store new conv state: last d_conv inputs  [B, conv_dim, d_conv]
+    new_conv_state = xBC_padded[..., -blk.d_conv:]
 
     # 3. SSM scan
     dt = F.softplus(dt + blk.dt_bias)
