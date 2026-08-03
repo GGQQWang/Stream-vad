@@ -150,26 +150,21 @@ class StreamingVADModel(nn.Module):
         window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
         window_batch[valid_b, valid_w] = window_vecs
 
-        # 3. SSM — training: forward(), inference: step() with cache
-        if training:
-            ssm_out = self.ssm(window_batch)               # differentiable scan
-        else:
-            assert chunk_video_ids is not None and ssm_state_cache is not None
-            ssm_out = torch.zeros_like(window_batch)
-            for b in range(B):
-                vid = chunk_video_ids[b]
-                bw = valid_w[valid_b == b]
-                if len(bw) == 0:
-                    continue
-                cache = ssm_state_cache.get(vid)
-                if cache is not None:
-                    self.ssm.set_cache(cache)
-                else:
-                    self.ssm.allocate_cache(batch_size=1, max_windows=max_w)
-                for _, gi in enumerate(bw.tolist()):
-                    wv = window_vecs[valid_b == b][_].unsqueeze(0).unsqueeze(0)
-                    ssm_out[b, gi] = self.ssm.forward_step(wv, seq_idx=gi).squeeze(0)
-                ssm_state_cache[vid] = self.ssm.get_cache(detach=False)
+        # 3. SSM — both paths use forward_chunk() with state carry
+        assert chunk_video_ids is not None and ssm_state_cache is not None
+        ssm_out = torch.zeros_like(window_batch)
+        for b in range(B):
+            vid = chunk_video_ids[b]
+            bw = valid_w[valid_b == b]
+            if len(bw) == 0:
+                continue
+            wv = window_vecs[valid_b == b].unsqueeze(0)                # [1, T_i, 3584]
+            prev = ssm_state_cache.get(vid)
+            if training and prev is not None:
+                prev = {i: s.detach() for i, s in prev.items()}         # truncated BPTT
+            out, new_st = self.ssm.forward_chunk(wv, state=prev)
+            ssm_out[b, bw] = out.squeeze(0)
+            ssm_state_cache[vid] = new_st
 
         # 4. semantic-fidelity residual + adapter
         ssm_out = ssm_out + window_batch
@@ -435,6 +430,7 @@ def main():
     best_auc = 0.0
 
     for epoch in range(args.epochs):
+        ssm_cache: dict = {}  # video_id → SSMState (training: detach before forward)
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         train_losses: List[float] = []
         train_pos_scores: List[float] = []
@@ -473,8 +469,12 @@ def main():
             binary = binary.to(device)
 
             with torch.autocast(device_type=device.type, dtype=dtype):
-                scores, _, stats = model(pixel_vals, grid_thw, valid_mask,
-                                         training=True, return_stats=True)
+                scores, _, stats = model(
+                    pixel_vals, grid_thw, valid_mask,
+                    training=True, return_stats=True,
+                    chunk_video_ids=batch["video_id"],
+                    ssm_state_cache=ssm_cache,
+                )
 
                 valid = valid_mask & (labels >= 0)
                 loss = F.binary_cross_entropy_with_logits(
@@ -510,6 +510,11 @@ def main():
                 # compression stats
                 clip_keep_ratios.extend(stats["clip_keep_ratios"])
                 clip_anomaly_ratios.extend(labels[valid].cpu().tolist())
+
+            # release SSM cache for finished videos
+            for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+                if is_last:
+                    ssm_cache.pop(vid, None)
 
             pbar.set_postfix(
                 loss=sum(train_losses[-10:]) / min(10, len(train_losses))
