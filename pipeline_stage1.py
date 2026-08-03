@@ -203,8 +203,6 @@ def validate(
     processor: Qwen2VLProcessor,
     device: torch.device,
     pos_weight: torch.Tensor,
-    min_pixels: int = 200704,
-    max_pixels: int = 802816,
 ) -> dict:
     """Return ``{auc, ap, loss, pos_score, neg_score}``."""
     model.eval()
@@ -237,8 +235,6 @@ def validate(
         processed = processor(
             videos=all_clips,
             return_tensors="pt",
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
         )
         pixel_vals = processed["pixel_values_videos"].to(device)
         grid_thw = processed["video_grid_thw"].to(device)
@@ -347,7 +343,11 @@ def main():
     ).to(device)
 
     # ---- processor ----
-    processor = Qwen2VLProcessor.from_pretrained(args.model_path)
+    processor = Qwen2VLProcessor.from_pretrained(
+        args.model_path,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
+    )
 
     # ---- LoRA on LLM q/v projections ----
     lora_config = LoraConfig(
@@ -462,8 +462,6 @@ def main():
             processed = processor(
                 videos=all_clips,
                 return_tensors="pt",
-                min_pixels=args.min_pixels,
-                max_pixels=args.max_pixels,
             )
             pixel_vals = processed["pixel_values_videos"].to(device)
             grid_thw = processed["video_grid_thw"].to(device)
@@ -566,8 +564,7 @@ def main():
         }
 
         if val_loader is not None:
-            metrics = validate(model, val_loader, processor, device, pos_weight,
-                              min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+            metrics = validate(model, val_loader, processor, device, pos_weight)
             print(f"  val loss={metrics['loss']:.4f}  auc={metrics['auc']:.4f}  "
                   f"ap={metrics['ap']:.4f}  pos={metrics['pos_score']:.3f}  "
                   f"neg={metrics['neg_score']:.3f}")
