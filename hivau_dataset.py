@@ -33,6 +33,18 @@ def _build_frame_labels(
     return labels
 
 
+def _read_video_label(meta: dict, frame_labels: np.ndarray) -> int:
+    """Prefer explicit video-level labels; fall back to temporal events."""
+    if "video_label" in meta:
+        return int(meta["video_label"])
+    if "label" in meta:
+        label = meta["label"]
+        if isinstance(label, str):
+            return 0 if label.lower() in {"normal", "0", "negative"} else 1
+        return int(label)
+    return 1 if frame_labels.any() else 0
+
+
 class HIVAUDataset(Dataset):
     """HIVAU-70K — per-chunk window sequences.
 
@@ -85,7 +97,8 @@ class HIVAUDataset(Dataset):
             frame_labels = _build_frame_labels(
                 n, meta.get("fps", fps), meta.get("events", [])
             )
-            # per-clip soft + hard labels
+            video_label = _read_video_label(meta, frame_labels)
+            # Per-window labels are for temporal evaluation; MIL pairing uses video_label.
             clip_soft: List[float] = []
             clip_bin: List[int] = []
             n_clips = math.ceil(n / self.clip_span)
@@ -104,6 +117,7 @@ class HIVAUDataset(Dataset):
                 self.samples.append({
                     "video_path": str(video_path),
                     "video_id": video_name,
+                    "video_label": video_label,
                     "n_frames": n,
                     "chunk_start": lo,
                     "chunk_end": hi,
@@ -196,6 +210,7 @@ class HIVAUDataset(Dataset):
         return {
             "video_path": meta["video_path"],
             "video_id": meta["video_id"],
+            "video_label": meta["video_label"],
             "chunk_start": meta["chunk_start"],
             "n_total_windows": meta["n_total_windows"],
             "is_last_chunk": meta["is_last_chunk"],
@@ -210,6 +225,7 @@ def hivau_collate(batch: List[dict]) -> dict:
     return {
         "video_path": [b["video_path"] for b in batch],
         "video_id": [b["video_id"] for b in batch],
+        "video_label": [b["video_label"] for b in batch],
         "chunk_start": [b["chunk_start"] for b in batch],
         "n_total_windows": [b["n_total_windows"] for b in batch],
         "is_last_chunk": [b["is_last_chunk"] for b in batch],

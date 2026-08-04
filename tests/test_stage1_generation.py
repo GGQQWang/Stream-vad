@@ -90,7 +90,7 @@ def test_padding_handles_different_lengths():
     batch = build_status_generation_batch(embed_fn, tokenizer, state, targets)
     assert batch["inputs_embeds"].shape[0] == 2
     # max_len should be the Abnormal sample (longer)
-    assert batch["inputs_embeds"].shape[1] >= 1 + 3 + 3 + 2  # state + 3 prompt + max(2,3) answer + 1 eos
+    assert batch["inputs_embeds"].shape[1] == 1 + 3 + 3  # state + 3 prompt + (2 Abnormal tokens + eos)
 
 
 def test_masked_token_ce():

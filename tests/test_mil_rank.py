@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from hivau_sampler import VideoPairSampler
+from hivau_sampler import SequentialVideoSampler, VideoPairSampler
 from mil_utils import (
     abnormal_language_loss,
     abnormal_sparsity_loss,
@@ -62,10 +62,10 @@ def test_sparsity_loss_only_valid_abnormal_probs():
 
 def test_video_pair_sampler_preserves_chunk_order_and_cycles_smaller_class():
     samples = [
-        {"video_id": "n1", "chunk_start": 1, "chunk_end": 2, "clip_bin": [0]},
-        {"video_id": "n1", "chunk_start": 0, "chunk_end": 1, "clip_bin": [0]},
-        {"video_id": "a1", "chunk_start": 0, "chunk_end": 1, "clip_bin": [1]},
-        {"video_id": "a2", "chunk_start": 0, "chunk_end": 1, "clip_bin": [1]},
+        {"video_id": "n1", "video_label": 0, "chunk_start": 1, "chunk_end": 2},
+        {"video_id": "n1", "video_label": 0, "chunk_start": 0, "chunk_end": 1},
+        {"video_id": "a1", "video_label": 1, "chunk_start": 0, "chunk_end": 1},
+        {"video_id": "a2", "video_label": 1, "chunk_start": 0, "chunk_end": 1},
     ]
     sampler = VideoPairSampler(samples, shuffle=False)
     pairs = list(sampler.iter_epoch(0))
@@ -73,6 +73,22 @@ def test_video_pair_sampler_preserves_chunk_order_and_cycles_smaller_class():
     n_vid, n_indices, _, _ = pairs[0]
     assert n_vid == "n1"
     assert n_indices == [1, 0]
+
+
+def test_sequential_video_sampler_yields_each_video_once():
+    samples = [
+        {"video_id": "v2", "video_label": 1, "chunk_start": 1, "chunk_end": 2},
+        {"video_id": "v1", "video_label": 0, "chunk_start": 1, "chunk_end": 2},
+        {"video_id": "v2", "video_label": 1, "chunk_start": 0, "chunk_end": 1},
+        {"video_id": "v1", "video_label": 0, "chunk_start": 0, "chunk_end": 1},
+    ]
+    sampler = SequentialVideoSampler(samples)
+    items = list(sampler)
+    video_ids = [vid for vid, _, _ in items]
+    assert sorted(video_ids) == ["v1", "v2"]
+    assert len(video_ids) == len(set(video_ids))
+    assert items[0] == ("v1", [3, 1], 0)
+    assert items[1] == ("v2", [2, 0], 1)
 
 
 class _StatefulSSM:

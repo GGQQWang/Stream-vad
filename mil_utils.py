@@ -103,7 +103,10 @@ def group_video_chunks(samples: Sequence[dict]) -> Dict[str, List[VideoChunkRef]
 def infer_video_labels(samples: Sequence[dict]) -> Dict[str, int]:
     labels: Dict[str, int] = {}
     for sample in samples:
-        label = 1 if any(int(v) > 0 for v in sample.get("clip_bin", [])) else 0
+        if "video_label" in sample:
+            label = int(sample["video_label"])
+        else:
+            label = 1 if any(int(v) > 0 for v in sample.get("clip_bin", [])) else 0
         labels[sample["video_id"]] = max(labels.get(sample["video_id"], 0), label)
     return labels
 

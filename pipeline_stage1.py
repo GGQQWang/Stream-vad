@@ -927,7 +927,7 @@ def _collect_video_candidate_outputs(
 def validate_mil_rank(
     model: StreamingVADGenerationModel,
     dataset: HIVAUDataset,
-    pair_sampler,
+    video_sampler,
     processor: Qwen2VLProcessor,
     tokenizer,
     device: torch.device,
@@ -942,6 +942,7 @@ def validate_mil_rank(
     lambda_sparse: float,
     mil_margin: float,
 ) -> dict:
+    was_training = model.training
     model.eval()
     all_scores: List[float] = []
     all_labels: List[int] = []
@@ -954,56 +955,64 @@ def validate_mil_rank(
     sparse_losses: List[float] = []
     normal_max_scores: List[float] = []
     abnormal_max_scores: List[float] = []
-    ranking_hits: List[float] = []
+    seen_video_ids: set[str] = set()
 
-    for normal_vid, normal_indices, abnormal_vid, abnormal_indices in tqdm(
-        pair_sampler.iter_epoch(0), total=len(pair_sampler), desc="Val MIL", leave=False,
+    for video_id, sample_indices, video_label in tqdm(
+        video_sampler, total=len(video_sampler), desc="Val MIL", leave=False,
     ):
-        n_normal, n_abnormal, n_scores, n_labels = _collect_video_candidate_outputs(
-            model, processor, tokenizer, dataset, normal_indices, device, dtype,
-            prompt_text, normal_answer, abnormal_answer, llm_micro_batch,
-        )
-        a_normal, a_abnormal, a_scores, a_labels = _collect_video_candidate_outputs(
-            model, processor, tokenizer, dataset, abnormal_indices, device, dtype,
+        if video_id in seen_video_ids:
+            raise RuntimeError(f"validation video repeated: {video_id}")
+        seen_video_ids.add(video_id)
+
+        normal_nll, abnormal_nll, scores, labels = _collect_video_candidate_outputs(
+            model, processor, tokenizer, dataset, sample_indices, device, dtype,
             prompt_text, normal_answer, abnormal_answer, llm_micro_batch,
         )
 
-        n_valid = torch.ones_like(n_scores, dtype=torch.bool)
-        a_valid = torch.ones_like(a_scores, dtype=torch.bool)
-        l_normal = normal_language_loss(n_normal, n_valid)
-        a_idx = torch.argmax(a_scores)
-        l_abnormal = a_abnormal[a_idx]
-        n_max = n_scores.max()
-        a_max = a_scores[a_idx]
-        l_rank = mil_ranking_loss(a_max, n_max, mil_margin)
-        l_sparse = abnormal_sparsity_loss(a_scores, a_valid)
-        total = (
-            lambda_normal * l_normal
-            + lambda_abnormal * l_abnormal
-            + lambda_rank * l_rank
-            + lambda_sparse * l_sparse
-        )
+        valid = torch.ones_like(scores, dtype=torch.bool)
+        video_max = scores.max()
+        if int(video_label) == 0:
+            l_normal = normal_language_loss(normal_nll, valid)
+            total = lambda_normal * l_normal
+            normal_losses.append(float(l_normal.item()))
+            normal_max_scores.append(float(video_max.item()))
+        else:
+            max_idx = torch.argmax(scores)
+            l_abnormal = abnormal_nll[max_idx]
+            l_sparse = abnormal_sparsity_loss(scores, valid)
+            total = lambda_abnormal * l_abnormal + lambda_sparse * l_sparse
+            abnormal_losses.append(float(l_abnormal.item()))
+            sparse_losses.append(float(l_sparse.item()))
+            abnormal_max_scores.append(float(video_max.item()))
 
         total_losses.append(float(total.item()))
-        normal_losses.append(float(l_normal.item()))
-        abnormal_losses.append(float(l_abnormal.item()))
-        rank_losses.append(float(l_rank.item()))
-        sparse_losses.append(float(l_sparse.item()))
-        normal_max_scores.append(float(n_max.item()))
-        abnormal_max_scores.append(float(a_max.item()))
-        ranking_hits.append(1.0 if a_max.item() > n_max.item() else 0.0)
+        all_scores.extend(scores.cpu().tolist())
+        all_labels.extend(labels.cpu().long().tolist())
+        video_scores.append(float(video_max.item()))
+        video_labels.append(int(video_label))
 
-        all_scores.extend(n_scores.cpu().tolist())
-        all_scores.extend(a_scores.cpu().tolist())
-        all_labels.extend(n_labels.cpu().long().tolist())
-        all_labels.extend(a_labels.cpu().long().tolist())
-        video_scores.extend([float(n_max.item()), float(a_max.item())])
-        video_labels.extend([0, 1])
+    if seen_video_ids != set(video_sampler.video_ids):
+        missing = sorted(set(video_sampler.video_ids) - seen_video_ids)
+        raise RuntimeError(f"validation videos missing: {missing}")
+
+    for abnormal_score in abnormal_max_scores:
+        for normal_score in normal_max_scores:
+            rank_losses.append(float(mil_ranking_loss(
+                torch.tensor(abnormal_score),
+                torch.tensor(normal_score),
+                mil_margin,
+            ).item()))
 
     scores_arr = np.array(all_scores)
     labels_arr = np.array(all_labels)
     video_scores_arr = np.array(video_scores)
     video_labels_arr = np.array(video_labels)
+    ranking_total = len(abnormal_max_scores) * len(normal_max_scores)
+    ranking_hits = [
+        1.0 if a > n else 0.0
+        for a in abnormal_max_scores
+        for n in normal_max_scores
+    ]
     metrics = {
         "total_loss": finite_mean(total_losses),
         "normal_language_loss": finite_mean(normal_losses),
@@ -1015,20 +1024,26 @@ def validate_mil_rank(
         "ranking_accuracy": finite_mean(ranking_hits),
         "alpha": float(torch.sigmoid(model.alpha_logit).item()),
         "n_samples": len(all_labels),
+        "n_videos": len(seen_video_ids),
+        "n_unique_videos": len(seen_video_ids),
+        "ranking_pairs": ranking_total,
     }
     if HAS_SKLEARN and len(set(labels_arr)) > 1:
         metrics["auc"] = roc_auc_score(labels_arr, scores_arr)
         metrics["ap"] = average_precision_score(labels_arr, scores_arr)
-        metrics["video_auc"] = roc_auc_score(video_labels_arr, video_scores_arr)
-        metrics["video_ap"] = average_precision_score(video_labels_arr, video_scores_arr)
     else:
         metrics["auc"] = 0.5
         metrics["ap"] = 0.0
+    if HAS_SKLEARN and len(set(video_labels_arr)) > 1:
+        metrics["video_auc"] = roc_auc_score(video_labels_arr, video_scores_arr)
+        metrics["video_ap"] = average_precision_score(video_labels_arr, video_scores_arr)
+    else:
         metrics["video_auc"] = 0.5
         metrics["video_ap"] = 0.0
+    metrics["total_loss"] = metrics["total_loss"] + lambda_rank * metrics["ranking_loss"]
     pred = (scores_arr > 0).astype(int)
     metrics["accuracy"] = float((pred == labels_arr).mean()) if len(labels_arr) else 0.0
-    model.train()
+    model.train(was_training)
     return metrics
 
 
@@ -1102,7 +1117,8 @@ def main():
     lora_config = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha,
         target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+        lora_dropout=0.0 if args.objective == "mil_rank" else 0.05,
+        bias="none", task_type="CAUSAL_LM",
     )
     qwen = get_peft_model(qwen, lora_config)
 
@@ -1135,7 +1151,7 @@ def main():
         max_windows=args.max_windows,
     )
     from hivau_dataset import hivau_collate
-    from hivau_sampler import VideoChunkSampler, VideoPairSampler
+    from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
     train_loader = None
     train_pair_sampler = None
     if args.objective == "answer_ce":
@@ -1153,7 +1169,7 @@ def main():
         )
 
     val_loader = None
-    val_pair_sampler = None
+    val_video_sampler = None
     val_ds = None
     if args.val_json:
         val_root = args.val_video_root or args.video_root
@@ -1165,11 +1181,11 @@ def main():
         if args.objective == "answer_ce":
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
         else:
-            val_pair_sampler = VideoPairSampler(val_ds.samples, shuffle=False, seed=args.seed)
+            val_video_sampler = SequentialVideoSampler(val_ds.samples)
             print(
-                f"MIL val videos: normal={len(val_pair_sampler.normal_videos)} "
-                f"abnormal={len(val_pair_sampler.abnormal_videos)} "
-                f"pairs={len(val_pair_sampler)}"
+                f"MIL val unique videos: total={len(val_video_sampler)} "
+                f"normal={sum(1 for v in val_video_sampler.video_ids if val_video_sampler.video_labels[v] == 0)} "
+                f"abnormal={sum(1 for v in val_video_sampler.video_ids if val_video_sampler.video_labels[v] == 1)}"
             )
 
     # ---- optimizer ----
@@ -1300,64 +1316,69 @@ def main():
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(pairs) - group_start)
 
-                normal_selected_idx, normal_max_score = _mine_video_max_window(
-                    model, processor, tokenizer, train_ds, normal_indices,
-                    device, dtype,
-                    args.status_prompt, args.normal_answer, args.abnormal_answer,
-                    args.llm_micro_batch,
-                )
-                abnormal_selected_idx, abnormal_max_score = _mine_video_max_window(
-                    model, processor, tokenizer, train_ds, abnormal_indices,
-                    device, dtype,
-                    args.status_prompt, args.normal_answer, args.abnormal_answer,
-                    args.llm_micro_batch,
-                )
+                was_training = model.training
+                model.eval()
+                try:
+                    normal_selected_idx, normal_max_score = _mine_video_max_window(
+                        model, processor, tokenizer, train_ds, normal_indices,
+                        device, dtype,
+                        args.status_prompt, args.normal_answer, args.abnormal_answer,
+                        args.llm_micro_batch,
+                    )
+                    abnormal_selected_idx, abnormal_max_score = _mine_video_max_window(
+                        model, processor, tokenizer, train_ds, abnormal_indices,
+                        device, dtype,
+                        args.status_prompt, args.normal_answer, args.abnormal_answer,
+                        args.llm_micro_batch,
+                    )
 
-                normal_total = sum(
-                    int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
-                    for i in normal_indices
-                )
-                abnormal_total = sum(
-                    int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
-                    for i in abnormal_indices
-                )
+                    normal_total = sum(
+                        int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
+                        for i in normal_indices
+                    )
+                    abnormal_total = sum(
+                        int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
+                        for i in abnormal_indices
+                    )
 
-                normal_logit, normal_selected_loss, _, normal_metrics = _backward_mil_video_pass(
-                    model, processor, tokenizer, train_ds, normal_indices,
-                    device, dtype,
-                    args.status_prompt, args.normal_answer, args.abnormal_answer,
-                    args.llm_micro_batch,
-                    normal_selected_idx,
-                    is_abnormal=False,
-                    total_windows=normal_total,
-                    lambda_normal=args.lambda_normal,
-                    lambda_sparse=args.lambda_sparse,
-                    grad_scale=group_size,
-                )
-                abnormal_logit, abnormal_selected_loss, abnormal_selected_sparse, abnormal_metrics = _backward_mil_video_pass(
-                    model, processor, tokenizer, train_ds, abnormal_indices,
-                    device, dtype,
-                    args.status_prompt, args.normal_answer, args.abnormal_answer,
-                    args.llm_micro_batch,
-                    abnormal_selected_idx,
-                    is_abnormal=True,
-                    total_windows=abnormal_total,
-                    lambda_normal=args.lambda_normal,
-                    lambda_sparse=args.lambda_sparse,
-                    grad_scale=group_size,
-                )
+                    normal_logit, normal_selected_loss, _, normal_metrics = _backward_mil_video_pass(
+                        model, processor, tokenizer, train_ds, normal_indices,
+                        device, dtype,
+                        args.status_prompt, args.normal_answer, args.abnormal_answer,
+                        args.llm_micro_batch,
+                        normal_selected_idx,
+                        is_abnormal=False,
+                        total_windows=normal_total,
+                        lambda_normal=args.lambda_normal,
+                        lambda_sparse=args.lambda_sparse,
+                        grad_scale=group_size,
+                    )
+                    abnormal_logit, abnormal_selected_loss, abnormal_selected_sparse, abnormal_metrics = _backward_mil_video_pass(
+                        model, processor, tokenizer, train_ds, abnormal_indices,
+                        device, dtype,
+                        args.status_prompt, args.normal_answer, args.abnormal_answer,
+                        args.llm_micro_batch,
+                        abnormal_selected_idx,
+                        is_abnormal=True,
+                        total_windows=abnormal_total,
+                        lambda_normal=args.lambda_normal,
+                        lambda_sparse=args.lambda_sparse,
+                        grad_scale=group_size,
+                    )
 
-                ranking_loss = args.lambda_rank * mil_ranking_loss(
-                    abnormal_logit, normal_logit, args.mil_margin,
-                )
-                final_loss = ranking_loss
-                if normal_selected_loss is not None:
-                    final_loss = final_loss + normal_selected_loss
-                if abnormal_selected_loss is not None:
-                    final_loss = final_loss + args.lambda_abnormal * abnormal_selected_loss
-                if abnormal_selected_sparse is not None:
-                    final_loss = final_loss + abnormal_selected_sparse
-                (final_loss / group_size).backward()
+                    ranking_loss = args.lambda_rank * mil_ranking_loss(
+                        abnormal_logit, normal_logit, args.mil_margin,
+                    )
+                    final_loss = ranking_loss
+                    if normal_selected_loss is not None:
+                        final_loss = final_loss + normal_selected_loss
+                    if abnormal_selected_loss is not None:
+                        final_loss = final_loss + args.lambda_abnormal * abnormal_selected_loss
+                    if abnormal_selected_sparse is not None:
+                        final_loss = final_loss + abnormal_selected_sparse
+                    (final_loss / group_size).backward()
+                finally:
+                    model.train(was_training)
 
                 is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(pairs)
                 if is_update:
@@ -1420,9 +1441,9 @@ def main():
                 best_metric = metrics["auc"]
                 save_stage1_checkpoint(Path(args.log_dir) / "best", epoch)
                 print(f"  best auc={best_metric:.4f}")
-        elif args.objective == "mil_rank" and val_pair_sampler is not None and val_ds is not None:
+        elif args.objective == "mil_rank" and val_video_sampler is not None and val_ds is not None:
             metrics = validate_mil_rank(
-                model, val_ds, val_pair_sampler, processor, tokenizer, device, dtype,
+                model, val_ds, val_video_sampler, processor, tokenizer, device, dtype,
                 args.status_prompt, args.normal_answer, args.abnormal_answer,
                 args.llm_micro_batch,
                 args.lambda_normal, args.lambda_abnormal, args.lambda_rank,

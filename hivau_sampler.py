@@ -5,7 +5,7 @@ from typing import Iterator, List, Tuple
 
 from torch.utils.data import Sampler
 
-from mil_utils import cycle_pairs, group_video_chunks, split_normal_abnormal_videos
+from mil_utils import cycle_pairs, group_video_chunks, infer_video_labels, split_normal_abnormal_videos
 
 
 class VideoChunkSampler(Sampler):
@@ -91,3 +91,20 @@ class VideoPairSampler:
             normal_indices = [ref.index for ref in self.grouped[normal_vid]]
             abnormal_indices = [ref.index for ref in self.grouped[abnormal_vid]]
             yield normal_vid, normal_indices, abnormal_vid, abnormal_indices
+
+
+class SequentialVideoSampler:
+    """Yield each video exactly once with chunks in temporal order."""
+
+    def __init__(self, samples: List[dict]):
+        self.grouped = group_video_chunks(samples)
+        self.video_labels = infer_video_labels(samples)
+        self.video_ids = sorted(self.grouped.keys())
+
+    def __len__(self) -> int:
+        return len(self.video_ids)
+
+    def __iter__(self) -> Iterator[Tuple[str, List[int], int]]:
+        for vid in self.video_ids:
+            indices = [ref.index for ref in self.grouped[vid]]
+            yield vid, indices, int(self.video_labels[vid])
