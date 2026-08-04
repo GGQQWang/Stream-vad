@@ -48,35 +48,28 @@ def _layer_indices(model) -> List[int]:
     return [0, n // 4, n // 2, 3 * n // 4, n - 1]
 
 
-def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
-    af = a.detach().float().flatten()
-    bf = b.detach().float().flatten()
-    denom = (af.norm().item() * bf.norm().item())
-    if denom < 1e-12:
-        return 1.0 if torch.allclose(af, bf, atol=1e-8) else 0.0
-    return (af @ bf).item() / denom
-
-
 def _metrics(a: torch.Tensor, b: torch.Tensor) -> dict:
-    """Compute comparison metrics between two tensors."""
+    """Compute comparison metrics.  Cosine uses float64 accumulation."""
     if a.dtype == torch.bool or a.dtype in (torch.int32, torch.int64):
         exact = torch.equal(a.cpu(), b.cpu())
         return {"shape_match": a.shape == b.shape, "exact_match": exact}
 
-    a_f = a.detach().float().cpu()
-    b_f = b.detach().float().cpu()
-    diff = a_f - b_f
-    max_abs = diff.abs().max().item()
-    mean_abs = diff.abs().mean().item()
-    rel_l2 = diff.norm().item() / max(a_f.norm().item(), 1e-12)
-    cos = _cosine(a_f, b_f)
+    # float64 for stable cosine on large tensors
+    x = a.detach().reshape(-1).cpu().to(torch.float64)
+    y = b.detach().reshape(-1).cpu().to(torch.float64)
+    diff = x - y
+
+    norm_x = torch.linalg.vector_norm(x)
+    denom = (norm_x * torch.linalg.vector_norm(y)).clamp_min(1e-30)
+    cosine = float((torch.dot(x, y) / denom).clamp(-1.0, 1.0))
+
     return {
         "shape_match": a.shape == b.shape,
         "finite": a.isfinite().all().item() and b.isfinite().all().item(),
-        "max_abs": max_abs,
-        "mean_abs": mean_abs,
-        "relative_l2": rel_l2,
-        "cosine": cos,
+        "max_abs": diff.abs().max().item(),
+        "mean_abs": diff.abs().mean().item(),
+        "relative_l2": float(torch.linalg.vector_norm(diff) / norm_x.clamp_min(1e-30)),
+        "cosine": cosine,
     }
 
 
