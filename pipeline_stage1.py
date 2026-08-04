@@ -782,19 +782,20 @@ def _backward_mil_video_pass(
     is_abnormal: bool,
     total_windows: int,
     lambda_normal: float,
+    lambda_abnormal: float,
     lambda_sparse: float,
+    lambda_rank: float,
+    rank_active: bool,
     grad_scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, Dict[str, float]]:
+) -> Dict[str, float]:
     """Second MIL pass for one video.
 
-    Returns selected logit, selected direct-language loss if applicable,
-    selected sparsity loss if applicable, and detached metrics.
+    The selected ranking term is immediately backpropagated on the video side
+    that owns it, so normal and abnormal Qwen graphs are never held together.
     """
     embed_fn = _find_embed(model.qwen)
     ssm_cache: dict = {}
-    selected_logit: torch.Tensor | None = None
-    selected_language: torch.Tensor | None = None
-    selected_sparse: torch.Tensor | None = None
+    found_selected = False
     metrics: Dict[str, float] = {
         "language_loss": 0.0,
         "sparsity_loss": 0.0,
@@ -827,11 +828,16 @@ def _backward_mil_video_pass(
                 metrics["sparsity_loss"] += float(sparse_loss.detach().item())
 
             if selected_mask.any():
+                found_selected = True
                 selected_logit = logits[selected_mask].squeeze(0)
                 selected_language = abnormal_language_loss(
                     abnormal_nll, selected_global_idx, global_indices,
                 )
                 selected_sparse = lambda_sparse * probs[selected_mask].squeeze(0) / max(total_windows, 1)
+                selected_loss = selected_sparse + lambda_abnormal * selected_language
+                if rank_active:
+                    selected_loss = selected_loss - lambda_rank * selected_logit
+                (selected_loss / grad_scale).backward()
                 metrics["language_loss"] = float(selected_language.detach().item())
                 metrics["sparsity_loss"] += float(selected_sparse.detach().item())
                 metrics["max_score"] = float(selected_logit.detach().item())
@@ -847,27 +853,34 @@ def _backward_mil_video_pass(
                 metrics["language_loss"] += float(normal_loss.detach().item() / max(lambda_normal, 1e-12))
 
             if selected_mask.any():
+                found_selected = True
                 selected_normal_nll = normal_nll[selected_mask].squeeze(0)
-                selected_abnormal_nll = _compute_answer_nll(
-                    model.qwen, embed_fn, tokenizer, states[selected_mask], 1,
-                    prompt_text, normal_answer, abnormal_answer,
-                    micro_batch=llm_micro_batch,
-                ).squeeze(0)
-                selected_logit = anomaly_logits_from_nll(
-                    selected_normal_nll, selected_abnormal_nll,
-                )
                 selected_language = lambda_normal * selected_normal_nll / max(total_windows, 1)
+                selected_loss = selected_language
+                if rank_active:
+                    selected_abnormal_nll = _compute_answer_nll(
+                        model.qwen, embed_fn, tokenizer, states[selected_mask], 1,
+                        prompt_text, normal_answer, abnormal_answer,
+                        micro_batch=llm_micro_batch,
+                    ).squeeze(0)
+                    selected_logit = anomaly_logits_from_nll(
+                        selected_normal_nll, selected_abnormal_nll,
+                    )
+                    selected_loss = selected_loss + lambda_rank * selected_logit
+                    metrics["max_score"] = float(selected_logit.detach().item())
+                else:
+                    metrics["max_score"] = 0.0
+                (selected_loss / grad_scale).backward()
                 metrics["language_loss"] += float((selected_normal_nll.detach() / max(total_windows, 1)).item())
-                metrics["max_score"] = float(selected_logit.detach().item())
 
         for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
             if is_last:
                 ssm_cache.pop(vid, None)
 
-    if selected_logit is None:
+    if not found_selected:
         raise RuntimeError(f"selected window {selected_global_idx} was not found in second MIL pass")
     ssm_cache.clear()
-    return selected_logit, selected_language, selected_sparse, metrics
+    return metrics
 
 
 @torch.no_grad()
@@ -1104,6 +1117,12 @@ def main():
         attn_implementation=args.attn_implementation,
         device_map=None, low_cpu_mem_usage=True,
     ).to(device)
+    qwen.config.use_cache = False
+    if hasattr(qwen, "gradient_checkpointing_enable"):
+        qwen.gradient_checkpointing_enable()
+        print("Enabled Qwen gradient checkpointing and disabled use_cache.")
+    else:
+        print("WARNING: Qwen model does not expose gradient_checkpointing_enable(); use_cache disabled only.")
 
     _verify_attention_backend(qwen, args.attn_implementation)
 
@@ -1341,7 +1360,13 @@ def main():
                         for i in abnormal_indices
                     )
 
-                    normal_logit, normal_selected_loss, _, normal_metrics = _backward_mil_video_pass(
+                    ranking_loss_value = max(
+                        0.0,
+                        args.mil_margin - abnormal_max_score + normal_max_score,
+                    )
+                    rank_active = ranking_loss_value > 0.0
+
+                    normal_metrics = _backward_mil_video_pass(
                         model, processor, tokenizer, train_ds, normal_indices,
                         device, dtype,
                         args.status_prompt, args.normal_answer, args.abnormal_answer,
@@ -1350,10 +1375,13 @@ def main():
                         is_abnormal=False,
                         total_windows=normal_total,
                         lambda_normal=args.lambda_normal,
+                        lambda_abnormal=args.lambda_abnormal,
                         lambda_sparse=args.lambda_sparse,
+                        lambda_rank=args.lambda_rank,
+                        rank_active=rank_active,
                         grad_scale=group_size,
                     )
-                    abnormal_logit, abnormal_selected_loss, abnormal_selected_sparse, abnormal_metrics = _backward_mil_video_pass(
+                    abnormal_metrics = _backward_mil_video_pass(
                         model, processor, tokenizer, train_ds, abnormal_indices,
                         device, dtype,
                         args.status_prompt, args.normal_answer, args.abnormal_answer,
@@ -1362,21 +1390,14 @@ def main():
                         is_abnormal=True,
                         total_windows=abnormal_total,
                         lambda_normal=args.lambda_normal,
+                        lambda_abnormal=args.lambda_abnormal,
                         lambda_sparse=args.lambda_sparse,
+                        lambda_rank=args.lambda_rank,
+                        rank_active=rank_active,
                         grad_scale=group_size,
                     )
-
-                    ranking_loss = args.lambda_rank * mil_ranking_loss(
-                        abnormal_logit, normal_logit, args.mil_margin,
-                    )
-                    final_loss = ranking_loss
-                    if normal_selected_loss is not None:
-                        final_loss = final_loss + normal_selected_loss
-                    if abnormal_selected_loss is not None:
-                        final_loss = final_loss + args.lambda_abnormal * abnormal_selected_loss
-                    if abnormal_selected_sparse is not None:
-                        final_loss = final_loss + abnormal_selected_sparse
-                    (final_loss / group_size).backward()
+                    normal_metrics["max_score"] = normal_max_score
+                    abnormal_metrics["max_score"] = abnormal_max_score
                 finally:
                     model.train(was_training)
 
@@ -1390,13 +1411,13 @@ def main():
                 raw_total = (
                     args.lambda_normal * normal_metrics["language_loss"]
                     + args.lambda_abnormal * abnormal_metrics["language_loss"]
-                    + float(ranking_loss.detach().item())
+                    + args.lambda_rank * ranking_loss_value
                     + abnormal_metrics["sparsity_loss"]
                 )
                 train_losses.append(raw_total)
                 train_normal_losses.append(normal_metrics["language_loss"])
                 train_abnormal_losses.append(abnormal_metrics["language_loss"])
-                train_rank_losses.append(float((ranking_loss.detach() / max(args.lambda_rank, 1e-12)).item()))
+                train_rank_losses.append(ranking_loss_value)
                 train_sparse_losses.append(abnormal_metrics["sparsity_loss"] / max(args.lambda_sparse, 1e-12))
                 train_normal_max.append(normal_metrics["max_score"])
                 train_abnormal_max.append(abnormal_metrics["max_score"])
