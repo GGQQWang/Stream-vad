@@ -32,7 +32,24 @@ if [ "$TORCH_BEFORE" != "$TORCH_AFTER" ]; then
     exit 1
 fi
 
-python -m pip check
+set +e
+PIP_CHECK_OUTPUT=$(python -m pip check 2>&1)
+PIP_CHECK_CODE=$?
+set -e
+
+echo "$PIP_CHECK_OUTPUT"
+
+UNEXPECTED=$(printf '%s\n' "$PIP_CHECK_OUTPUT" |
+    grep -vF "decord 0.6.0 is not supported on this platform" |
+    grep -vF "No broken requirements found." || true)
+
+if [ "$PIP_CHECK_CODE" -ne 0 ] && [ -n "$UNEXPECTED" ]; then
+    echo "ERROR: unexpected dependency problems:"
+    echo "$UNEXPECTED"
+    exit 1
+fi
+
+echo "pip check: PASS (known Decord metadata warning ignored)"
 
 # ---- verify ----
 echo ""

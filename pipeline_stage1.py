@@ -379,7 +379,7 @@ def main():
     parser.add_argument("--val-video-root", default="",
                        help="validation video root; defaults to --video-root")
     parser.add_argument("--log-dir", default="./logs/stage1")
-    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1,
@@ -398,8 +398,8 @@ def main():
     )
     parser.add_argument("--min-pixels", type=int, default=200704,
                        help="Qwen2-VL min_pixels (448*448=200704)")
-    parser.add_argument("--max-pixels", type=int, default=802816,
-                       help="Qwen2-VL max_pixels (896*896=802816)")
+    parser.add_argument("--max-pixels", type=int, default=200704,
+                       help="Qwen2-VL max_pixels (448*448=200704)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument(

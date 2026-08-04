@@ -13,14 +13,21 @@ import argparse
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 BENCH_SCRIPT = """
 import argparse, sys, time
+from pathlib import Path
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+
+# ensure project root is on sys.path
+PROJECT_ROOT = Path("{project_root}")
+sys.path.insert(0, str(PROJECT_ROOT))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model-path", required=True)
@@ -122,6 +129,9 @@ def main():
     parser.add_argument("--video-path", required=True)
     args = parser.parse_args()
 
+    project_root = Path(__file__).resolve().parents[1]
+    bench_script = BENCH_SCRIPT.format(project_root=project_root)
+
     micro_sizes = [1, 2, 4, 8]
 
     print("| vit_micro_batch | time (s) | mem_alloc (GB) | mem_reserved (GB) | tokens |")
@@ -130,7 +140,7 @@ def main():
     for mb in micro_sizes:
         try:
             result = subprocess.run(
-                [sys.executable, "-c", BENCH_SCRIPT,
+                [sys.executable, "-c", bench_script,
                  "--model-path", args.model_path,
                  "--video-path", args.video_path,
                  "--vit-micro-batch", str(mb)],
