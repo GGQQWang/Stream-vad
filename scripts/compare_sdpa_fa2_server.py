@@ -44,8 +44,11 @@ def load_and_run(model_path: str, attn_impl: str, all_clips):
     rotary = rotary[mask]
     cu = torch.nn.functional.pad(seqlens.cumsum(0), (1, 0), value=0).int()
 
-    for blk in visual.blocks:
-        patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16,
+    ):
+        for blk in visual.blocks:
+            patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
 
     tokens = visual.merger(patches)
 
@@ -79,18 +82,22 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # ---- prepare identical input ----
+    assert torch.cuda.is_available()
+    torch.cuda.init()
+
     from decord import VideoReader, cpu
     vr = VideoReader(args.video_path, ctx=cpu(0))
-    n_frames = min(len(vr), 20 * 4)  # small: 4 clips
-    indices = list(range(0, n_frames, max(1, len(vr) // (20 * 4))))[: 20 * 4]
+    target_frames = 20 * 4
+    if len(vr) < target_frames:
+        raise RuntimeError(f"Video has {len(vr)} frames, need {target_frames}")
+    indices = list(range(target_frames))
     frames = vr.get_batch(indices).asnumpy()
     frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
     F = 20
-    n_clips = min(4, frames.shape[0] // F)
-    all_clips = [frames[i*F:(i+1)*F] for i in range(n_clips)]
+    all_clips = [frames[i*F:(i+1)*F] for i in range(4)]
+    assert len(all_clips) == 4, f"Expected 4 clips, got {len(all_clips)}"
 
-    print(f"=== SDPA vs FA2 comparison ({n_clips} clips) ===\n")
+    print(f"=== SDPA vs FA2 comparison (4 clips) ===\n")
 
     # ---- SDPA ----
     print("Loading SDPA model ...")

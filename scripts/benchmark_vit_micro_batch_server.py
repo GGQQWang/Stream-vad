@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Benchmark ViT micro-batch sizes under FlashAttention-2.
+"""Frozen-ViT micro-batch benchmark (FlashAttention-2).
 
-Each micro-batch size runs in an independent subprocess to avoid
-GPU memory cache contamination.
+Measures the visual tower forward only (frozen in training).
+Each micro-batch size runs in an independent subprocess.
 
 Server usage:
     python scripts/benchmark_vit_micro_batch_server.py \
@@ -30,6 +30,9 @@ parser.add_argument("--warmup", type=int, default=2)
 parser.add_argument("--measure", type=int, default=5)
 args = parser.parse_args()
 
+assert torch.cuda.is_available()
+torch.cuda.init()
+
 # load model
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     args.model_path, torch_dtype=torch.bfloat16,
@@ -37,61 +40,58 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
     device_map=None, low_cpu_mem_usage=True,
 ).cuda().eval()
 
-processor = Qwen2VLProcessor.from_pretrained(args.model_path)
+# fixed 448×448 for reproducible benchmark
+processor = Qwen2VLProcessor.from_pretrained(
+    args.model_path,
+    min_pixels=200704,
+    max_pixels=200704,
+)
 
-# load a real video chunk
+# check FA2 backend
+visual = model.visual
+vis_cls = type(visual.blocks[0].attn).__name__ if hasattr(visual.blocks[0], "attn") else type(visual.blocks[0]).__name__
+print(f"Vision attention class: {vis_cls}")
+
 from decord import VideoReader, cpu
 vr = VideoReader(args.video_path, ctx=cpu(0))
-n_frames = min(len(vr), 20 * 32)
-indices = list(range(0, n_frames, max(1, len(vr) // (20 * 32))))[: 20 * 32]
+target_frames = 20 * 32
+if len(vr) < target_frames:
+    raise RuntimeError(f"Video has {len(vr)} frames, benchmark needs {target_frames}")
+indices = list(range(target_frames))
 frames = vr.get_batch(indices).asnumpy()
 frames = torch.from_numpy(frames).permute(0, 3, 1, 2)
 
-# split into max_windows=32 clips of 20 frames each
-max_w = 32
 F = 20
-n_clips = min(max_w, frames.shape[0] // F)
-all_clips = [frames[i*F:(i+1)*F] for i in range(n_clips)]
+all_clips = [frames[i*F:(i+1)*F] for i in range(target_frames // F)]
+assert len(all_clips) == 32, f"Expected 32 clips, got {len(all_clips)}"
 
 processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
 pv = processed["pixel_values_videos"].cuda()
 gthw = processed["video_grid_thw"].cuda()
+print(f"grid_thw sample: {gthw[:2].tolist()}")
 
-# ViT forward
-visual = model.visual
-
-# import compression
+# use project's ViTForwarder
 from temporal import TemporalTokenReducer
-reducer = TemporalTokenReducer()
+from vit_forwarder import ViTForwarder
+
+vit = ViTForwarder(visual, TemporalTokenReducer()).cuda().eval()
 
 def run_vit(micro_size):
-    patch_counts = gthw.detach().cpu().prod(dim=1).tolist()
-    pixel_clips = torch.split(pv, patch_counts, dim=0)
-    total = gthw.shape[0]
-
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    for start in range(0, total, micro_size):
-        end = min(start + micro_size, total)
-        micro_pv = torch.cat(pixel_clips[start:end], dim=0)
-        micro_gthw = gthw[start:end]
-
-        patches = visual.patch_embed(micro_pv)
-        rotary = visual.rot_pos_emb(micro_gthw)
-        mask, seqlens = reducer(patches, micro_gthw)
-        patches = patches[mask]
-        rotary = rotary[mask]
-        cu = torch.nn.functional.pad(seqlens.cumsum(0), (1,0), value=0).int()
-
-        for blk in visual.blocks:
-            patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
-
-        _ = visual.merger(patches)
+    with torch.inference_mode(), torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16,
+    ):
+        tokens, counts = vit.forward_batch_micro(
+            pv, gthw, micro_batch_size=micro_size,
+        )
 
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
-    return elapsed
+
+    assert torch.isfinite(tokens).all(), "ViT output non-finite"
+    return elapsed, tokens.shape[0]
 
 # warmup
 for _ in range(args.warmup):
@@ -103,12 +103,13 @@ mem_alloc = []
 mem_reserved = []
 for _ in range(args.measure):
     torch.cuda.reset_peak_memory_stats()
-    t = run_vit(args.vit_micro_batch)
+    t, n_tok = run_vit(args.vit_micro_batch)
     times.append(t)
     mem_alloc.append(torch.cuda.max_memory_allocated() / 1024**3)
     mem_reserved.append(torch.cuda.max_memory_reserved() / 1024**3)
 
 print(f"MB={args.vit_micro_batch} "
+      f"tokens={n_tok} "
       f"time={np.mean(times):.3f}s±{np.std(times):.3f}s "
       f"mem_alloc={np.mean(mem_alloc):.2f}GB "
       f"mem_reserved={np.mean(mem_reserved):.2f}GB")
@@ -123,8 +124,8 @@ def main():
 
     micro_sizes = [1, 2, 4, 8]
 
-    print("| vit_micro_batch | time (s) | mem_alloc (GB) | mem_reserved (GB) |")
-    print("|----------------|----------|----------------|-------------------|")
+    print("| vit_micro_batch | time (s) | mem_alloc (GB) | mem_reserved (GB) | tokens |")
+    print("|----------------|----------|----------------|-------------------|--------|")
 
     for mb in micro_sizes:
         try:
