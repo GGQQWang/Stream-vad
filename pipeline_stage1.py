@@ -314,6 +314,62 @@ def validate(
     return metrics
 
 
+def _verify_attention_backend(model: nn.Module, requested: str) -> None:
+    """Check that the loaded model actually uses the requested attention backend."""
+    print(f"\n--- Attention Backend Check (requested={requested}) ---")
+
+    # 1. config-level
+    cfg_attn = getattr(model.config, "_attn_implementation", None)
+    print(f"  model.config._attn_implementation = {cfg_attn}")
+
+    # 2. flash-attn availability
+    from transformers.utils import is_flash_attn_2_available
+    fa2_ok = is_flash_attn_2_available()
+    print(f"  is_flash_attn_2_available() = {fa2_ok}")
+
+    if requested == "flash_attention_2":
+        if not fa2_ok:
+            raise RuntimeError(
+                "flash_attention_2 requested but is_flash_attn_2_available()=False. "
+                "Install flash-attn: pip install flash-attn --no-build-isolation"
+            )
+
+    # 3. vision attention class
+    visual = _find_visual(model)
+    first_vis_blk = visual.blocks[0]
+    vis_attn_cls = type(first_vis_blk.attn).__name__ if hasattr(first_vis_blk, "attn") else type(first_vis_blk).__name__
+    print(f"  vision block attention class = {vis_attn_cls}")
+
+    # 4. text attention class
+    if hasattr(model.model, "language_model"):
+        lm = model.model.language_model
+    else:
+        lm = model.model
+    first_txt_layer = lm.layers[0]
+    txt_attn_cls = type(first_txt_layer.self_attn).__name__
+    print(f"  text layer attention class    = {txt_attn_cls}")
+
+    # 5. dtype
+    print(f"  model dtype = {model.dtype}")
+    print(f"  visual dtype = {next(visual.parameters()).dtype}")
+
+    # 6. validate FA2
+    if requested == "flash_attention_2":
+        if "FlashAttention2" not in vis_attn_cls:
+            raise RuntimeError(
+                f"Vision attention is {vis_attn_cls}, expected *FlashAttention2*"
+            )
+        if "FlashAttention2" not in txt_attn_cls:
+            raise RuntimeError(
+                f"Text attention is {txt_attn_cls}, expected *FlashAttention2*"
+            )
+        print("  FLASH-ATTENTION-2 BACKEND CHECK: PASS")
+    else:
+        print("  SDPA BACKEND CHECK: PASS")
+
+    print("---\n")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
@@ -346,6 +402,13 @@ def main():
                        help="Qwen2-VL max_pixels (896*896=802816)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        choices=["flash_attention_2", "sdpa"],
+        default="flash_attention_2",
+        help="Attention backend for Qwen2-VL construction.",
+    )
     parser.add_argument("--save-every", type=int, default=1)
     args = parser.parse_args()
 
@@ -359,9 +422,15 @@ def main():
     print("Loading Qwen2-VL ...")
     dtype = torch.bfloat16
     qwen = Qwen2VLForConditionalGeneration.from_pretrained(
-        args.model_path, torch_dtype=dtype,
-        device_map=None, low_cpu_mem_usage=True,
+        args.model_path,
+        torch_dtype=dtype,
+        attn_implementation=args.attn_implementation,
+        device_map=None,
+        low_cpu_mem_usage=True,
     ).to(device)
+
+    # ---- verify attention backend ----
+    _verify_attention_backend(qwen, args.attn_implementation)
 
     # ---- processor ----
     processor = Qwen2VLProcessor.from_pretrained(
