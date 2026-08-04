@@ -46,7 +46,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
     set_seed,
 )
-from peft import LoraConfig, get_peft_model
+from peft import PeftModel
 
 from temporal import TemporalTokenReducer
 from spatial import SpatialTokenCompressor
@@ -373,20 +373,28 @@ def _verify_attention_backend(model: nn.Module, requested: str) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", required=True)
+    parser.add_argument(
+        "--stage1-dir",
+        required=True,
+        help="Stage-1 checkpoint directory containing lora_adapter/ and train_state.pt",
+    )
     parser.add_argument("--train-json", required=True)
     parser.add_argument("--val-json", default="")
     parser.add_argument("--video-root", required=True)
     parser.add_argument("--val-video-root", default="",
                        help="validation video root; defaults to --video-root")
-    parser.add_argument("--log-dir", default="./logs/stage1")
+    parser.add_argument("--log-dir", default="./logs/stage2")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--grad-accum", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=1,
                        help="videos per step (increase with grad-accum)")
-    parser.add_argument("--lora-r", type=int, default=8)
-    parser.add_argument("--lora-alpha", type=int, default=16)
-    parser.add_argument("--d-ssm", type=int, default=256)
+    parser.add_argument("--lora-r", type=int, default=8,
+                       help="deprecated; Stage-2 loads LoRA from --stage1-dir")
+    parser.add_argument("--lora-alpha", type=int, default=16,
+                       help="deprecated; Stage-2 loads LoRA from --stage1-dir")
+    parser.add_argument("--d-ssm", type=int, default=None,
+                       help="override Stage-1 d_ssm; defaults to the value stored in train_state.pt")
     parser.add_argument("--frames-per-clip", type=int, default=20)
     parser.add_argument("--max-windows", type=int, default=32,
                        help="max consecutive clips per video sample")
@@ -414,9 +422,20 @@ def main():
 
     set_seed(args.seed)
     device = torch.device(args.device)
-    assert device.type == "cuda", "Stage-1 requires CUDA"
+    assert device.type == "cuda", "Stage-2 requires CUDA"
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
+
+    stage1_dir = Path(args.stage1_dir)
+    stage1_lora_dir = stage1_dir / "lora_adapter"
+    stage1_state_path = stage1_dir / "train_state.pt"
+    if not stage1_lora_dir.is_dir():
+        raise FileNotFoundError(f"Stage-1 LoRA adapter not found: {stage1_lora_dir}")
+    if not stage1_state_path.is_file():
+        raise FileNotFoundError(f"Stage-1 train_state.pt not found: {stage1_state_path}")
+
+    stage1_state = torch.load(stage1_state_path, map_location="cpu")
+    d_ssm = args.d_ssm if args.d_ssm is not None else stage1_state.get("d_ssm", 256)
 
     # ---- model ----
     print("Loading Qwen2-VL ...")
@@ -439,22 +458,22 @@ def main():
         max_pixels=args.max_pixels,
     )
 
-    # ---- LoRA on LLM q/v projections ----
-    lora_config = LoraConfig(
-        r=args.lora_r, lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj"],
-        lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
+    # ---- load Stage-1 LoRA; Stage-2 continues training it ----
+    qwen = PeftModel.from_pretrained(
+        qwen, str(stage1_lora_dir), is_trainable=True,
     )
-    qwen = get_peft_model(qwen, lora_config)
 
     # freeze ViT
     for p in _find_visual(qwen).parameters():
         p.requires_grad = False
 
     model = StreamingVADModel(
-        qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
+        qwen, d_ssm=d_ssm, llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=args.vit_micro_batch,
     ).to(device)
+    model.ssm.load_state_dict(stage1_state["ssm"])
+    model.adapter.load_state_dict(stage1_state["adapter"])
+    print(f"Loaded Stage-1 LoRA, SSM, and adapter from {stage1_dir}")
 
     # Set LLM transformer (LoRA-aware path so LoRA layers get gradients)
     if hasattr(qwen, "base_model"):
@@ -658,6 +677,8 @@ def main():
             "epoch": epoch,
             "global_step": global_step,
             "best_auc": best_auc,
+            "stage1_dir": str(stage1_dir),
+            "d_ssm": d_ssm,
         }
 
         if val_loader is not None:

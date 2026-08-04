@@ -220,6 +220,130 @@ def masked_token_ce(
     return loss, info
 
 
+def _select_supervised_state_tokens(
+    state_emb: torch.Tensor,
+    binary: torch.Tensor,
+    valid_mask: torch.Tensor,
+    supervision_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select window state tokens according to the configured supervision mode."""
+    valid = valid_mask & (binary >= 0)
+    valid_b, valid_w = valid.nonzero(as_tuple=True)
+    if len(valid_b) == 0:
+        return state_emb.new_empty((0, state_emb.shape[-1])), binary.new_empty((0,), dtype=torch.long)
+
+    if supervision_mode == "last_window":
+        keep_b: List[int] = []
+        keep_w: List[int] = []
+        for b in range(valid_mask.shape[0]):
+            bw = valid_w[valid_b == b]
+            if len(bw) > 0:
+                keep_b.append(b)
+                keep_w.append(int(bw[-1]))
+        b_idx = torch.tensor(keep_b, device=state_emb.device, dtype=torch.long)
+        w_idx = torch.tensor(keep_w, device=state_emb.device, dtype=torch.long)
+        return state_emb[b_idx, w_idx], binary[b_idx, w_idx].long()
+
+    return state_emb[valid_b, valid_w], binary[valid_b, valid_w].long()
+
+
+def _generation_loss_terms(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    answer_token_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, int, float]:
+    """Return per-sample answer NLLs plus lightweight logging terms."""
+    N, _, V = logits.shape
+    shift_logits = logits[:, :-1].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    shift_mask = answer_token_mask[:, 1:].contiguous()
+
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, V),
+        shift_labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).reshape(N, -1)
+
+    mask_f = shift_mask.float()
+    per_sample = (ce * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1)
+    n_answer_tokens = int(shift_mask.sum().item())
+    ce_sum = float((ce.detach() * mask_f).sum().item())
+    return per_sample, n_answer_tokens, ce_sum
+
+
+def backward_generation_loss_microbatched(
+    qwen,
+    embed_fn: nn.Module,
+    tokenizer,
+    state_tokens: torch.Tensor,
+    targets: torch.Tensor,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    abnormal_loss_weight: float,
+    micro_batch: int,
+    grad_scale: float,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Run Qwen in micro-batches and backprop the globally normalised loss."""
+    device = state_tokens.device
+    N = state_tokens.shape[0]
+    mb = N if micro_batch <= 0 else micro_batch
+    weights_all = torch.where(
+        targets > 0,
+        torch.full_like(targets, abnormal_loss_weight, dtype=torch.float32),
+        torch.ones_like(targets, dtype=torch.float32),
+    ).to(device)
+    denom = weights_all.sum().clamp_min(1)
+
+    total_loss = state_tokens.new_tensor(0.0)
+    n_answer_tokens = 0
+    ce_sum = 0.0
+
+    for start in range(0, N, mb):
+        end = min(start + mb, N)
+        state_slice = state_tokens[start:end].detach()
+        if state_tokens.requires_grad:
+            state_slice.requires_grad_(True)
+
+        gen_batch = build_status_generation_batch(
+            embed_fn, tokenizer, state_slice, targets[start:end],
+            prompt_text=prompt_text,
+            normal_answer=normal_answer,
+            abnormal_answer=abnormal_answer,
+        )
+
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+            out = qwen(
+                inputs_embeds=gen_batch["inputs_embeds"],
+                attention_mask=gen_batch["attention_mask"],
+                use_cache=False,
+                return_dict=True,
+            )
+            per_sample, n_tokens, batch_ce_sum = _generation_loss_terms(
+                out.logits, gen_batch["labels"], gen_batch["answer_token_mask"],
+            )
+            micro_loss = (per_sample * weights_all[start:end]).sum() / denom
+
+        total_loss = total_loss + micro_loss.detach()
+        n_answer_tokens += n_tokens
+        ce_sum += batch_ce_sum
+        (micro_loss / grad_scale).backward()
+        if state_tokens.requires_grad and state_slice.grad is not None:
+            state_tokens[start:end].backward(
+                state_slice.grad, retain_graph=(end < N),
+            )
+
+    info = {
+        "loss": total_loss.item(),
+        "n_samples": N,
+        "n_answer_tokens": n_answer_tokens,
+        "mean_ce_per_token": ce_sum / max(n_answer_tokens, 1),
+    }
+    return total_loss, info
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -423,23 +547,20 @@ def validate_generative(
             if is_last:
                 ssm_cache.pop(vid, None)
 
-        # select state tokens
-        valid = valid_mask & (binary >= 0)
-        valid_b, valid_w = valid.nonzero(as_tuple=True)
-        if len(valid_b) == 0:
+        all_state, all_target = _select_supervised_state_tokens(
+            state_emb, binary, valid_mask, supervision_mode,
+        )
+        if all_state.shape[0] == 0:
             continue
-
-        all_state = state_emb[valid_b, valid_w]                 # [Nv, H]
-        all_target = binary[valid_b, valid_w].long()            # [Nv]
 
         # candidate NLL
         n_normal, n_abnormal = _compute_candidate_nll(
             model.qwen, embed_fn, tokenizer,
-            all_state, all_target,
+            all_state,
             prompt_text, normal_answer, abnormal_answer,
             micro_batch=llm_micro_batch,
         )
-        score = n_abnormal - n_normal                           # higher → more abnormal
+        score = n_normal - n_abnormal                           # higher → more abnormal
         all_scores.extend(score.cpu().tolist())
         all_labels.extend(all_target.cpu().tolist())
 
@@ -468,7 +589,7 @@ def validate_generative(
 
 def _compute_candidate_nll(
     qwen, embed_fn, tokenizer,
-    state_tokens, targets,
+    state_tokens,
     prompt_text, normal_answer, abnormal_answer,
     micro_batch: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -478,26 +599,24 @@ def _compute_candidate_nll(
     normal_nll = torch.zeros(N, device=device)
     abnormal_nll = torch.zeros(N, device=device)
 
-    for answer, out_tensor in [(normal_answer, normal_nll), (abnormal_answer, abnormal_nll)]:
-        batch = build_status_generation_batch(
-            embed_fn, tokenizer, state_tokens, torch.zeros(N, device=device, dtype=torch.long),
-            prompt_text, normal_answer=answer, abnormal_answer=answer,
-        )
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            out = qwen(inputs_embeds=batch["inputs_embeds"], attention_mask=batch["attention_mask"],
-                       use_cache=False, return_dict=True)
-        logits = out.logits
-        shift_logits = logits[:, :-1]
-        shift_labels = batch["labels"][:, 1:]
-        shift_mask = batch["answer_token_mask"][:, 1:]
-
-        ce = F.cross_entropy(
-            shift_logits.reshape(-1, shift_logits.shape[-1]),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        ).reshape(N, -1)
-        out_tensor.copy_((ce * shift_mask.float()).sum(dim=1) / shift_mask.float().sum(dim=1).clamp_min(1))
+    mb = N if micro_batch <= 0 else micro_batch
+    for candidate_target, out_tensor in [(0, normal_nll), (1, abnormal_nll)]:
+        for start in range(0, N, mb):
+            end = min(start + mb, N)
+            candidate_targets = torch.full(
+                (end - start,), candidate_target, device=device, dtype=torch.long,
+            )
+            batch = build_status_generation_batch(
+                embed_fn, tokenizer, state_tokens[start:end], candidate_targets,
+                prompt_text, normal_answer=normal_answer, abnormal_answer=abnormal_answer,
+            )
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                out = qwen(inputs_embeds=batch["inputs_embeds"], attention_mask=batch["attention_mask"],
+                           use_cache=False, return_dict=True)
+            per_sample, _, _ = _generation_loss_terms(
+                out.logits, batch["labels"], batch["answer_token_mask"],
+            )
+            out_tensor[start:end].copy_(per_sample)
 
     return normal_nll, abnormal_nll
 
@@ -533,11 +652,12 @@ def main():
     parser.add_argument("--abnormal-answer", default="Abnormal")
     parser.add_argument("--status-prompt", default="Current video status:")
     parser.add_argument("--abnormal-loss-weight", type=float, default=1.0)
-    parser.add_argument("--generation-examples", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
     args = parser.parse_args()
+    if args.save_every < 1:
+        raise ValueError("--save-every must be >= 1")
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -626,6 +746,29 @@ def main():
 
     embed_fn = _find_embed(model.qwen)
 
+    def save_stage1_checkpoint(ckpt_dir: Path, epoch: int) -> None:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        model.qwen.save_pretrained(str(ckpt_dir / "lora_adapter"))
+        torch.save({
+            "ssm": model.ssm.state_dict(),
+            "adapter": model.adapter.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+            "prompt": args.status_prompt,
+            "normal_answer": args.normal_answer,
+            "abnormal_answer": args.abnormal_answer,
+            "supervision_mode": args.supervision_mode,
+            "frames_per_clip": args.frames_per_clip,
+            "max_windows": args.max_windows,
+            "d_ssm": args.d_ssm,
+            "lora_r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
+        }, str(ckpt_dir / "train_state.pt"))
+        processor.save_pretrained(str(ckpt_dir))
+        tokenizer.save_pretrained(str(ckpt_dir))
+
     # ---- loop ----
     model.train()
     qwen.train()
@@ -663,50 +806,25 @@ def main():
                     pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
                 )
 
-            # select state tokens
-            valid = valid_mask & (binary >= 0)
-            valid_b, valid_w = valid.nonzero(as_tuple=True)
-            if len(valid_b) == 0:
-                continue
-
-            if args.supervision_mode == "last_window":
-                # take last valid window per chunk
-                keep: List[int] = []
-                for b in range(B):
-                    bw = valid_w[valid_b == b]
-                    if len(bw) > 0:
-                        keep.append(int(bw[-1]))
-                all_state = state_emb[range(B), torch.tensor(keep, device=device)]
-                all_target = binary[range(B), torch.tensor(keep, device=device)].long()
-            else:
-                all_state = state_emb[valid_b, valid_w]
-                all_target = binary[valid_b, valid_w].long()
-
-            # build generation batch
-            gen_batch = build_status_generation_batch(
-                embed_fn, tokenizer, all_state, all_target,
-                prompt_text=args.status_prompt,
-                normal_answer=args.normal_answer,
-                abnormal_answer=args.abnormal_answer,
+            all_state, all_target = _select_supervised_state_tokens(
+                state_emb, binary, valid_mask, args.supervision_mode,
             )
-
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                out = model.qwen(
-                    inputs_embeds=gen_batch["inputs_embeds"],
-                    attention_mask=gen_batch["attention_mask"],
-                    use_cache=False,
-                    return_dict=True,
-                )
-                loss, loss_info = masked_token_ce(
-                    out.logits, gen_batch["labels"], gen_batch["answer_token_mask"],
-                    targets=all_target, abnormal_loss_weight=args.abnormal_loss_weight,
-                )
+            if all_state.shape[0] == 0:
+                continue
 
             group_start = (step // args.grad_accum) * args.grad_accum
             group_size = min(args.grad_accum, len(train_loader) - group_start)
-            raw_loss = loss.detach()
-            loss = loss / group_size
-            loss.backward()
+            raw_loss, loss_info = backward_generation_loss_microbatched(
+                model.qwen, embed_fn, tokenizer,
+                all_state, all_target,
+                prompt_text=args.status_prompt,
+                normal_answer=args.normal_answer,
+                abnormal_answer=args.abnormal_answer,
+                abnormal_loss_weight=args.abnormal_loss_weight,
+                micro_batch=args.llm_micro_batch,
+                grad_scale=group_size,
+                dtype=dtype,
+            )
 
             is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
             if is_update:
@@ -728,29 +846,8 @@ def main():
         writer.add_scalar("train/loss", np.mean(train_losses), epoch)
         writer.add_scalar("train/lr", lr, epoch)
 
-        # checkpoint
-        ckpt_dir = Path(args.log_dir) / f"epoch{epoch}"
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        model.qwen.save_pretrained(str(ckpt_dir / "lora_adapter"))
-        torch.save({
-            "ssm": model.ssm.state_dict(),
-            "adapter": model.adapter.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "prompt": args.status_prompt,
-            "normal_answer": args.normal_answer,
-            "abnormal_answer": args.abnormal_answer,
-            "supervision_mode": args.supervision_mode,
-            "frames_per_clip": args.frames_per_clip,
-            "max_windows": args.max_windows,
-            "d_ssm": args.d_ssm,
-            "lora_r": args.lora_r,
-            "lora_alpha": args.lora_alpha,
-        }, str(ckpt_dir / "train_state.pt"))
-        processor.save_pretrained(str(ckpt_dir))
-        tokenizer.save_pretrained(str(ckpt_dir))
+        if (epoch + 1) % args.save_every == 0:
+            save_stage1_checkpoint(Path(args.log_dir) / f"epoch{epoch}", epoch)
 
         if val_loader is not None:
             metrics = validate_generative(
@@ -766,7 +863,7 @@ def main():
                     writer.add_scalar(f"val/{k}", v, epoch)
             if metrics.get("auc", 0) > best_metric:
                 best_metric = metrics["auc"]
-                model.qwen.save_pretrained(str(Path(args.log_dir) / "lora_best"))
+                save_stage1_checkpoint(Path(args.log_dir) / "best", epoch)
                 print(f"  best auc={best_metric:.4f}")
 
     writer.close()

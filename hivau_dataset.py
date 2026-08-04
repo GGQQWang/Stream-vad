@@ -9,6 +9,7 @@ correctly in loss, metrics, and logging.
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -75,7 +76,7 @@ class HIVAUDataset(Dataset):
 
         for video_name, meta in raw.items():
             n = meta["n_frames"]
-            if n < self.clip_span:
+            if n <= 0:
                 continue
             video_path = self.video_root / f"{video_name}.mp4"
             if not video_path.exists():
@@ -87,17 +88,13 @@ class HIVAUDataset(Dataset):
             # per-clip soft + hard labels
             clip_soft: List[float] = []
             clip_bin: List[int] = []
-            n_clips = 0
-            for start in range(0, n - self.clip_span + 1, self.clip_span):
-                clip_fl = frame_labels[
-                    start : start + self.clip_span : sample_interval
-                ]
+            n_clips = math.ceil(n / self.clip_span)
+            for ci in range(n_clips):
+                start = ci * self.clip_span
+                end = min(start + self.clip_span, n)
+                clip_fl = frame_labels[start:end:sample_interval]
                 clip_soft.append(float(clip_fl.mean()))
                 clip_bin.append(1 if clip_fl.any() else 0)
-                n_clips += 1
-
-            if n_clips == 0:
-                continue
 
             total_windows_all += n_clips
 
@@ -107,6 +104,7 @@ class HIVAUDataset(Dataset):
                 self.samples.append({
                     "video_path": str(video_path),
                     "video_id": video_name,
+                    "n_frames": n,
                     "chunk_start": lo,
                     "chunk_end": hi,
                     "n_total_windows": n_clips,
@@ -126,9 +124,7 @@ class HIVAUDataset(Dataset):
         for video_name, meta in raw.items():
             if video_name not in video_window_counts:
                 continue
-            n_clips_ref = 0
-            for start in range(0, meta["n_frames"] - self.clip_span + 1, self.clip_span):
-                n_clips_ref += 1
+            n_clips_ref = math.ceil(meta["n_frames"] / self.clip_span)
             assert video_window_counts[video_name] == n_clips_ref, (
                 f"{video_name}: chunks cover {video_window_counts[video_name]} "
                 f"windows, expected {n_clips_ref}"
@@ -158,12 +154,22 @@ class HIVAUDataset(Dataset):
 
         vr = VideoReader(meta["video_path"], ctx=cpu(0))
         total_video_frames = len(vr)
+        if total_video_frames != meta["n_frames"]:
+            raise ValueError(
+                f"{meta['video_id']}: annotation n_frames={meta['n_frames']} "
+                f"but decoded video has {total_video_frames} frames. "
+                "Fix the annotation or video file before training."
+            )
 
         clips: List[torch.Tensor] = []
         for ci in range(ci_start, ci_end):
             start = ci * self.clip_span
-            pts = list(range(start, start + self.clip_span, self.sample_interval))
-            pts = [min(p, total_video_frames - 1) for p in pts]
+            end = min(start + self.clip_span, total_video_frames)
+            pts = list(range(start, end, self.sample_interval))
+            if len(pts) == 0:
+                raise RuntimeError(f"{meta['video_id']}: empty clip at index {ci}")
+            if len(pts) < self.total_frames:
+                pts.extend([pts[-1]] * (self.total_frames - len(pts)))
             f = vr.get_batch(pts).asnumpy()
             f = torch.from_numpy(f).permute(0, 3, 1, 2)       # [F, C, H, W]
             clips.append(f)

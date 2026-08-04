@@ -117,14 +117,14 @@ def test_anomaly_score_direction():
     """Higher NLL(normal) - NLL(abnormal) → more likely abnormal."""
     normal_nll = torch.tensor([0.5, 2.0, 0.3])
     abnormal_nll = torch.tensor([2.0, 0.1, 0.8])
-    score = abnormal_nll - normal_nll
-    # sample 0: 2.0 - 0.5 = 1.5 > 0 → abnormal
-    # sample 1: 0.1 - 2.0 = -1.9 < 0 → normal
-    # sample 2: 0.8 - 0.3 = 0.5 > 0 → abnormal
+    score = normal_nll - abnormal_nll
+    # sample 0: 0.5 - 2.0 = -1.5 < 0 → normal
+    # sample 1: 2.0 - 0.1 = 1.9 > 0 → abnormal
+    # sample 2: 0.3 - 0.8 = -0.5 < 0 → normal
     pred = (score > 0).int()
-    assert pred[0].item() == 1
-    assert pred[1].item() == 0
-    assert pred[2].item() == 1
+    assert pred[0].item() == 0
+    assert pred[1].item() == 1
+    assert pred[2].item() == 0
 
 
 def test_state_prompt_labels_masked():
