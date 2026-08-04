@@ -42,6 +42,15 @@ from spatial import SpatialTokenCompressor
 from ssm_block import SSMBlock
 from vit_forwarder import ViTForwarder
 from hivau_dataset import HIVAUDataset
+from mil_utils import (
+    abnormal_sparsity_loss,
+    anomaly_logits_from_nll,
+    anomaly_probs_from_logits,
+    finite_mean,
+    mil_ranking_loss,
+    normal_language_loss,
+    select_global_max,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +388,7 @@ class StreamingVADGenerationModel(nn.Module):
             nn.Linear(llm_hidden, llm_hidden),
             nn.LayerNorm(llm_hidden),
         )
-        self.alpha_logit = nn.Parameter(torch.tensor(-2.2))
+        self.alpha_logit = nn.Parameter(torch.tensor(-2.1972246))
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
 
@@ -604,11 +613,11 @@ def _compute_candidate_nll(
     """Return NLL for Normal and Abnormal for each state token."""
     device = state_tokens.device
     N = state_tokens.shape[0]
-    normal_nll = torch.zeros(N, device=device)
-    abnormal_nll = torch.zeros(N, device=device)
+    outputs: List[torch.Tensor] = []
 
     mb = N if micro_batch <= 0 else micro_batch
-    for candidate_target, out_tensor in [(0, normal_nll), (1, abnormal_nll)]:
+    for candidate_target in [0, 1]:
+        parts: List[torch.Tensor] = []
         for start in range(0, N, mb):
             end = min(start + mb, N)
             candidate_targets = torch.full(
@@ -624,9 +633,403 @@ def _compute_candidate_nll(
             per_sample, _, _ = _generation_loss_terms(
                 out.logits, batch["labels"], batch["answer_token_mask"],
             )
-            out_tensor[start:end].copy_(per_sample)
+            parts.append(per_sample)
+        outputs.append(torch.cat(parts, dim=0))
 
-    return normal_nll, abnormal_nll
+    return outputs[0], outputs[1]
+
+
+def _compute_answer_nll(
+    qwen, embed_fn, tokenizer,
+    state_tokens: torch.Tensor,
+    target_value: int,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    micro_batch: int = 0,
+) -> torch.Tensor:
+    """Return per-window NLL for one fixed candidate answer."""
+    device = state_tokens.device
+    N = state_tokens.shape[0]
+    mb = N if micro_batch <= 0 else micro_batch
+    parts: List[torch.Tensor] = []
+
+    for start in range(0, N, mb):
+        end = min(start + mb, N)
+        targets = torch.full(
+            (end - start,), target_value, device=device, dtype=torch.long,
+        )
+        batch = build_status_generation_batch(
+            embed_fn, tokenizer, state_tokens[start:end], targets,
+            prompt_text, normal_answer=normal_answer, abnormal_answer=abnormal_answer,
+        )
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            out = qwen(
+                inputs_embeds=batch["inputs_embeds"],
+                attention_mask=batch["attention_mask"],
+                use_cache=False,
+                return_dict=True,
+            )
+        per_sample, _, _ = _generation_loss_terms(
+            out.logits, batch["labels"], batch["answer_token_mask"],
+        )
+        parts.append(per_sample)
+
+    return torch.cat(parts, dim=0)
+
+
+def _single_chunk_batch(dataset: HIVAUDataset, sample_idx: int) -> dict:
+    from hivau_dataset import hivau_collate
+
+    return hivau_collate([dataset[sample_idx]])
+
+
+def _encode_chunk_states(
+    model: StreamingVADGenerationModel,
+    processor: Qwen2VLProcessor,
+    batch: dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    ssm_cache: dict,
+    training: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, dict]:
+    """Encode one chunk and return valid state tokens plus global indices."""
+    frames = batch["frames"][0]                      # [max_w, F, C, H, W]
+    valid_mask_cpu = batch["valid_mask"]             # [1, max_w]
+    valid_mask = valid_mask_cpu.to(device)
+    valid_w_cpu = valid_mask_cpu[0].nonzero(as_tuple=True)[0]
+    if len(valid_w_cpu) == 0:
+        empty = torch.empty(0, model.llm_hidden, device=device)
+        return empty, empty.new_empty((0,), dtype=torch.long), empty.new_empty((0,), dtype=torch.long), batch["chunk_start"][0], ssm_cache
+
+    all_clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
+    processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+    pv = processed["pixel_values_videos"].to(device)
+    gthw = processed["video_grid_thw"].to(device)
+
+    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+        state_emb, _, ssm_cache, _ = model.encode_stream(
+            pv, gthw, valid_mask,
+            batch["video_id"], ssm_cache,
+            training=training,
+        )
+
+    binary = batch["binary"].to(device)
+    valid = valid_mask & (binary >= 0)
+    valid_b, valid_w = valid.nonzero(as_tuple=True)
+    states = state_emb[valid_b, valid_w]
+    targets = binary[valid_b, valid_w].long()
+    chunk_start = int(batch["chunk_start"][0])
+    global_indices = valid_w + chunk_start
+    return states, targets, global_indices.long(), chunk_start, ssm_cache
+
+
+@torch.no_grad()
+def _mine_video_max_window(
+    model: StreamingVADGenerationModel,
+    processor: Qwen2VLProcessor,
+    tokenizer,
+    dataset: HIVAUDataset,
+    sample_indices: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    llm_micro_batch: int,
+) -> Tuple[int, float]:
+    """First MIL pass: find the full-video max anomaly logit without grads."""
+    embed_fn = _find_embed(model.qwen)
+    ssm_cache: dict = {}
+    score_chunks: List[Tuple[int, torch.Tensor]] = []
+
+    for sample_idx in sample_indices:
+        batch = _single_chunk_batch(dataset, sample_idx)
+        states, _, _, chunk_start, ssm_cache = _encode_chunk_states(
+            model, processor, batch, device, dtype, ssm_cache, training=False,
+        )
+        if states.shape[0] == 0:
+            continue
+        normal_nll, abnormal_nll = _compute_candidate_nll(
+            model.qwen, embed_fn, tokenizer, states,
+            prompt_text, normal_answer, abnormal_answer,
+            micro_batch=llm_micro_batch,
+        )
+        score_chunks.append((chunk_start, anomaly_logits_from_nll(normal_nll, abnormal_nll).detach()))
+
+        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+            if is_last:
+                ssm_cache.pop(vid, None)
+
+    selected_idx, selected_score = select_global_max(score_chunks)
+    ssm_cache.clear()
+    return selected_idx, float(selected_score.item())
+
+
+def _backward_mil_video_pass(
+    model: StreamingVADGenerationModel,
+    processor: Qwen2VLProcessor,
+    tokenizer,
+    dataset: HIVAUDataset,
+    sample_indices: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    llm_micro_batch: int,
+    selected_global_idx: int,
+    is_abnormal: bool,
+    total_windows: int,
+    lambda_normal: float,
+    lambda_sparse: float,
+    grad_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, Dict[str, float]]:
+    """Second MIL pass for one video.
+
+    Returns selected logit, selected direct-language loss if applicable,
+    selected sparsity loss if applicable, and detached metrics.
+    """
+    embed_fn = _find_embed(model.qwen)
+    ssm_cache: dict = {}
+    selected_logit: torch.Tensor | None = None
+    selected_language: torch.Tensor | None = None
+    selected_sparse: torch.Tensor | None = None
+    metrics: Dict[str, float] = {
+        "language_loss": 0.0,
+        "sparsity_loss": 0.0,
+        "max_score": 0.0,
+    }
+
+    for sample_idx in sample_indices:
+        batch = _single_chunk_batch(dataset, sample_idx)
+        states, _, global_indices, _, ssm_cache = _encode_chunk_states(
+            model, processor, batch, device, dtype, ssm_cache, training=True,
+        )
+        if states.shape[0] == 0:
+            continue
+
+        selected_mask = global_indices == int(selected_global_idx)
+        nonselected_mask = ~selected_mask
+
+        if is_abnormal:
+            normal_nll, abnormal_nll = _compute_candidate_nll(
+                model.qwen, embed_fn, tokenizer, states,
+                prompt_text, normal_answer, abnormal_answer,
+                micro_batch=llm_micro_batch,
+            )
+            logits = anomaly_logits_from_nll(normal_nll, abnormal_nll)
+            probs = anomaly_probs_from_logits(logits)
+
+            if nonselected_mask.any():
+                sparse_loss = lambda_sparse * probs[nonselected_mask].sum() / max(total_windows, 1)
+                (sparse_loss / grad_scale).backward(retain_graph=bool(selected_mask.any()))
+                metrics["sparsity_loss"] += float(sparse_loss.detach().item())
+
+            if selected_mask.any():
+                selected_logit = logits[selected_mask].squeeze(0)
+                selected_language = abnormal_language_loss(
+                    abnormal_nll, selected_global_idx, global_indices,
+                )
+                selected_sparse = lambda_sparse * probs[selected_mask].squeeze(0) / max(total_windows, 1)
+                metrics["language_loss"] = float(selected_language.detach().item())
+                metrics["sparsity_loss"] += float(selected_sparse.detach().item())
+                metrics["max_score"] = float(selected_logit.detach().item())
+        else:
+            normal_nll = _compute_answer_nll(
+                model.qwen, embed_fn, tokenizer, states, 0,
+                prompt_text, normal_answer, abnormal_answer,
+                micro_batch=llm_micro_batch,
+            )
+            if nonselected_mask.any():
+                normal_loss = lambda_normal * normal_nll[nonselected_mask].sum() / max(total_windows, 1)
+                (normal_loss / grad_scale).backward(retain_graph=bool(selected_mask.any()))
+                metrics["language_loss"] += float(normal_loss.detach().item() / max(lambda_normal, 1e-12))
+
+            if selected_mask.any():
+                selected_normal_nll = normal_nll[selected_mask].squeeze(0)
+                selected_abnormal_nll = _compute_answer_nll(
+                    model.qwen, embed_fn, tokenizer, states[selected_mask], 1,
+                    prompt_text, normal_answer, abnormal_answer,
+                    micro_batch=llm_micro_batch,
+                ).squeeze(0)
+                selected_logit = anomaly_logits_from_nll(
+                    selected_normal_nll, selected_abnormal_nll,
+                )
+                selected_language = lambda_normal * selected_normal_nll / max(total_windows, 1)
+                metrics["language_loss"] += float((selected_normal_nll.detach() / max(total_windows, 1)).item())
+                metrics["max_score"] = float(selected_logit.detach().item())
+
+        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+            if is_last:
+                ssm_cache.pop(vid, None)
+
+    if selected_logit is None:
+        raise RuntimeError(f"selected window {selected_global_idx} was not found in second MIL pass")
+    ssm_cache.clear()
+    return selected_logit, selected_language, selected_sparse, metrics
+
+
+@torch.no_grad()
+def _collect_video_candidate_outputs(
+    model: StreamingVADGenerationModel,
+    processor: Qwen2VLProcessor,
+    tokenizer,
+    dataset: HIVAUDataset,
+    sample_indices: List[int],
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    llm_micro_batch: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    embed_fn = _find_embed(model.qwen)
+    ssm_cache: dict = {}
+    normal_parts: List[torch.Tensor] = []
+    abnormal_parts: List[torch.Tensor] = []
+    score_parts: List[torch.Tensor] = []
+    label_parts: List[torch.Tensor] = []
+
+    for sample_idx in sample_indices:
+        batch = _single_chunk_batch(dataset, sample_idx)
+        states, targets, _, _, ssm_cache = _encode_chunk_states(
+            model, processor, batch, device, dtype, ssm_cache, training=False,
+        )
+        if states.shape[0] > 0:
+            normal_nll, abnormal_nll = _compute_candidate_nll(
+                model.qwen, embed_fn, tokenizer, states,
+                prompt_text, normal_answer, abnormal_answer,
+                micro_batch=llm_micro_batch,
+            )
+            scores = anomaly_logits_from_nll(normal_nll, abnormal_nll)
+            normal_parts.append(normal_nll.detach())
+            abnormal_parts.append(abnormal_nll.detach())
+            score_parts.append(scores.detach())
+            label_parts.append(targets.detach())
+
+        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+            if is_last:
+                ssm_cache.pop(vid, None)
+
+    ssm_cache.clear()
+    if not score_parts:
+        raise RuntimeError("video produced no valid candidate outputs")
+    return (
+        torch.cat(normal_parts, dim=0),
+        torch.cat(abnormal_parts, dim=0),
+        torch.cat(score_parts, dim=0),
+        torch.cat(label_parts, dim=0),
+    )
+
+
+@torch.no_grad()
+def validate_mil_rank(
+    model: StreamingVADGenerationModel,
+    dataset: HIVAUDataset,
+    pair_sampler,
+    processor: Qwen2VLProcessor,
+    tokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_text: str,
+    normal_answer: str,
+    abnormal_answer: str,
+    llm_micro_batch: int,
+    lambda_normal: float,
+    lambda_abnormal: float,
+    lambda_rank: float,
+    lambda_sparse: float,
+    mil_margin: float,
+) -> dict:
+    model.eval()
+    all_scores: List[float] = []
+    all_labels: List[int] = []
+    video_scores: List[float] = []
+    video_labels: List[int] = []
+    total_losses: List[float] = []
+    normal_losses: List[float] = []
+    abnormal_losses: List[float] = []
+    rank_losses: List[float] = []
+    sparse_losses: List[float] = []
+    normal_max_scores: List[float] = []
+    abnormal_max_scores: List[float] = []
+    ranking_hits: List[float] = []
+
+    for normal_vid, normal_indices, abnormal_vid, abnormal_indices in tqdm(
+        pair_sampler.iter_epoch(0), total=len(pair_sampler), desc="Val MIL", leave=False,
+    ):
+        n_normal, n_abnormal, n_scores, n_labels = _collect_video_candidate_outputs(
+            model, processor, tokenizer, dataset, normal_indices, device, dtype,
+            prompt_text, normal_answer, abnormal_answer, llm_micro_batch,
+        )
+        a_normal, a_abnormal, a_scores, a_labels = _collect_video_candidate_outputs(
+            model, processor, tokenizer, dataset, abnormal_indices, device, dtype,
+            prompt_text, normal_answer, abnormal_answer, llm_micro_batch,
+        )
+
+        n_valid = torch.ones_like(n_scores, dtype=torch.bool)
+        a_valid = torch.ones_like(a_scores, dtype=torch.bool)
+        l_normal = normal_language_loss(n_normal, n_valid)
+        a_idx = torch.argmax(a_scores)
+        l_abnormal = a_abnormal[a_idx]
+        n_max = n_scores.max()
+        a_max = a_scores[a_idx]
+        l_rank = mil_ranking_loss(a_max, n_max, mil_margin)
+        l_sparse = abnormal_sparsity_loss(a_scores, a_valid)
+        total = (
+            lambda_normal * l_normal
+            + lambda_abnormal * l_abnormal
+            + lambda_rank * l_rank
+            + lambda_sparse * l_sparse
+        )
+
+        total_losses.append(float(total.item()))
+        normal_losses.append(float(l_normal.item()))
+        abnormal_losses.append(float(l_abnormal.item()))
+        rank_losses.append(float(l_rank.item()))
+        sparse_losses.append(float(l_sparse.item()))
+        normal_max_scores.append(float(n_max.item()))
+        abnormal_max_scores.append(float(a_max.item()))
+        ranking_hits.append(1.0 if a_max.item() > n_max.item() else 0.0)
+
+        all_scores.extend(n_scores.cpu().tolist())
+        all_scores.extend(a_scores.cpu().tolist())
+        all_labels.extend(n_labels.cpu().long().tolist())
+        all_labels.extend(a_labels.cpu().long().tolist())
+        video_scores.extend([float(n_max.item()), float(a_max.item())])
+        video_labels.extend([0, 1])
+
+    scores_arr = np.array(all_scores)
+    labels_arr = np.array(all_labels)
+    video_scores_arr = np.array(video_scores)
+    video_labels_arr = np.array(video_labels)
+    metrics = {
+        "total_loss": finite_mean(total_losses),
+        "normal_language_loss": finite_mean(normal_losses),
+        "abnormal_language_loss": finite_mean(abnormal_losses),
+        "ranking_loss": finite_mean(rank_losses),
+        "sparsity_loss": finite_mean(sparse_losses),
+        "normal_max_score": finite_mean(normal_max_scores),
+        "abnormal_max_score": finite_mean(abnormal_max_scores),
+        "ranking_accuracy": finite_mean(ranking_hits),
+        "alpha": float(torch.sigmoid(model.alpha_logit).item()),
+        "n_samples": len(all_labels),
+    }
+    if HAS_SKLEARN and len(set(labels_arr)) > 1:
+        metrics["auc"] = roc_auc_score(labels_arr, scores_arr)
+        metrics["ap"] = average_precision_score(labels_arr, scores_arr)
+        metrics["video_auc"] = roc_auc_score(video_labels_arr, video_scores_arr)
+        metrics["video_ap"] = average_precision_score(video_labels_arr, video_scores_arr)
+    else:
+        metrics["auc"] = 0.5
+        metrics["ap"] = 0.0
+        metrics["video_auc"] = 0.5
+        metrics["video_ap"] = 0.0
+    pred = (scores_arr > 0).astype(int)
+    metrics["accuracy"] = float((pred == labels_arr).mean()) if len(labels_arr) else 0.0
+    model.train()
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -655,11 +1058,17 @@ def main():
     parser.add_argument("--min-pixels", type=int, default=200704)
     parser.add_argument("--max-pixels", type=int, default=200704)
     parser.add_argument("--attn-implementation", type=str, choices=["flash_attention_2", "sdpa"], default="flash_attention_2")
+    parser.add_argument("--objective", choices=["answer_ce", "mil_rank"], default="answer_ce")
     parser.add_argument("--supervision-mode", choices=["all_windows", "last_window"], default="all_windows")
     parser.add_argument("--normal-answer", default="Normal")
     parser.add_argument("--abnormal-answer", default="Abnormal")
     parser.add_argument("--status-prompt", default="Current video status:")
     parser.add_argument("--abnormal-loss-weight", type=float, default=1.0)
+    parser.add_argument("--lambda-normal", type=float, default=1.0)
+    parser.add_argument("--lambda-abnormal", type=float, default=1.0)
+    parser.add_argument("--lambda-rank", type=float, default=1.0)
+    parser.add_argument("--lambda-sparse", type=float, default=1e-3)
+    parser.add_argument("--mil-margin", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
@@ -669,7 +1078,6 @@ def main():
 
     set_seed(args.seed)
     device = torch.device(args.device)
-    assert device.type == "cuda", "Stage-1 requires CUDA"
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
 
@@ -727,14 +1135,26 @@ def main():
         max_windows=args.max_windows,
     )
     from hivau_dataset import hivau_collate
-    from hivau_sampler import VideoChunkSampler
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size,
-        sampler=VideoChunkSampler(train_ds.samples, shuffle=True),
-        collate_fn=hivau_collate,
-    )
+    from hivau_sampler import VideoChunkSampler, VideoPairSampler
+    train_loader = None
+    train_pair_sampler = None
+    if args.objective == "answer_ce":
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size,
+            sampler=VideoChunkSampler(train_ds.samples, shuffle=True),
+            collate_fn=hivau_collate,
+        )
+    else:
+        train_pair_sampler = VideoPairSampler(train_ds.samples, shuffle=True, seed=args.seed)
+        print(
+            f"MIL train videos: normal={len(train_pair_sampler.normal_videos)} "
+            f"abnormal={len(train_pair_sampler.abnormal_videos)} "
+            f"pairs_per_epoch={len(train_pair_sampler)}"
+        )
 
     val_loader = None
+    val_pair_sampler = None
+    val_ds = None
     if args.val_json:
         val_root = args.val_video_root or args.video_root
         val_ds = HIVAUDataset(
@@ -742,12 +1162,21 @@ def main():
             total_sampled_frames=args.frames_per_clip, sample_interval=1,
             max_windows=args.max_windows,
         )
-        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
+        if args.objective == "answer_ce":
+            val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
+        else:
+            val_pair_sampler = VideoPairSampler(val_ds.samples, shuffle=False, seed=args.seed)
+            print(
+                f"MIL val videos: normal={len(val_pair_sampler.normal_videos)} "
+                f"abnormal={len(val_pair_sampler.abnormal_videos)} "
+                f"pairs={len(val_pair_sampler)}"
+            )
 
     # ---- optimizer ----
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-5)
-    updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
+    epoch_units = len(train_loader) if args.objective == "answer_ce" else len(train_pair_sampler)
+    updates_per_epoch = math.ceil(epoch_units / args.grad_accum)
     total_steps = args.epochs * updates_per_epoch
     warmup_steps = _compute_warmup_steps(total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
@@ -765,6 +1194,7 @@ def main():
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
+            "objective": args.objective,
             "prompt": args.status_prompt,
             "normal_answer": args.normal_answer,
             "abnormal_answer": args.abnormal_answer,
@@ -774,6 +1204,11 @@ def main():
             "d_ssm": args.d_ssm,
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
+            "lambda_normal": args.lambda_normal,
+            "lambda_abnormal": args.lambda_abnormal,
+            "lambda_rank": args.lambda_rank,
+            "lambda_sparse": args.lambda_sparse,
+            "mil_margin": args.mil_margin,
         }, str(ckpt_dir / "train_state.pt"))
         processor.save_pretrained(str(ckpt_dir))
         tokenizer.save_pretrained(str(ckpt_dir))
@@ -785,80 +1220,191 @@ def main():
     best_metric = 0.0
 
     for epoch in range(args.epochs):
-        ssm_cache: dict = {}
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         train_losses: List[float] = []
+        train_normal_losses: List[float] = []
+        train_abnormal_losses: List[float] = []
+        train_rank_losses: List[float] = []
+        train_sparse_losses: List[float] = []
+        train_normal_max: List[float] = []
+        train_abnormal_max: List[float] = []
+        train_ranking_hits: List[float] = []
 
-        for step, batch in enumerate(pbar):
-            frames_list = batch["frames"]
-            binary = batch["binary"]
-            valid_mask_cpu = batch["valid_mask"]
-            valid_mask = valid_mask_cpu.to(device)
+        if args.objective == "answer_ce":
+            ssm_cache: dict = {}
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-            B, max_w = binary.shape[:2]
-            all_clips: List[torch.Tensor] = []
-            for b in range(B):
-                f = frames_list[b]
-                for w in range(max_w):
-                    if valid_mask_cpu[b, w]:
-                        all_clips.append(f[w])
-            if not all_clips:
-                continue
+            for step, batch in enumerate(pbar):
+                frames_list = batch["frames"]
+                binary = batch["binary"]
+                valid_mask_cpu = batch["valid_mask"]
+                valid_mask = valid_mask_cpu.to(device)
 
-            processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
-            pv = processed["pixel_values_videos"].to(device)
-            gthw = processed["video_grid_thw"].to(device)
-            binary = binary.to(device)
+                B, max_w = binary.shape[:2]
+                all_clips: List[torch.Tensor] = []
+                for b in range(B):
+                    f = frames_list[b]
+                    for w in range(max_w):
+                        if valid_mask_cpu[b, w]:
+                            all_clips.append(f[w])
+                if not all_clips:
+                    continue
 
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                state_emb, _, ssm_cache, _ = model.encode_stream(
-                    pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
+                processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+                pv = processed["pixel_values_videos"].to(device)
+                gthw = processed["video_grid_thw"].to(device)
+                binary = binary.to(device)
+
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                    state_emb, _, ssm_cache, _ = model.encode_stream(
+                        pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
+                    )
+
+                all_state, all_target = _select_supervised_state_tokens(
+                    state_emb, binary, valid_mask, args.supervision_mode,
+                )
+                if all_state.shape[0] == 0:
+                    continue
+
+                group_start = (step // args.grad_accum) * args.grad_accum
+                group_size = min(args.grad_accum, len(train_loader) - group_start)
+                raw_loss, loss_info = backward_generation_loss_microbatched(
+                    model.qwen, embed_fn, tokenizer,
+                    all_state, all_target,
+                    prompt_text=args.status_prompt,
+                    normal_answer=args.normal_answer,
+                    abnormal_answer=args.abnormal_answer,
+                    abnormal_loss_weight=args.abnormal_loss_weight,
+                    micro_batch=args.llm_micro_batch,
+                    grad_scale=group_size,
+                    dtype=dtype,
                 )
 
-            all_state, all_target = _select_supervised_state_tokens(
-                state_emb, binary, valid_mask, args.supervision_mode,
-            )
-            if all_state.shape[0] == 0:
-                continue
+                is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
+                if is_update:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
 
-            group_start = (step // args.grad_accum) * args.grad_accum
-            group_size = min(args.grad_accum, len(train_loader) - group_start)
-            raw_loss, loss_info = backward_generation_loss_microbatched(
-                model.qwen, embed_fn, tokenizer,
-                all_state, all_target,
-                prompt_text=args.status_prompt,
-                normal_answer=args.normal_answer,
-                abnormal_answer=args.abnormal_answer,
-                abnormal_loss_weight=args.abnormal_loss_weight,
-                micro_batch=args.llm_micro_batch,
-                grad_scale=group_size,
-                dtype=dtype,
-            )
+                train_losses.append(raw_loss.item())
 
-            is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
-            if is_update:
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
+                for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+                    if is_last:
+                        ssm_cache.pop(vid, None)
 
-            train_losses.append(raw_loss.item())
+                pbar.set_postfix(loss=sum(train_losses[-10:]) / min(10, len(train_losses)))
+        else:
+            pairs = list(train_pair_sampler.iter_epoch(epoch))
+            pbar = tqdm(pairs, desc=f"Epoch {epoch} MIL")
+            for step, (normal_vid, normal_indices, abnormal_vid, abnormal_indices) in enumerate(pbar):
+                group_start = (step // args.grad_accum) * args.grad_accum
+                group_size = min(args.grad_accum, len(pairs) - group_start)
 
-            for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-                if is_last:
-                    ssm_cache.pop(vid, None)
+                normal_selected_idx, normal_max_score = _mine_video_max_window(
+                    model, processor, tokenizer, train_ds, normal_indices,
+                    device, dtype,
+                    args.status_prompt, args.normal_answer, args.abnormal_answer,
+                    args.llm_micro_batch,
+                )
+                abnormal_selected_idx, abnormal_max_score = _mine_video_max_window(
+                    model, processor, tokenizer, train_ds, abnormal_indices,
+                    device, dtype,
+                    args.status_prompt, args.normal_answer, args.abnormal_answer,
+                    args.llm_micro_batch,
+                )
 
-            pbar.set_postfix(loss=sum(train_losses[-10:]) / min(10, len(train_losses)))
+                normal_total = sum(
+                    int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
+                    for i in normal_indices
+                )
+                abnormal_total = sum(
+                    int(train_ds.samples[i]["chunk_end"]) - int(train_ds.samples[i]["chunk_start"])
+                    for i in abnormal_indices
+                )
+
+                normal_logit, normal_selected_loss, _, normal_metrics = _backward_mil_video_pass(
+                    model, processor, tokenizer, train_ds, normal_indices,
+                    device, dtype,
+                    args.status_prompt, args.normal_answer, args.abnormal_answer,
+                    args.llm_micro_batch,
+                    normal_selected_idx,
+                    is_abnormal=False,
+                    total_windows=normal_total,
+                    lambda_normal=args.lambda_normal,
+                    lambda_sparse=args.lambda_sparse,
+                    grad_scale=group_size,
+                )
+                abnormal_logit, abnormal_selected_loss, abnormal_selected_sparse, abnormal_metrics = _backward_mil_video_pass(
+                    model, processor, tokenizer, train_ds, abnormal_indices,
+                    device, dtype,
+                    args.status_prompt, args.normal_answer, args.abnormal_answer,
+                    args.llm_micro_batch,
+                    abnormal_selected_idx,
+                    is_abnormal=True,
+                    total_windows=abnormal_total,
+                    lambda_normal=args.lambda_normal,
+                    lambda_sparse=args.lambda_sparse,
+                    grad_scale=group_size,
+                )
+
+                ranking_loss = args.lambda_rank * mil_ranking_loss(
+                    abnormal_logit, normal_logit, args.mil_margin,
+                )
+                final_loss = ranking_loss
+                if normal_selected_loss is not None:
+                    final_loss = final_loss + normal_selected_loss
+                if abnormal_selected_loss is not None:
+                    final_loss = final_loss + args.lambda_abnormal * abnormal_selected_loss
+                if abnormal_selected_sparse is not None:
+                    final_loss = final_loss + abnormal_selected_sparse
+                (final_loss / group_size).backward()
+
+                is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(pairs)
+                if is_update:
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                raw_total = (
+                    args.lambda_normal * normal_metrics["language_loss"]
+                    + args.lambda_abnormal * abnormal_metrics["language_loss"]
+                    + float(ranking_loss.detach().item())
+                    + abnormal_metrics["sparsity_loss"]
+                )
+                train_losses.append(raw_total)
+                train_normal_losses.append(normal_metrics["language_loss"])
+                train_abnormal_losses.append(abnormal_metrics["language_loss"])
+                train_rank_losses.append(float((ranking_loss.detach() / max(args.lambda_rank, 1e-12)).item()))
+                train_sparse_losses.append(abnormal_metrics["sparsity_loss"] / max(args.lambda_sparse, 1e-12))
+                train_normal_max.append(normal_metrics["max_score"])
+                train_abnormal_max.append(abnormal_metrics["max_score"])
+                train_ranking_hits.append(1.0 if abnormal_max_score > normal_max_score else 0.0)
+
+                pbar.set_postfix(
+                    loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
+                    n=normal_vid,
+                    a=abnormal_vid,
+                )
 
         # ---- end of epoch ----
         lr = scheduler.get_last_lr()[0]
         writer.add_scalar("train/loss", np.mean(train_losses), epoch)
         writer.add_scalar("train/lr", lr, epoch)
+        writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
+        if args.objective == "mil_rank":
+            writer.add_scalar("train/normal_language_loss", finite_mean(train_normal_losses), epoch)
+            writer.add_scalar("train/abnormal_language_loss", finite_mean(train_abnormal_losses), epoch)
+            writer.add_scalar("train/ranking_loss", finite_mean(train_rank_losses), epoch)
+            writer.add_scalar("train/sparsity_loss", finite_mean(train_sparse_losses), epoch)
+            writer.add_scalar("train/normal_max_score", finite_mean(train_normal_max), epoch)
+            writer.add_scalar("train/abnormal_max_score", finite_mean(train_abnormal_max), epoch)
+            writer.add_scalar("train/ranking_accuracy", finite_mean(train_ranking_hits), epoch)
 
         if (epoch + 1) % args.save_every == 0:
             save_stage1_checkpoint(Path(args.log_dir) / f"epoch{epoch}", epoch)
 
-        if val_loader is not None:
+        if args.objective == "answer_ce" and val_loader is not None:
             metrics = validate_generative(
                 model, val_loader, processor, tokenizer, device,
                 args.status_prompt, args.normal_answer, args.abnormal_answer,
@@ -874,6 +1420,28 @@ def main():
                 best_metric = metrics["auc"]
                 save_stage1_checkpoint(Path(args.log_dir) / "best", epoch)
                 print(f"  best auc={best_metric:.4f}")
+        elif args.objective == "mil_rank" and val_pair_sampler is not None and val_ds is not None:
+            metrics = validate_mil_rank(
+                model, val_ds, val_pair_sampler, processor, tokenizer, device, dtype,
+                args.status_prompt, args.normal_answer, args.abnormal_answer,
+                args.llm_micro_batch,
+                args.lambda_normal, args.lambda_abnormal, args.lambda_rank,
+                args.lambda_sparse, args.mil_margin,
+            )
+            print(
+                f"  val total={metrics['total_loss']:.4f} normal={metrics['normal_language_loss']:.4f} "
+                f"abnormal={metrics['abnormal_language_loss']:.4f} rank={metrics['ranking_loss']:.4f} "
+                f"sparse={metrics['sparsity_loss']:.4f} n_max={metrics['normal_max_score']:.3f} "
+                f"a_max={metrics['abnormal_max_score']:.3f} rank_acc={metrics['ranking_accuracy']:.3f} "
+                f"alpha={metrics['alpha']:.3f} auc={metrics['auc']:.3f} video_auc={metrics['video_auc']:.3f}"
+            )
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    writer.add_scalar(f"val/{k}", v, epoch)
+            if metrics.get("video_auc", metrics.get("auc", 0)) > best_metric:
+                best_metric = metrics.get("video_auc", metrics.get("auc", 0))
+                save_stage1_checkpoint(Path(args.log_dir) / "best", epoch)
+                print(f"  best video_auc={best_metric:.4f}")
 
     writer.close()
     print("Done.")

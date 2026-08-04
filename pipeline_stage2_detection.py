@@ -100,7 +100,7 @@ class StreamingVADModel(nn.Module):
             nn.Linear(llm_hidden, llm_hidden),
             nn.LayerNorm(llm_hidden),
         )
-        self.alpha_logit = nn.Parameter(torch.tensor(-2.2))
+        self.alpha_logit = nn.Parameter(torch.tensor(-2.1972246))
         self.score_head = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden // 4),
             nn.GELU(),
@@ -430,7 +430,6 @@ def main():
 
     set_seed(args.seed)
     device = torch.device(args.device)
-    assert device.type == "cuda", "Stage-2 requires CUDA"
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
 
