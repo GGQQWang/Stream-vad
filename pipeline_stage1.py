@@ -1,7 +1,7 @@
 """Stage-1 generative semantic alignment training.
 
-Video → frozen ViT → temporal/spatial compress → streaming SSM → adapter
-→ state tokens → full Qwen2-VL (LoRA, lm_head) → generate Normal/Abnormal
+Video → frozen ViT → temporal/spatial compress → streaming SSM
+→ ViT residual + gated adapter delta → full Qwen2-VL (LoRA, lm_head) → generate Normal/Abnormal
 → token-level causal LM loss.
 
 This is GENERATIVE alignment, NOT detection.  Detection training
@@ -67,6 +67,12 @@ def _find_eos(tokenizer) -> int:
     if im_end != tokenizer.unk_token_id:
         return im_end
     return tokenizer.eos_token_id
+
+
+def _compute_warmup_steps(total_steps: int) -> int:
+    if total_steps <= 1:
+        return 0
+    return min(total_steps - 1, max(1, int(0.03 * total_steps)))
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +379,7 @@ class StreamingVADGenerationModel(nn.Module):
             nn.Linear(llm_hidden, llm_hidden),
             nn.LayerNorm(llm_hidden),
         )
+        self.alpha_logit = nn.Parameter(torch.tensor(-2.2))
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
 
@@ -445,8 +452,9 @@ class StreamingVADGenerationModel(nn.Module):
             ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
-        ssm_out = ssm_out + window_batch                           # residual
-        state_embeddings = self.adapter(ssm_out)                   # [B, max_w, H]
+        delta = self.adapter(ssm_out)
+        alpha = torch.sigmoid(self.alpha_logit)
+        state_embeddings = window_batch + alpha * delta            # [B, max_w, H]
 
         if return_stats:
             return state_embeddings, window_batch, ssm_state_cache, stats
@@ -741,7 +749,7 @@ def main():
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-5)
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     total_steps = args.epochs * updates_per_epoch
-    warmup_steps = max(10, int(0.03 * total_steps))
+    warmup_steps = _compute_warmup_steps(total_steps)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
     embed_fn = _find_embed(model.qwen)
@@ -752,6 +760,7 @@ def main():
         torch.save({
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
+            "alpha_logit": model.alpha_logit.detach().cpu(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,

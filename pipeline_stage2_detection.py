@@ -13,7 +13,7 @@ Architecture:
        ↓  split + pool
   [B, T, 3584]  window vectors
        ↓  SSMBlock
-  [B, T, d_ssm]  →  adapter  →  [B, T, llm_hidden]
+  [B, T, d_ssm]  →  gated adapter delta + ViT residual  →  [B, T, llm_hidden]
        ↓  Qwen2-VL LLM (LoRA, inputs_embeds)
   [B, T, llm_hidden]
        ↓  score_head
@@ -65,6 +65,12 @@ def _find_visual(model: Qwen2VLForConditionalGeneration) -> nn.Module:
     return model.model.visual
 
 
+def _compute_warmup_steps(total_steps: int) -> int:
+    if total_steps <= 1:
+        return 0
+    return min(total_steps - 1, max(1, int(0.03 * total_steps)))
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -94,6 +100,7 @@ class StreamingVADModel(nn.Module):
             nn.Linear(llm_hidden, llm_hidden),
             nn.LayerNorm(llm_hidden),
         )
+        self.alpha_logit = nn.Parameter(torch.tensor(-2.2))
         self.score_head = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden // 4),
             nn.GELU(),
@@ -173,9 +180,10 @@ class StreamingVADModel(nn.Module):
             ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
-        # 4. semantic-fidelity residual + adapter
-        ssm_out = ssm_out + window_batch
-        llm_embeds = self.adapter(ssm_out)
+        # 4. semantic-fidelity residual: preserve raw ViT semantics by default
+        delta = self.adapter(ssm_out)
+        alpha = torch.sigmoid(self.alpha_logit)
+        llm_embeds = window_batch + alpha * delta
 
         # 5. LLM → score head
         llm_out = self.llm(
@@ -473,6 +481,10 @@ def main():
     ).to(device)
     model.ssm.load_state_dict(stage1_state["ssm"])
     model.adapter.load_state_dict(stage1_state["adapter"])
+    if "alpha_logit" in stage1_state:
+        model.alpha_logit.data.copy_(stage1_state["alpha_logit"].to(device))
+    else:
+        print("Stage-1 checkpoint has no alpha_logit; using default alpha ~= 0.10")
     print(f"Loaded Stage-1 LoRA, SSM, and adapter from {stage1_dir}")
 
     # Set LLM transformer (LoRA-aware path so LoRA layers get gradients)
@@ -530,7 +542,7 @@ def main():
     optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-5)
     updates_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     total_steps = args.epochs * updates_per_epoch
-    warmup_steps = max(10, int(0.03 * total_steps))          # 3% of total, min 10
+    warmup_steps = _compute_warmup_steps(total_steps)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, warmup_steps, total_steps
     )
@@ -671,6 +683,7 @@ def main():
         ckpt = {
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
+            "alpha_logit": model.alpha_logit.detach().cpu(),
             "score_head": model.score_head.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
