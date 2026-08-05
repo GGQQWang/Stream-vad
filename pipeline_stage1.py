@@ -395,6 +395,85 @@ class StreamingVADGenerationModel(nn.Module):
         # Full Qwen model with LoRA
         self.qwen = qwen
 
+    def encode_window_features(
+        self,
+        window_batch: torch.Tensor,
+        valid_mask: torch.Tensor,
+        chunk_video_ids: List[str],
+        ssm_state_cache: dict,
+        training: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """SSM + gated residual over precomputed per-window visual vectors."""
+        valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
+        ssm_out = torch.zeros_like(window_batch)
+        for b in range(window_batch.shape[0]):
+            vid = chunk_video_ids[b]
+            bw = valid_w[valid_b == b]
+            if len(bw) == 0:
+                continue
+            wv = window_batch[b, bw].unsqueeze(0)
+            prev = ssm_state_cache.get(vid)
+            if training and prev is not None:
+                prev = {i: s.detach() for i, s in prev.items()}
+            out, new_st = self.ssm.forward_chunk(wv, state=prev)
+            ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
+            ssm_state_cache[vid] = new_st
+
+        delta = self.adapter(ssm_out)
+        alpha = torch.sigmoid(self.alpha_logit)
+        state_embeddings = window_batch + alpha * delta
+        return state_embeddings, window_batch, ssm_state_cache
+
+    def extract_window_features(
+        self,
+        pixel_values: torch.Tensor,
+        video_grid_thw: torch.Tensor,
+        valid_mask: torch.Tensor,
+        return_stats: bool = False,
+    ):
+        """Frozen ViT + temporal/spatial compression to per-window vectors."""
+        B, max_w = valid_mask.shape
+        device = valid_mask.device
+        n_valid = video_grid_thw.shape[0]
+        if n_valid == 0:
+            window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device)
+            if return_stats:
+                return window_batch, {}
+            return window_batch
+
+        vit_out = self.vit.forward_batch_micro(
+            pixel_values, video_grid_thw,
+            micro_batch_size=self.vit_micro_batch,
+            return_stats=return_stats,
+        )
+        if return_stats:
+            tokens, merged_counts, stats = vit_out
+        else:
+            tokens, merged_counts = vit_out
+            stats = {}
+
+        tg_list = video_grid_thw[:, 0].tolist()
+        clip_token_counts: List[int] = []
+        ptr = 0
+        for tg in tg_list:
+            count = int(merged_counts[ptr: ptr + tg].sum().item())
+            clip_token_counts.append(count)
+            ptr += tg
+        clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
+        window_vecs = torch.stack(
+            [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
+        )
+        valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
+        window_batch = torch.zeros(
+            B, max_w, self.llm_hidden,
+            device=device, dtype=window_vecs.dtype,
+        )
+        window_batch[valid_b, valid_w] = window_vecs
+
+        if return_stats:
+            return window_batch, stats
+        return window_batch
+
     def encode_stream(
         self,
         pixel_values: torch.Tensor,
@@ -421,49 +500,19 @@ class StreamingVADGenerationModel(nn.Module):
             z = torch.zeros(B, max_w, self.llm_hidden, device=device)
             return z, z, ssm_state_cache, ({} if return_stats else None)
 
-        vit_out = self.vit.forward_batch_micro(
-            pixel_values, video_grid_thw,
-            micro_batch_size=self.vit_micro_batch,
-            return_stats=return_stats,
-        )
         if return_stats:
-            tokens, merged_counts, stats = vit_out
+            window_batch, stats = self.extract_window_features(
+                pixel_values, video_grid_thw, valid_mask, return_stats=True,
+            )
         else:
-            tokens, merged_counts = vit_out
+            window_batch = self.extract_window_features(
+                pixel_values, video_grid_thw, valid_mask, return_stats=False,
+            )
             stats = {}
 
-        tg_list = video_grid_thw[:, 0].tolist()
-        clip_token_counts: List[int] = []
-        ptr = 0
-        for tg in tg_list:
-            count = int(merged_counts[ptr: ptr + tg].sum().item())
-            clip_token_counts.append(count)
-            ptr += tg
-        clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
-        window_vecs = torch.stack(
-            [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
+        state_embeddings, window_batch, ssm_state_cache = self.encode_window_features(
+            window_batch, valid_mask, chunk_video_ids, ssm_state_cache, training=training,
         )
-        valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
-        window_batch = torch.zeros(B, max_w, self.llm_hidden, device=device, dtype=window_vecs.dtype)
-        window_batch[valid_b, valid_w] = window_vecs
-
-        ssm_out = torch.zeros_like(window_batch)
-        for b in range(B):
-            vid = chunk_video_ids[b]
-            bw = valid_w[valid_b == b]
-            if len(bw) == 0:
-                continue
-            wv = window_vecs[valid_b == b].unsqueeze(0)
-            prev = ssm_state_cache.get(vid)
-            if training and prev is not None:
-                prev = {i: s.detach() for i, s in prev.items()}
-            out, new_st = self.ssm.forward_chunk(wv, state=prev)
-            ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
-            ssm_state_cache[vid] = new_st
-
-        delta = self.adapter(ssm_out)
-        alpha = torch.sigmoid(self.alpha_logit)
-        state_embeddings = window_batch + alpha * delta            # [B, max_w, H]
 
         if return_stats:
             return state_embeddings, window_batch, ssm_state_cache, stats
@@ -535,30 +584,38 @@ def validate_generative(
     embed_fn = _find_embed(model.qwen)
 
     for batch in tqdm(loader, desc="Val", leave=False):
-        frames_list = batch["frames"]
         binary = batch["binary"]
         valid_mask_cpu = batch["valid_mask"]
         valid_mask = valid_mask_cpu.to(device)
-
-        B, max_w = binary.shape[:2]
-        all_clips: List[torch.Tensor] = []
-        for b in range(B):
-            f = frames_list[b]
-            for w in range(max_w):
-                if valid_mask_cpu[b, w]:
-                    all_clips.append(f[w])
-        if not all_clips:
-            continue
-
-        processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
-        pv = processed["pixel_values_videos"].to(device)
-        gthw = processed["video_grid_thw"].to(device)
         binary = binary.to(device)
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            state_emb, _, ssm_cache, _ = model.encode_stream(
-                pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=False,
-            )
+        if "features" in batch:
+            window_batch = batch["features"].to(device=device, dtype=torch.bfloat16)
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                state_emb, _, ssm_cache = model.encode_window_features(
+                    window_batch, valid_mask, batch["video_id"], ssm_cache,
+                    training=False,
+                )
+        else:
+            frames_list = batch["frames"]
+            B, max_w = binary.shape[:2]
+            all_clips: List[torch.Tensor] = []
+            for b in range(B):
+                f = frames_list[b]
+                for w in range(max_w):
+                    if valid_mask_cpu[b, w]:
+                        all_clips.append(f[w])
+            if not all_clips:
+                continue
+
+            processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+            pv = processed["pixel_values_videos"].to(device)
+            gthw = processed["video_grid_thw"].to(device)
+
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+                state_emb, _, ssm_cache, _ = model.encode_stream(
+                    pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=False,
+                )
 
         for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
             if is_last:
@@ -694,7 +751,6 @@ def _encode_chunk_states(
     training: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, dict]:
     """Encode one chunk and return valid state tokens plus global indices."""
-    frames = batch["frames"][0]                      # [max_w, F, C, H, W]
     valid_mask_cpu = batch["valid_mask"]             # [1, max_w]
     valid_mask = valid_mask_cpu.to(device)
     valid_w_cpu = valid_mask_cpu[0].nonzero(as_tuple=True)[0]
@@ -702,17 +758,27 @@ def _encode_chunk_states(
         empty = torch.empty(0, model.llm_hidden, device=device)
         return empty, empty.new_empty((0,), dtype=torch.long), empty.new_empty((0,), dtype=torch.long), batch["chunk_start"][0], ssm_cache
 
-    all_clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
-    processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
-    pv = processed["pixel_values_videos"].to(device)
-    gthw = processed["video_grid_thw"].to(device)
+    if "features" in batch:
+        window_batch = batch["features"].to(device=device, dtype=dtype)
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+            state_emb, _, ssm_cache = model.encode_window_features(
+                window_batch, valid_mask,
+                batch["video_id"], ssm_cache,
+                training=training,
+            )
+    else:
+        frames = batch["frames"][0]                      # [max_w, F, C, H, W]
+        all_clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
+        processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+        pv = processed["pixel_values_videos"].to(device)
+        gthw = processed["video_grid_thw"].to(device)
 
-    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-        state_emb, _, ssm_cache, _ = model.encode_stream(
-            pv, gthw, valid_mask,
-            batch["video_id"], ssm_cache,
-            training=training,
-        )
+        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+            state_emb, _, ssm_cache, _ = model.encode_stream(
+                pv, gthw, valid_mask,
+                batch["video_id"], ssm_cache,
+                training=training,
+            )
 
     binary = batch["binary"].to(device)
     valid = valid_mask & (binary >= 0)
@@ -1071,6 +1137,8 @@ def main():
     parser.add_argument("--val-json", default="")
     parser.add_argument("--video-root", required=True)
     parser.add_argument("--val-video-root", default="")
+    parser.add_argument("--feature-cache-root", default="",
+                       help="optional frozen ViT feature cache root; skips video decoding, processor, and ViT")
     parser.add_argument("--log-dir", default="./logs/stage1")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -1168,6 +1236,10 @@ def main():
         args.train_json, args.video_root,
         total_sampled_frames=args.frames_per_clip, sample_interval=1,
         max_windows=args.max_windows,
+        feature_cache_root=args.feature_cache_root or None,
+        feature_cache_model_id=args.model_path,
+        min_pixels=args.min_pixels,
+        max_pixels=args.max_pixels,
     )
     from hivau_dataset import hivau_collate
     from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
@@ -1196,6 +1268,10 @@ def main():
             args.val_json, val_root,
             total_sampled_frames=args.frames_per_clip, sample_interval=1,
             max_windows=args.max_windows,
+            feature_cache_root=args.feature_cache_root or None,
+            feature_cache_model_id=args.model_path,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
         )
         if args.objective == "answer_ce":
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
@@ -1269,30 +1345,38 @@ def main():
             pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
             for step, batch in enumerate(pbar):
-                frames_list = batch["frames"]
                 binary = batch["binary"]
                 valid_mask_cpu = batch["valid_mask"]
                 valid_mask = valid_mask_cpu.to(device)
-
-                B, max_w = binary.shape[:2]
-                all_clips: List[torch.Tensor] = []
-                for b in range(B):
-                    f = frames_list[b]
-                    for w in range(max_w):
-                        if valid_mask_cpu[b, w]:
-                            all_clips.append(f[w])
-                if not all_clips:
-                    continue
-
-                processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
-                pv = processed["pixel_values_videos"].to(device)
-                gthw = processed["video_grid_thw"].to(device)
                 binary = binary.to(device)
 
-                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    state_emb, _, ssm_cache, _ = model.encode_stream(
-                        pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
-                    )
+                if "features" in batch:
+                    window_batch = batch["features"].to(device=device, dtype=dtype)
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                        state_emb, _, ssm_cache = model.encode_window_features(
+                            window_batch, valid_mask, batch["video_id"], ssm_cache,
+                            training=True,
+                        )
+                else:
+                    frames_list = batch["frames"]
+                    B, max_w = binary.shape[:2]
+                    all_clips: List[torch.Tensor] = []
+                    for b in range(B):
+                        f = frames_list[b]
+                        for w in range(max_w):
+                            if valid_mask_cpu[b, w]:
+                                all_clips.append(f[w])
+                    if not all_clips:
+                        continue
+
+                    processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+                    pv = processed["pixel_values_videos"].to(device)
+                    gthw = processed["video_grid_thw"].to(device)
+
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                        state_emb, _, ssm_cache, _ = model.encode_stream(
+                            pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
+                        )
 
                 all_state, all_target = _select_supervised_state_tokens(
                     state_emb, binary, valid_mask, args.supervision_mode,
