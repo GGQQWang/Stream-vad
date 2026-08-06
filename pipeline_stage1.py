@@ -55,7 +55,6 @@ from mil_utils import (
 )
 from stage1_streaming import (
     collect_summary_triggers,
-    future_prediction_loss,
     score_bce_loss,
     score_metrics_from_logits,
     summary_ce_loss,
@@ -85,31 +84,6 @@ def _find_eos(tokenizer) -> int:
     if im_end != tokenizer.unk_token_id:
         return im_end
     return tokenizer.eos_token_id
-
-
-def _collect_last_window_texts(
-    batch: dict,
-    valid_b: torch.Tensor,
-    valid_w: torch.Tensor,
-    last_mask: torch.Tensor,
-    valid_mask_cpu: torch.Tensor,
-) -> List[str]:
-    """Return summary text for each last-window-of-chunk, or empty strings."""
-    captions_per_chunk = batch.get("clip_captions", None)
-    if captions_per_chunk is None:
-        return [""] * int(last_mask.sum().item())
-    B = valid_mask_cpu.shape[0]
-    texts: List[str] = []
-    last_indices = last_mask.nonzero(as_tuple=True)[0]
-    idx_to_bw = list(zip(valid_b.tolist(), valid_w.tolist()))
-    for li in last_indices.tolist():
-        b, w = idx_to_bw[li]
-        caps = captions_per_chunk[b]
-        if isinstance(caps, list) and w < len(caps):
-            texts.append(str(caps[w]))
-        else:
-            texts.append("")
-    return texts
 
 
 def _compute_warmup_steps(total_steps: int) -> int:
@@ -530,11 +504,6 @@ class StreamingVADGenerationModel(nn.Module):
             nn.GELU(),
             nn.Dropout(0.1),
             nn.Linear(llm_hidden // 4, 1),
-        )
-        self.future_head = nn.Sequential(
-            nn.Linear(llm_hidden, llm_hidden),
-            nn.GELU(),
-            nn.Linear(llm_hidden, llm_hidden),
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
@@ -1478,8 +1447,6 @@ def main():
     parser.add_argument("--lambda-rank", type=float, default=1.0)
     parser.add_argument("--lambda-sparse", type=float, default=1e-3)
     parser.add_argument("--mil-margin", type=float, default=0.5)
-    parser.add_argument("--lambda-score", type=float, default=1.0)
-    parser.add_argument("--lambda-future", type=float, default=0.05)
     parser.add_argument("--lambda-sum", type=float, default=0.1,
                        help="weight for clip-boundary summary CE loss")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
@@ -1626,7 +1593,6 @@ def main():
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
-            "future_head": model.future_head.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -1651,8 +1617,6 @@ def main():
             "lambda_abnormal": args.lambda_abnormal,
             "lambda_rank": args.lambda_rank,
             "lambda_sparse": args.lambda_sparse,
-            "lambda_score": args.lambda_score,
-            "lambda_future": args.lambda_future,
             "lambda_sum": args.lambda_sum,
             "mil_margin": args.mil_margin,
             "binary_threshold": args.binary_threshold,
@@ -1680,10 +1644,8 @@ def main():
         train_abnormal_max: List[float] = []
         train_ranking_hits: List[float] = []
         train_score_losses: List[float] = []
-        train_future_losses: List[float] = []
         train_summary_losses: List[float] = []
         train_valid_windows: List[float] = []
-        train_future_pairs: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
 
@@ -1746,20 +1708,12 @@ def main():
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                     loss_score = score_bce_loss(score_logits, labels, valid_mask)
 
-                    chunk_starts = torch.tensor(batch["chunk_start"], dtype=torch.long, device=device).view(B, 1)
-                    local_idx = torch.arange(max_w, dtype=torch.long, device=device).view(1, max_w)
-                    window_indices = chunk_starts + local_idx
-                    loss_future, num_future_pairs = future_prediction_loss(
-                        state_emb, visual_windows, valid_mask,
-                        window_indices, batch["video_id"], model.future_head,
-                    )
-
                     triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
                     if triggers:
                         trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
                         trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
                         trigger_states = state_emb[trigger_b, trigger_w]
-                        summary_texts = [t[2] for t in triggers]
+                        summary_texts = [str(t[2]["text"]) for t in triggers]
                         loss_summary, summary_info = summary_ce_loss(
                             model.qwen, embed_fn, tokenizer,
                             trigger_states, model.summary_query, summary_texts,
@@ -1769,8 +1723,7 @@ def main():
                         summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
 
                     raw_total_loss = (
-                        args.lambda_score * loss_score
-                        + args.lambda_future * loss_future
+                        loss_score
                         + args.lambda_sum * loss_summary
                     )
                     total_loss = raw_total_loss / group_size
@@ -1785,10 +1738,8 @@ def main():
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
-                train_future_losses.append(float(loss_future.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
                 train_valid_windows.append(float(valid.sum().item()))
-                train_future_pairs.append(float(num_future_pairs))
                 train_summary_triggers.append(float(summary_info["num_summary_triggers"]))
                 train_skipped_summary.append(float(skipped_summary))
 
@@ -1797,7 +1748,6 @@ def main():
                 pbar.set_postfix(
                     loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
                     score=sum(train_score_losses[-10:]) / min(10, len(train_score_losses)),
-                    future_pairs=int(train_future_pairs[-1]),
                     sum_trig=int(train_summary_triggers[-1]),
                 )
 
@@ -1979,19 +1929,15 @@ def main():
         writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
         if args.objective == "score_token":
             writer.add_scalar("train/loss_score", finite_mean(train_score_losses), epoch)
-            writer.add_scalar("train/loss_future", finite_mean(train_future_losses), epoch)
             writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
             writer.add_scalar("train/num_valid_windows", finite_mean(train_valid_windows), epoch)
-            writer.add_scalar("train/num_future_pairs", finite_mean(train_future_pairs), epoch)
             writer.add_scalar("train/num_summary_triggers", finite_mean(train_summary_triggers), epoch)
             writer.add_scalar("train/num_skipped_summary_boundaries", finite_mean(train_skipped_summary), epoch)
             print(
                 f"  train total={finite_mean(train_losses):.4f} "
                 f"score={finite_mean(train_score_losses):.4f} "
-                f"future={finite_mean(train_future_losses):.4f} "
                 f"summary={finite_mean(train_summary_losses):.4f} "
                 f"valid_w={finite_mean(train_valid_windows):.1f} "
-                f"future_pairs={finite_mean(train_future_pairs):.1f} "
                 f"summary_triggers={finite_mean(train_summary_triggers):.1f} "
                 f"skipped_summary={finite_mean(train_skipped_summary):.1f}"
             )

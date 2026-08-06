@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -46,9 +46,9 @@ def build_window_infos(
 
     ``frames_per_clip`` is the number of sampled frames in one scoring window.
     The source-frame span is therefore ``frames_per_clip * sample_interval``.
-    Summary clips are triggered only when their end frame exactly matches a
-    window's valid end frame.  A clip ending inside a window is skipped so the
-    summary loss cannot see frames after the clip boundary.
+    Summary clips are triggered by the window whose time range contains the
+    clip end frame.  This gives at most one fixed-window delay while avoiding
+    the incorrect chunk-end trigger.
     """
     if n_frames <= 0:
         return []
@@ -62,26 +62,29 @@ def build_window_infos(
         if hi > lo:
             abnormal[lo:hi] = True
 
-    clips_by_end: dict[int, List[dict]] = {}
+    clips_by_window: dict[int, List[dict]] = {}
+    seen_clip_ids: set[str] = set()
     skipped_by_window = [0 for _ in range(n_windows)]
     for clip in summary_clips or []:
-        clip_id = clip.get("clip_id", f"clip_{len(clips_by_end)}")
+        clip_id = str(clip.get("clip_id", f"clip_{len(seen_clip_ids)}"))
         start_frame = max(0, int(clip["clip_start_frame"]))
         end_frame = min(n_frames, int(clip["clip_end_frame"]))
         text = str(clip.get("text", ""))
-        if end_frame <= start_frame or not text:
+        if end_frame <= start_frame or not text or clip_id in seen_clip_ids:
             continue
         wi = min(max(math.ceil(end_frame / span) - 1, 0), n_windows - 1)
         win_start = wi * span
         win_valid_end = min(win_start + span, n_frames)
-        if end_frame == win_valid_end:
-            clips_by_end.setdefault(end_frame, []).append({
+        if win_start < end_frame <= win_valid_end:
+            seen_clip_ids.add(str(clip_id))
+            clips_by_window.setdefault(wi, []).append({
                 "clip_id": clip_id,
                 "clip_start_frame": start_frame,
                 "clip_end_frame": end_frame,
+                "window_index": wi,
                 "text": text,
             })
-        elif win_start < end_frame < win_valid_end:
+        else:
             skipped_by_window[wi] += 1
 
     infos: List[WindowInfo] = []
@@ -93,7 +96,7 @@ def build_window_infos(
             soft = 0.0
         else:
             soft = float(abnormal[list(sampled)].float().mean().item())
-        triggers = tuple(clips_by_end.get(valid_end, []))
+        triggers = tuple(clips_by_window.get(wi, []))
         infos.append(WindowInfo(
             index=wi,
             start_frame=start,
@@ -145,43 +148,9 @@ def score_metrics_from_logits(
     }
 
 
-def future_prediction_loss(
-    states: torch.Tensor,
-    visual_windows: torch.Tensor,
-    valid_mask: torch.Tensor,
-    window_indices: torch.Tensor,
-    video_ids: Sequence[str],
-    future_head: torch.nn.Module,
-) -> tuple[torch.Tensor, int]:
-    """Predict next visual window inside the current chunk only.
-
-    Cross-chunk targets are intentionally omitted in this first implementation
-    because keeping the next chunk's visual tensor attached to the current
-    truncated graph is easy to get wrong.  SSM state is still carried across
-    chunks; this auxiliary loss only uses contiguous in-chunk pairs.
-    """
-    preds = []
-    targets = []
-    B, W = valid_mask.shape
-    for b in range(B):
-        _ = video_ids[b]
-        for w in range(W - 1):
-            if not bool(valid_mask[b, w]) or not bool(valid_mask[b, w + 1]):
-                continue
-            if int(window_indices[b, w + 1]) != int(window_indices[b, w]) + 1:
-                continue
-            preds.append(future_head(states[b, w]))
-            targets.append(visual_windows[b, w + 1].detach())
-    if not preds:
-        return states.new_zeros(()), 0
-    pred_t = torch.stack(preds, dim=0)
-    target_t = torch.stack(targets, dim=0)
-    return F.smooth_l1_loss(pred_t, target_t), int(pred_t.shape[0])
-
-
-def collect_summary_triggers(batch: dict, valid_mask: torch.Tensor) -> tuple[List[tuple[int, int, str]], int]:
-    """Return ``(batch_index, window_index, text)`` triggers and skipped count."""
-    triggers: List[tuple[int, int, str]] = []
+def collect_summary_triggers(batch: dict, valid_mask: torch.Tensor) -> tuple[List[tuple[int, int, dict]], int]:
+    """Return ``(batch_index, local_window_index, trigger)`` and skipped count."""
+    triggers: List[tuple[int, int, dict]] = []
     skipped = 0
     per_batch = batch.get("summary_triggers", [])
     per_skip = batch.get("skipped_summary_boundaries", [])
@@ -194,7 +163,7 @@ def collect_summary_triggers(batch: dict, valid_mask: torch.Tensor) -> tuple[Lis
             for item in items:
                 text = str(item.get("text", ""))
                 if text:
-                    triggers.append((b, w, text))
+                    triggers.append((b, w, item))
     return triggers, skipped
 
 

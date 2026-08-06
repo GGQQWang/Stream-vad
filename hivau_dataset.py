@@ -3,7 +3,7 @@
 Each video is pre-cut into non-overlapping, contiguous chunks of at most
 ``max_windows`` scoring windows.  A chunk is a memory/TBPTT unit, not a
 semantic HIVAU clip.  HIVAU clip-level captions are represented as summary
-triggers on the window whose valid end frame exactly matches the clip end.
+triggers on the window whose time range contains the clip end.
 
 Chunks carry ``valid_mask`` so the last (possibly shorter) chunk is handled
 correctly in loss, metrics, and logging.
@@ -43,10 +43,22 @@ def _read_video_label(meta: dict, frame_labels: np.ndarray) -> int:
         return int(meta["video_label"])
     if "label" in meta:
         label = meta["label"]
-        if isinstance(label, str):
-            return 0 if label.lower() in {"normal", "0", "negative"} else 1
-        return int(label)
+        if isinstance(label, (list, tuple)):
+            if len(label) == 0:
+                return 1 if frame_labels.any() else 0
+            return 1 if any(_label_value_is_abnormal(x) for x in label) else 0
+        return 1 if _label_value_is_abnormal(label) else 0
     return 1 if frame_labels.any() else 0
+
+
+def _label_value_is_abnormal(label) -> bool:
+    if isinstance(label, str):
+        value = label.strip().lower()
+        return value not in {"normal", "0", "negative"}
+    try:
+        return int(label) != 0
+    except (TypeError, ValueError):
+        return True
 
 
 def _pad_int(values: List[int], length: int, pad_value: int) -> List[int]:
@@ -70,8 +82,8 @@ def _parse_summary_clips(meta: dict, fps: float, n_frames: int) -> List[dict]:
       - ``summary_clips``: list of dicts with frame or second boundaries.
       - ``clips`` + ``clips_caption``: nested HIVAU-style second intervals.
 
-    Clip endings that do not align with a window boundary are handled later by
-    ``build_window_infos`` and are skipped rather than leaking future frames.
+    Clip endings are handled later by ``build_window_infos`` and trigger on
+    the window whose time range contains the clip end frame.
     """
     parsed: List[dict] = []
     if isinstance(meta.get("summary_clips"), list):

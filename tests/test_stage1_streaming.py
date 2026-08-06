@@ -1,16 +1,15 @@
-import math
 from pathlib import Path
 
-import pytest
+import numpy as np
 import torch
 import torch.nn as nn
 
+from hivau_dataset import _read_video_label
 from stage1_streaming import (
     build_summary_query_batch,
     build_window_infos,
     collect_summary_triggers,
     detach_state_cache,
-    future_prediction_loss,
     score_bce_loss,
     score_metrics_from_logits,
     summary_ce_loss,
@@ -69,7 +68,7 @@ def test_window_soft_labels_and_tail_denominator():
     assert no_overlap[0].soft_label == 0.0
 
 
-def test_summary_trigger_uses_clip_end_boundary_and_skips_mid_window():
+def test_summary_trigger_fires_when_clip_end_falls_inside_window():
     infos = build_window_infos(
         n_frames=60,
         fps=10.0,
@@ -83,8 +82,61 @@ def test_summary_trigger_uses_clip_end_boundary_and_skips_mid_window():
         ],
     )
     assert [t["clip_id"] for t in infos[0].summary_triggers] == ["aligned"]
-    assert infos[1].skipped_summary_boundaries == 1
-    assert [t["clip_id"] for t in infos[1].summary_triggers] == ["also"]
+    assert infos[1].skipped_summary_boundaries == 0
+    assert [t["clip_id"] for t in infos[1].summary_triggers] == ["mid", "also"]
+
+
+def test_summary_trigger_mid_window_example_192_239_clip_end_201():
+    infos = build_window_infos(
+        n_frames=300,
+        fps=30.0,
+        events=[],
+        frames_per_clip=16,
+        sample_interval=3,
+        summary_clips=[
+            {"clip_id": "c201", "clip_start_frame": 100, "clip_end_frame": 201, "text": "a"},
+        ],
+    )
+    trigger_windows = [
+        info for info in infos if any(t["clip_id"] == "c201" for t in info.summary_triggers)
+    ]
+    assert len(trigger_windows) == 1
+    assert trigger_windows[0].start_frame == 192
+    assert trigger_windows[0].valid_end_frame == 240
+
+
+def test_one_chunk_multiple_summary_triggers():
+    infos = build_window_infos(
+        n_frames=400,
+        fps=30.0,
+        events=[],
+        frames_per_clip=16,
+        sample_interval=3,
+        summary_clips=[
+            {"clip_id": "A", "clip_start_frame": 0, "clip_end_frame": 100, "text": "a"},
+            {"clip_id": "B", "clip_start_frame": 0, "clip_end_frame": 245, "text": "b"},
+            {"clip_id": "C", "clip_start_frame": 20, "clip_end_frame": 260, "text": "c"},
+        ],
+    )
+    assert [t["clip_id"] for t in infos[2].summary_triggers] == ["A"]
+    assert [t["clip_id"] for t in infos[5].summary_triggers] == ["B", "C"]
+
+
+def test_clip_cross_chunk_triggers_only_in_second_chunk():
+    infos = build_window_infos(
+        n_frames=700,
+        fps=30.0,
+        events=[],
+        frames_per_clip=16,
+        sample_interval=3,
+        summary_clips=[
+            {"clip_id": "cross", "clip_start_frame": 50, "clip_end_frame": 430, "text": "a"},
+        ],
+    )
+    chunk1 = infos[:8]
+    chunk2 = infos[8:16]
+    assert sum(len(w.summary_triggers) for w in chunk1) == 0
+    assert sum(len(w.summary_triggers) for w in chunk2) == 1
 
 
 def test_state_cache_detach_and_video_isolation():
@@ -111,19 +163,6 @@ def test_score_loss_and_metrics_keep_soft_labels():
     assert metrics["soft_targets"].tolist() == [0.2, 0.8]
     assert metrics["binary_targets"].tolist() == [0, 1]
     assert logits.grad is not None
-
-
-def test_future_loss_masks_invalid_pairs_and_detaches_target():
-    states = torch.randn(1, 4, 3, requires_grad=True)
-    visual = torch.randn(1, 4, 3, requires_grad=True)
-    valid = torch.tensor([[True, True, False, True]])
-    idx = torch.tensor([[0, 1, 2, 4]])
-    head = nn.Linear(3, 3)
-    loss, n_pairs = future_prediction_loss(states, visual, valid, idx, ["v"], head)
-    loss.backward()
-    assert n_pairs == 1
-    assert states.grad is not None
-    assert visual.grad is None
 
 
 def test_summary_batch_masks_and_zero_loss_without_triggers():
@@ -174,7 +213,6 @@ def test_queries_optimizer_and_checkpoint_round_trip(tmp_path):
             self.score_query = nn.Parameter(torch.randn(1, 4))
             self.summary_query = nn.Parameter(torch.randn(1, 4))
             self.score_head = nn.Linear(4, 1)
-            self.future_head = nn.Linear(4, 4)
 
         def score(self, x):
             return self.score_head(x + self.score_query).squeeze(-1)
@@ -187,22 +225,18 @@ def test_queries_optimizer_and_checkpoint_round_trip(tmp_path):
 
     x = torch.randn(3, 4)
     score_before = model.score(x).detach()
-    future_before = model.future_head(x).detach()
     path = Path(tmp_path) / "state.pt"
     torch.save({
         "score_query": model.score_query.detach().clone(),
         "summary_query": model.summary_query.detach().clone(),
         "score_head": model.score_head.state_dict(),
-        "future_head": model.future_head.state_dict(),
     }, path)
     loaded = TinyStage1()
     state = torch.load(path, map_location="cpu")
     loaded.score_query.data.copy_(state["score_query"])
     loaded.summary_query.data.copy_(state["summary_query"])
     loaded.score_head.load_state_dict(state["score_head"])
-    loaded.future_head.load_state_dict(state["future_head"])
     assert torch.allclose(score_before, loaded.score(x))
-    assert torch.allclose(future_before, loaded.future_head(x))
 
 
 def test_collect_summary_triggers_ignores_padding():
@@ -215,5 +249,26 @@ def test_collect_summary_triggers_ignores_padding():
     }
     valid = torch.tensor([[True, False]])
     triggers, skipped = collect_summary_triggers(batch, valid)
-    assert triggers == [(0, 0, "a")]
+    assert triggers == [(0, 0, {"text": "a", "clip_id": "c0"})]
     assert skipped == 2
+
+
+def test_no_summary_trigger_zero_loss():
+    tok = _TinyTokenizer()
+    embed = nn.Embedding(8, 4)
+    lm = _TinyLM()
+    states = torch.randn(0, 4)
+    query = nn.Parameter(torch.randn(1, 4))
+    loss, info = summary_ce_loss(lm, embed, tok, states, query, [])
+    assert loss.item() == 0.0
+    assert info["num_summary_triggers"] == 0
+
+
+def test_official_hivau_label_formats():
+    empty_frames = np.zeros(4, dtype=np.uint8)
+    assert _read_video_label({"label": ["Normal"]}, empty_frames) == 0
+    assert _read_video_label({"label": ["Abuse"]}, empty_frames) == 1
+    assert _read_video_label({"label": "Normal"}, empty_frames) == 0
+    assert _read_video_label({"label": "Abuse"}, empty_frames) == 1
+    assert _read_video_label({"label": 0}, empty_frames) == 0
+    assert _read_video_label({"label": 1}, empty_frames) == 1
