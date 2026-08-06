@@ -6,7 +6,7 @@ from urllib.parse import quote
 import torch
 
 
-FEATURE_CACHE_VERSION = 1
+FEATURE_CACHE_VERSION = 2
 
 
 def feature_cache_path(cache_root: str | Path, video_id: str) -> Path:
@@ -32,8 +32,11 @@ def build_feature_cache_metadata(
         "n_windows": int(n_windows),
         "n_frames": int(n_frames),
         "fps": float(fps),
+        "source_fps": float(fps),
+        "sampled_fps": float(fps) / float(sample_interval),
         "frames_per_clip": int(frames_per_clip),
         "sample_interval": int(sample_interval),
+        "window_span_frames": int(frames_per_clip) * int(sample_interval),
         "min_pixels": int(min_pixels),
         "max_pixels": int(max_pixels),
         "model_id": str(model_id),

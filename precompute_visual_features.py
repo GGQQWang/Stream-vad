@@ -66,8 +66,9 @@ def main() -> None:
     parser.add_argument("--annotation-json", required=True)
     parser.add_argument("--video-root", required=True)
     parser.add_argument("--cache-root", required=True)
-    parser.add_argument("--frames-per-clip", type=int, default=20)
-    parser.add_argument("--max-windows", type=int, default=32)
+    parser.add_argument("--frames-per-clip", type=int, default=16)
+    parser.add_argument("--sample-interval", type=int, default=3)
+    parser.add_argument("--max-windows", type=int, default=8)
     parser.add_argument("--vit-micro-batch", type=int, default=1)
     parser.add_argument("--d-ssm", type=int, default=256)
     parser.add_argument("--min-pixels", type=int, default=200704)
@@ -114,7 +115,7 @@ def main() -> None:
         args.annotation_json,
         args.video_root,
         total_sampled_frames=args.frames_per_clip,
-        sample_interval=1,
+        sample_interval=args.sample_interval,
         max_windows=args.max_windows,
     )
     grouped = group_video_chunks(dataset.samples)
@@ -129,7 +130,7 @@ def main() -> None:
             n_frames=first["n_frames"],
             fps=first["fps"],
             frames_per_clip=args.frames_per_clip,
-            sample_interval=1,
+            sample_interval=args.sample_interval,
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             model_id=args.model_path,
@@ -142,7 +143,7 @@ def main() -> None:
                 n_frames=first["n_frames"],
                 fps=first["fps"],
                 frames_per_clip=args.frames_per_clip,
-                sample_interval=1,
+                sample_interval=args.sample_interval,
                 min_pixels=args.min_pixels,
                 max_pixels=args.max_pixels,
                 model_id=args.model_path,

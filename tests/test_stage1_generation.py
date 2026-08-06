@@ -147,12 +147,13 @@ def test_state_prompt_labels_masked():
     assert (labels[4:4+2] != -100).all()
 
 
-def test_no_score_head_in_stage1():
-    """Stage 1 model should NOT have score_head."""
-    # Check the module definition
+def test_stage1_score_components_defined_on_instances():
+    """Stage 1 score-token objective owns explicit trainable heads/queries."""
     from pipeline_stage1 import StreamingVADGenerationModel
-    assert not hasattr(StreamingVADGenerationModel, "score_head") or \
-           StreamingVADGenerationModel.__dict__.get("score_head") is None
+    assert "score_head" not in StreamingVADGenerationModel.__dict__
+    assert "future_head" not in StreamingVADGenerationModel.__dict__
+    assert "score_query" not in StreamingVADGenerationModel.__dict__
+    assert "summary_query" not in StreamingVADGenerationModel.__dict__
 
 
 def test_stage2_not_broken():
@@ -168,6 +169,6 @@ if __name__ == "__main__":
     test_masked_token_ce()
     test_anomaly_score_direction()
     test_state_prompt_labels_masked()
-    test_no_score_head_in_stage1()
+    test_stage1_score_components_defined_on_instances()
     test_stage2_not_broken()
     print("ALL CPU TESTS PASSED")

@@ -1,8 +1,9 @@
 """HIVAU-70K dataset — video chunked into fixed-size windows for training.
 
 Each video is pre-cut into non-overlapping, contiguous chunks of at most
-``max_windows`` clips.  A chunk is an independent sample; shuffling chunks
-guarantees full coverage of every video in a single epoch.
+``max_windows`` scoring windows.  A chunk is a memory/TBPTT unit, not a
+semantic HIVAU clip.  HIVAU clip-level captions are represented as summary
+triggers on the window whose valid end frame exactly matches the clip end.
 
 Chunks carry ``valid_mask`` so the last (possibly shorter) chunk is handled
 correctly in loss, metrics, and logging.
@@ -19,6 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from feature_cache import load_feature_cache
+from stage1_streaming import build_window_infos, sampled_fps, window_span_frames
 
 
 def _build_frame_labels(
@@ -47,6 +49,64 @@ def _read_video_label(meta: dict, frame_labels: np.ndarray) -> int:
     return 1 if frame_labels.any() else 0
 
 
+def _pad_int(values: List[int], length: int, pad_value: int) -> List[int]:
+    out = list(values)
+    if len(out) < length:
+        out.extend([pad_value] * (length - len(out)))
+    return out
+
+
+def _pad_list(values: List[list], length: int) -> List[list]:
+    out = list(values)
+    if len(out) < length:
+        out.extend([[] for _ in range(length - len(out))])
+    return out
+
+
+def _parse_summary_clips(meta: dict, fps: float, n_frames: int) -> List[dict]:
+    """Parse HIVAU clip-level text annotations into frame boundaries.
+
+    Supported formats:
+      - ``summary_clips``: list of dicts with frame or second boundaries.
+      - ``clips`` + ``clips_caption``: nested HIVAU-style second intervals.
+
+    Clip endings that do not align with a window boundary are handled later by
+    ``build_window_infos`` and are skipped rather than leaking future frames.
+    """
+    parsed: List[dict] = []
+    if isinstance(meta.get("summary_clips"), list):
+        for i, item in enumerate(meta["summary_clips"]):
+            if not isinstance(item, dict):
+                continue
+            if "clip_start_frame" in item:
+                start = int(item["clip_start_frame"])
+            else:
+                start = int(float(item.get("clip_start", item.get("start", 0.0))) * fps)
+            if "clip_end_frame" in item:
+                end = int(item["clip_end_frame"])
+            else:
+                end = int(float(item.get("clip_end", item.get("end", 0.0))) * fps)
+            parsed.append({
+                "clip_id": item.get("clip_id", f"summary_{i}"),
+                "clip_start_frame": max(0, start),
+                "clip_end_frame": min(n_frames, end),
+                "text": item.get("text", item.get("caption", "")),
+            })
+
+    raw_clips = meta.get("clips", None)
+    raw_captions = meta.get("clips_caption", None)
+    if raw_clips is not None and raw_captions is not None:
+        for event_idx, (event_clips, event_captions) in enumerate(zip(raw_clips, raw_captions)):
+            for clip_idx, ((cs, ce), cap) in enumerate(zip(event_clips, event_captions)):
+                parsed.append({
+                    "clip_id": f"event{event_idx}_clip{clip_idx}",
+                    "clip_start_frame": max(0, int(float(cs) * fps)),
+                    "clip_end_frame": min(n_frames, int(float(ce) * fps)),
+                    "text": str(cap),
+                })
+    return parsed
+
+
 class HIVAUDataset(Dataset):
     """HIVAU-70K — per-chunk window sequences.
 
@@ -57,9 +117,9 @@ class HIVAUDataset(Dataset):
     Args:
         annotation_path: ``*_database_*.json``.
         video_root: directory containing .mp4 files.
-        total_sampled_frames: frames per clip.  Default 20.
-        sample_interval: stride inside a clip.  Default 1 (consecutive).
-        max_windows: max clips per chunk.  Default 32.
+        total_sampled_frames: sampled frames per scoring window.  Default 16.
+        sample_interval: source-frame stride inside a scoring window.  Default 3.
+        max_windows: max scoring windows per chunk.  Default 8.
         fps: fallback frame rate.
     """
 
@@ -67,9 +127,9 @@ class HIVAUDataset(Dataset):
         self,
         annotation_path: str | Path,
         video_root: str | Path,
-        total_sampled_frames: int = 20,
-        sample_interval: int = 1,
-        max_windows: int = 32,
+        total_sampled_frames: int = 16,
+        sample_interval: int = 3,
+        max_windows: int = 8,
         fps: float = 30.0,
         feature_cache_root: str | Path | None = None,
         feature_cache_model_id: str = "",
@@ -109,37 +169,20 @@ class HIVAUDataset(Dataset):
                 n, video_fps, meta.get("events", [])
             )
             video_label = _read_video_label(meta, frame_labels)
-            # Per-window labels are for temporal evaluation; MIL pairing uses video_label.
-            clip_soft: List[float] = []
-            clip_bin: List[int] = []
-            # --- parse clip captions if available ---
-            clip_captions: List[str] = []
-            flat_captions: List[Tuple[float, float, str]] = []
-            raw_clips = meta.get("clips", None)
-            raw_captions = meta.get("clips_caption", None)
-            if raw_clips is not None and raw_captions is not None:
-                for event_clips, event_captions in zip(raw_clips, raw_captions):
-                    for (cs, ce), cap in zip(event_clips, event_captions):
-                        flat_captions.append((float(cs), float(ce), str(cap)))
+            summary_clips = _parse_summary_clips(meta, video_fps, n)
+            # ``window`` is the scoring time step.  It is not the HIVAU
+            # semantic clip.  A chunk is only a TBPTT/memory management unit.
+            window_infos = build_window_infos(
+                n_frames=n,
+                fps=video_fps,
+                events=meta.get("events", []),
+                frames_per_clip=total_sampled_frames,
+                sample_interval=sample_interval,
+                summary_clips=summary_clips,
+            )
+            clip_soft = [w.soft_label for w in window_infos]
+            clip_bin = [1 if w.soft_label > 0.0 else 0 for w in window_infos]
             n_clips = math.ceil(n / self.clip_span)
-            win_dur = self.clip_span / video_fps
-            for ci in range(n_clips):
-                start = ci * self.clip_span
-                end = min(start + self.clip_span, n)
-                clip_fl = frame_labels[start:end:sample_interval]
-                clip_soft.append(float(clip_fl.mean()))
-                clip_bin.append(1 if clip_fl.any() else 0)
-                # best-matching caption for this window
-                win_s = ci * win_dur
-                win_e = win_s + win_dur
-                best_cap = ""
-                best_overlap = 0.0
-                for cs, ce, cap in flat_captions:
-                    overlap = min(win_e, ce) - max(win_s, cs)
-                    if overlap > best_overlap:
-                        best_overlap = overlap
-                        best_cap = cap
-                clip_captions.append(best_cap)
 
             if self.feature_cache_root is not None:
                 load_feature_cache(
@@ -167,13 +210,21 @@ class HIVAUDataset(Dataset):
                     "video_label": video_label,
                     "n_frames": n,
                     "fps": video_fps,
+                    "sampled_fps": sampled_fps(video_fps, sample_interval),
+                    "window_span_frames": window_span_frames(total_sampled_frames, sample_interval),
                     "chunk_start": lo,
                     "chunk_end": hi,
                     "n_total_windows": n_clips,
                     "is_last_chunk": (hi == n_clips),
                     "clip_soft": clip_soft[lo:hi],
                     "clip_bin": clip_bin[lo:hi],
-                    "clip_captions": clip_captions[lo:hi],
+                    "window_start_frames": [w.start_frame for w in window_infos[lo:hi]],
+                    "window_end_frames": [w.end_frame for w in window_infos[lo:hi]],
+                    "valid_end_frames": [w.valid_end_frame for w in window_infos[lo:hi]],
+                    "summary_triggers": [list(w.summary_triggers) for w in window_infos[lo:hi]],
+                    "skipped_summary_boundaries": [
+                        w.skipped_summary_boundaries for w in window_infos[lo:hi]
+                    ],
                 })
 
         # ---- sanity checks ----
@@ -251,7 +302,13 @@ class HIVAUDataset(Dataset):
                 "labels": soft,
                 "binary": binary,
                 "valid_mask": valid,
-                "clip_captions": meta.get("clip_captions", []),
+                "window_start_frames": _pad_int(meta["window_start_frames"], self.max_windows, -1),
+                "window_end_frames": _pad_int(meta["window_end_frames"], self.max_windows, -1),
+                "valid_end_frames": _pad_int(meta["valid_end_frames"], self.max_windows, -1),
+                "summary_triggers": _pad_list(meta["summary_triggers"], self.max_windows),
+                "skipped_summary_boundaries": _pad_int(
+                    meta["skipped_summary_boundaries"], self.max_windows, 0,
+                ),
             }
 
         try:
@@ -311,7 +368,13 @@ class HIVAUDataset(Dataset):
             "labels": soft,
             "binary": binary,
             "valid_mask": valid,
-            "clip_captions": meta.get("clip_captions", []),
+            "window_start_frames": _pad_int(meta["window_start_frames"], self.max_windows, -1),
+            "window_end_frames": _pad_int(meta["window_end_frames"], self.max_windows, -1),
+            "valid_end_frames": _pad_int(meta["valid_end_frames"], self.max_windows, -1),
+            "summary_triggers": _pad_list(meta["summary_triggers"], self.max_windows),
+            "skipped_summary_boundaries": _pad_int(
+                meta["skipped_summary_boundaries"], self.max_windows, 0,
+            ),
         }
 
 def hivau_collate(batch: List[dict]) -> dict:
@@ -326,7 +389,11 @@ def hivau_collate(batch: List[dict]) -> dict:
         "labels": torch.stack([b["labels"] for b in batch], dim=0),
         "binary": torch.stack([b["binary"] for b in batch], dim=0),
         "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),
-        "clip_captions": [b.get("clip_captions", []) for b in batch],
+        "window_start_frames": torch.tensor([b["window_start_frames"] for b in batch], dtype=torch.long),
+        "window_end_frames": torch.tensor([b["window_end_frames"] for b in batch], dtype=torch.long),
+        "valid_end_frames": torch.tensor([b["valid_end_frames"] for b in batch], dtype=torch.long),
+        "summary_triggers": [b.get("summary_triggers", []) for b in batch],
+        "skipped_summary_boundaries": [b.get("skipped_summary_boundaries", []) for b in batch],
     }
     if "features" in batch[0]:
         out["features"] = torch.stack([b["features"] for b in batch], dim=0)

@@ -53,6 +53,13 @@ from mil_utils import (
     normal_language_loss,
     select_global_max,
 )
+from stage1_streaming import (
+    collect_summary_triggers,
+    future_prediction_loss,
+    score_bce_loss,
+    score_metrics_from_logits,
+    summary_ce_loss,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +531,16 @@ class StreamingVADGenerationModel(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(llm_hidden // 4, 1),
         )
+        self.future_head = nn.Sequential(
+            nn.Linear(llm_hidden, llm_hidden),
+            nn.GELU(),
+            nn.Linear(llm_hidden, llm_hidden),
+        )
+        self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
+        self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
+        self.debug_state = False
 
         # Full Qwen model with LoRA
         self.qwen = qwen
@@ -548,8 +563,14 @@ class StreamingVADGenerationModel(nn.Module):
                 continue
             wv = window_batch[b, bw].unsqueeze(0)
             prev = ssm_state_cache.get(vid)
+            had_prev = prev is not None
             if training and prev is not None:
                 prev = {i: s.detach() for i, s in prev.items()}
+            if self.debug_state:
+                print(
+                    f"SSM_STATE video_id={vid} valid_windows={len(bw)} "
+                    f"reuse_prev={had_prev} detached={bool(training and had_prev)}"
+                )
             out, new_st = self.ssm.forward_chunk(wv, state=prev)
             ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
@@ -658,55 +679,29 @@ class StreamingVADGenerationModel(nn.Module):
         state_embeddings: torch.Tensor,
         embed_fn: nn.Module,
         tokenizer,
-        score_token_id: int,
         prompt_text: str,
-        sum_token_id: int | None = None,
-        summary_texts: List[str] | None = None,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
-        """One-pass LLM forward → ``<SCORE>`` hidden → scalar scores (+ optional CE).
-
-        When ``summary_texts`` is provided, also returns the CE loss from the
-        LLM's own lm_head over the summary token positions.
-
-        Args:
-            state_embeddings: ``[N, H]``  SSM output tokens (flattened).
-            embed_fn: model embedding layer.
-            tokenizer: tokenizer for prompt encoding.
-            score_token_id: id of ``<SCORE>`` token.
-            prompt_text: text prompt preceding ``<SCORE>``.
-            sum_token_id: id of ``<SUM>`` token (optional).
-            summary_texts: per-sample summary strings (optional).
-
-        Returns:
-            scores: ``[N]``  scalar anomaly scores.
-            ce_loss: scalar CE loss (only if summary_texts provided).
-        """
+    ) -> torch.Tensor:
+        """One-pass LLM forward -> explicit score query hidden -> anomaly logits."""
         N = state_embeddings.shape[0]
         if N == 0:
             return state_embeddings.new_zeros(0)
 
-        dummy_targets = state_embeddings.new_zeros(N)
-        batch = build_score_token_batch(
-            embed_fn, tokenizer, state_embeddings, dummy_targets,
-            score_token_id, prompt_text,
-            sum_token_id=sum_token_id, summary_texts=summary_texts,
-        )
+        device = state_embeddings.device
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        prompt_emb = embed_fn(prompt_ids_t).unsqueeze(0).expand(N, -1, -1)
+        query = self.score_query.to(device=device, dtype=state_embeddings.dtype).reshape(1, 1, -1).expand(N, 1, -1)
+        inputs = torch.cat([state_embeddings.unsqueeze(1), prompt_emb, query], dim=1)
+        attn = torch.ones(N, inputs.shape[1], dtype=torch.bool, device=device)
         out = self.qwen(
-            inputs_embeds=batch["inputs_embeds"],
-            attention_mask=batch["attention_mask"],
-            labels=batch["labels"],
+            inputs_embeds=inputs,
+            attention_mask=attn,
             output_hidden_states=True,
             use_cache=False,
             return_dict=True,
         )
-        # score
-        score_mask = batch["score_mask"].to(out.hidden_states[-1].device)
-        hidden = out.hidden_states[-1][score_mask]                   # [N, H]
-        scores = self.score_head(hidden).squeeze(-1)                 # [N]
-
-        if summary_texts is not None:
-            return scores, out.loss
-        return scores
+        hidden = out.hidden_states[-1][:, -1, :]
+        return self.score_head(hidden).squeeze(-1)
 
 
 def _verify_attention_backend(model: nn.Module, requested: str) -> None:
@@ -807,9 +802,7 @@ def validate_generative(
                     pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=False,
                 )
 
-        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-            if is_last:
-                ssm_cache.pop(vid, None)
+        _clear_finished_states(model, batch, ssm_cache)
 
         all_state, all_target = _select_supervised_state_tokens(
             state_emb, binary, valid_mask, supervision_mode,
@@ -931,6 +924,15 @@ def _single_chunk_batch(dataset: HIVAUDataset, sample_idx: int) -> dict:
     return hivau_collate([dataset[sample_idx]])
 
 
+def _clear_finished_states(model: StreamingVADGenerationModel, batch: dict, ssm_cache: dict) -> None:
+    for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
+        if is_last:
+            existed = vid in ssm_cache
+            ssm_cache.pop(vid, None)
+            if getattr(model, "debug_state", False):
+                print(f"SSM_STATE_CLEAR video_id={vid} existed={existed}")
+
+
 def _encode_chunk_states(
     model: StreamingVADGenerationModel,
     processor: Qwen2VLProcessor,
@@ -1013,9 +1015,7 @@ def _mine_video_max_window(
         )
         score_chunks.append((chunk_start, anomaly_logits_from_nll(normal_nll, abnormal_nll).detach()))
 
-        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-            if is_last:
-                ssm_cache.pop(vid, None)
+        _clear_finished_states(model, batch, ssm_cache)
 
     selected_idx, selected_score = select_global_max(score_chunks)
     ssm_cache.clear()
@@ -1129,9 +1129,7 @@ def _backward_mil_video_pass(
                 (selected_loss / grad_scale).backward()
                 metrics["language_loss"] += float((selected_normal_nll.detach() / max(total_windows, 1)).item())
 
-        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-            if is_last:
-                ssm_cache.pop(vid, None)
+        _clear_finished_states(model, batch, ssm_cache)
 
     if not found_selected:
         raise RuntimeError(f"selected window {selected_global_idx} was not found in second MIL pass")
@@ -1177,9 +1175,7 @@ def _collect_video_candidate_outputs(
             score_parts.append(scores.detach())
             label_parts.append(targets.detach())
 
-        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-            if is_last:
-                ssm_cache.pop(vid, None)
+        _clear_finished_states(model, batch, ssm_cache)
 
     ssm_cache.clear()
     if not score_parts:
@@ -1331,11 +1327,13 @@ def validate_score_token(
     prompt_text: str,
     score_token_id: int,
     sum_token_id: int | None = None,
+    binary_threshold: float = 0.5,
 ) -> dict:
     """One-pass score token evaluation."""
     model.eval()
-    all_scores: List[float] = []
-    all_labels: List[int] = []
+    all_probs: List[float] = []
+    all_soft_labels: List[float] = []
+    all_binary_labels: List[int] = []
     ssm_cache: dict = {}
     embed_fn = _find_embed(model.qwen)
 
@@ -1375,9 +1373,7 @@ def validate_score_token(
                 )
 
         # --- release cache for finished videos ---
-        for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-            if is_last:
-                ssm_cache.pop(vid, None)
+        _clear_finished_states(model, batch, ssm_cache)
 
         # --- score valid windows ---
         valid = valid_mask & (labels >= 0)
@@ -1385,38 +1381,56 @@ def validate_score_token(
         if len(valid_b) == 0:
             continue
         all_state = state_emb[valid_b, valid_w]
-        all_target = labels[valid_b, valid_w]
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            scores = model.forward_score_token(
+            logits_flat = model.forward_score_token(
                 all_state, embed_fn, tokenizer,
-                score_token_id, prompt_text,
+                prompt_text,
             )
-        all_scores.extend(scores.float().cpu().tolist())
-        all_labels.extend(all_target.long().cpu().tolist())
+        logits = labels.new_full(labels.shape, 0.0)
+        logits[valid_b, valid_w] = logits_flat.float()
+        metric_parts = score_metrics_from_logits(
+            logits, labels, valid_mask, binary_threshold=binary_threshold,
+        )
+        all_probs.extend(metric_parts["score_prob"].cpu().tolist())
+        all_soft_labels.extend(metric_parts["soft_targets"].cpu().tolist())
+        all_binary_labels.extend(metric_parts["binary_targets"].cpu().tolist())
 
     model.train()
 
-    scores_arr = np.array(all_scores)
-    labels_arr = np.array(all_labels)
+    probs_arr = np.array(all_probs)
+    soft_arr = np.array(all_soft_labels)
+    binary_arr = np.array(all_binary_labels)
 
-    metrics = {"n_samples": len(labels_arr)}
-    if HAS_SKLEARN and len(set(labels_arr)) > 1:
-        metrics["auc"] = roc_auc_score(labels_arr, scores_arr)
-        metrics["ap"] = average_precision_score(labels_arr, scores_arr)
+    metrics = {"n_samples": len(binary_arr)}
+    if HAS_SKLEARN and len(set(binary_arr.tolist())) > 1:
+        metrics["auc"] = roc_auc_score(binary_arr, probs_arr)
+        metrics["ap"] = average_precision_score(binary_arr, probs_arr)
     else:
-        metrics["auc"] = 0.5
-        metrics["ap"] = 0.0
+        print("WARNING: validation has a single binary class; AUC/AP set to NaN.")
+        metrics["auc"] = math.nan
+        metrics["ap"] = math.nan
 
-    # MSE and accuracy at threshold 0.5
-    if len(scores_arr):
-        metrics["mse"] = float(np.mean((scores_arr - labels_arr) ** 2))
-        pred = (scores_arr > 0.5).astype(int)
-        bin_labels = (labels_arr > 0.5).astype(int)
-        metrics["accuracy"] = float((pred == bin_labels).mean()) if len(labels_arr) else 0.0
+    if len(probs_arr):
+        metrics["mse"] = float(np.mean((probs_arr - soft_arr) ** 2))
+        metrics["mae"] = float(np.mean(np.abs(probs_arr - soft_arr)))
+        pred = (probs_arr >= binary_threshold).astype(int)
+        metrics["accuracy"] = float((pred == binary_arr).mean())
+        tp = int(((pred == 1) & (binary_arr == 1)).sum())
+        fp = int(((pred == 1) & (binary_arr == 0)).sum())
+        fn = int(((pred == 0) & (binary_arr == 1)).sum())
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        metrics["precision"] = float(precision)
+        metrics["recall"] = float(recall)
+        metrics["f1"] = float(2 * precision * recall / max(precision + recall, 1e-12))
     else:
-        metrics["mse"] = 0.0
+        metrics["mse"] = math.nan
+        metrics["mae"] = math.nan
         metrics["accuracy"] = 0.0
+        metrics["precision"] = 0.0
+        metrics["recall"] = 0.0
+        metrics["f1"] = 0.0
 
     return metrics
 
@@ -1446,7 +1460,8 @@ def main():
                        help="frames per clip window")
     parser.add_argument("--sample-interval", type=int, default=3,
                        help="stride inside a clip; 3 for ~10fps at 30fps source")
-    parser.add_argument("--max-windows", type=int, default=32)
+    parser.add_argument("--max-windows", type=int, default=8,
+                       help="max scoring windows per TBPTT chunk")
     parser.add_argument("--vit-micro-batch", type=int, default=1)
     parser.add_argument("--llm-micro-batch", type=int, default=0)
     parser.add_argument("--min-pixels", type=int, default=200704)
@@ -1463,8 +1478,13 @@ def main():
     parser.add_argument("--lambda-rank", type=float, default=1.0)
     parser.add_argument("--lambda-sparse", type=float, default=1e-3)
     parser.add_argument("--mil-margin", type=float, default=0.5)
+    parser.add_argument("--lambda-score", type=float, default=1.0)
+    parser.add_argument("--lambda-future", type=float, default=0.05)
     parser.add_argument("--lambda-sum", type=float, default=0.1,
-                       help="weight for summary CE loss on last windows of each chunk")
+                       help="weight for clip-boundary summary CE loss")
+    parser.add_argument("--binary-threshold", type=float, default=0.5)
+    parser.add_argument("--debug-state", action="store_true",
+                       help="print SSM state reuse/detach/clear events for streaming checks")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
@@ -1502,9 +1522,7 @@ def main():
     score_token_id = None
     sum_token_id = None
     if args.objective == "score_token":
-        score_token_id, sum_token_id = _add_special_tokens(tokenizer, qwen)
-        print(f"Added <SCORE> (id={score_token_id}) and <SUM> (id={sum_token_id}), "
-              f"vocab size now {len(tokenizer)}")
+        print("Using explicit trainable score_query and summary_query parameters.")
 
     # ---- LoRA ----
     lora_config = LoraConfig(
@@ -1523,6 +1541,7 @@ def main():
         qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=args.vit_micro_batch,
     ).to(device)
+    model.debug_state = bool(args.debug_state)
 
     # ---- param counts ----
     total = sum(p.numel() for p in model.parameters())
@@ -1607,6 +1626,9 @@ def main():
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
+            "future_head": model.future_head.state_dict(),
+            "score_query": model.score_query.detach().cpu(),
+            "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -1629,7 +1651,15 @@ def main():
             "lambda_abnormal": args.lambda_abnormal,
             "lambda_rank": args.lambda_rank,
             "lambda_sparse": args.lambda_sparse,
+            "lambda_score": args.lambda_score,
+            "lambda_future": args.lambda_future,
+            "lambda_sum": args.lambda_sum,
             "mil_margin": args.mil_margin,
+            "binary_threshold": args.binary_threshold,
+            "feature_cache_root": args.feature_cache_root,
+            "feature_cache_model_id": args.model_path,
+            "min_pixels": args.min_pixels,
+            "max_pixels": args.max_pixels,
         }, str(ckpt_dir / "train_state.pt"))
         processor.save_pretrained(str(ckpt_dir))
         tokenizer.save_pretrained(str(ckpt_dir))
@@ -1649,6 +1679,13 @@ def main():
         train_normal_max: List[float] = []
         train_abnormal_max: List[float] = []
         train_ranking_hits: List[float] = []
+        train_score_losses: List[float] = []
+        train_future_losses: List[float] = []
+        train_summary_losses: List[float] = []
+        train_valid_windows: List[float] = []
+        train_future_pairs: List[float] = []
+        train_summary_triggers: List[float] = []
+        train_skipped_summary: List[float] = []
 
         if args.objective == "score_token":
             # ---- fully-supervised score token ----
@@ -1668,7 +1705,7 @@ def main():
                 if "features" in batch:
                     window_batch = batch["features"].to(device=device, dtype=dtype)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, _, ssm_cache = model.encode_window_features(
+                        state_emb, visual_windows, ssm_cache = model.encode_window_features(
                             window_batch, valid_mask, batch["video_id"], ssm_cache,
                             training=True,
                         )
@@ -1687,52 +1724,56 @@ def main():
                     pv = processed["pixel_values_videos"].to(device)
                     gthw = processed["video_grid_thw"].to(device)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, _, ssm_cache, _ = model.encode_stream(
+                        state_emb, visual_windows, ssm_cache, _ = model.encode_stream(
                             pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
                         )
 
-                # --- select valid state tokens + targets ---
+                # --- score all valid windows exactly once ---
                 valid = valid_mask & (labels >= 0)
                 valid_b, valid_w = valid.nonzero(as_tuple=True)
                 if len(valid_b) == 0:
-                    continue
-                all_state = state_emb[valid_b, valid_w]                   # [Nv, H]
-                all_target = labels[valid_b, valid_w]                     # [Nv]  continuous
-
-                # --- find last-window-of-chunk indices ---
-                last_mask = torch.zeros(len(valid_b), dtype=torch.bool, device=device)
-                for b in range(B):
-                    bw = valid_w[valid_b == b]
-                    if len(bw) > 0:
-                        last_offset = (valid_b == b).nonzero(as_tuple=True)[0][bw.argmax()]
-                        last_mask[last_offset] = True
+                    raise RuntimeError("score_token batch has no valid windows")
+                all_state = state_emb[valid_b, valid_w]
+                score_logits_flat = model.forward_score_token(
+                    all_state, embed_fn, tokenizer, args.status_prompt,
+                )
+                score_logits = state_emb.new_full((B, max_w), 0.0)
+                score_logits[valid_b, valid_w] = score_logits_flat
 
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
 
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    total_loss = all_state.new_tensor(0.0)
-                    # non-last windows: score only
-                    if (~last_mask).any():
-                        scores_nl = model.forward_score_token(
-                            all_state[~last_mask], embed_fn, tokenizer,
-                            score_token_id, args.status_prompt,
+                    loss_score = score_bce_loss(score_logits, labels, valid_mask)
+
+                    chunk_starts = torch.tensor(batch["chunk_start"], dtype=torch.long, device=device).view(B, 1)
+                    local_idx = torch.arange(max_w, dtype=torch.long, device=device).view(1, max_w)
+                    window_indices = chunk_starts + local_idx
+                    loss_future, num_future_pairs = future_prediction_loss(
+                        state_emb, visual_windows, valid_mask,
+                        window_indices, batch["video_id"], model.future_head,
+                    )
+
+                    triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
+                    if triggers:
+                        trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
+                        trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
+                        trigger_states = state_emb[trigger_b, trigger_w]
+                        summary_texts = [t[2] for t in triggers]
+                        loss_summary, summary_info = summary_ce_loss(
+                            model.qwen, embed_fn, tokenizer,
+                            trigger_states, model.summary_query, summary_texts,
                         )
-                        total_loss = total_loss + F.mse_loss(scores_nl, all_target[~last_mask])
-                    # last windows: score + summary CE
-                    if last_mask.any():
-                        summary_texts = _collect_last_window_texts(
-                            batch, valid_b, valid_w, last_mask, valid_mask_cpu,
-                        )
-                        scores_l, ce_loss = model.forward_score_token(
-                            all_state[last_mask], embed_fn, tokenizer,
-                            score_token_id, args.status_prompt,
-                            sum_token_id=sum_token_id, summary_texts=summary_texts,
-                        )
-                        total_loss = total_loss + F.mse_loss(scores_l, all_target[last_mask])
-                        if ce_loss is not None:
-                            total_loss = total_loss + args.lambda_sum * ce_loss
-                    total_loss = total_loss / group_size
+                    else:
+                        loss_summary = state_emb.new_zeros(())
+                        summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
+
+                    raw_total_loss = (
+                        args.lambda_score * loss_score
+                        + args.lambda_future * loss_future
+                        + args.lambda_sum * loss_summary
+                    )
+                    total_loss = raw_total_loss / group_size
                 total_loss.backward()
 
                 is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
@@ -1742,13 +1783,23 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-                train_losses.append(float(total_loss.detach().item() * group_size))
+                train_losses.append(float(raw_total_loss.detach().item()))
+                train_score_losses.append(float(loss_score.detach().item()))
+                train_future_losses.append(float(loss_future.detach().item()))
+                train_summary_losses.append(float(loss_summary.detach().item()))
+                train_valid_windows.append(float(valid.sum().item()))
+                train_future_pairs.append(float(num_future_pairs))
+                train_summary_triggers.append(float(summary_info["num_summary_triggers"]))
+                train_skipped_summary.append(float(skipped_summary))
 
-                for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-                    if is_last:
-                        ssm_cache.pop(vid, None)
+                _clear_finished_states(model, batch, ssm_cache)
 
-                pbar.set_postfix(loss=sum(train_losses[-10:]) / min(10, len(train_losses)))
+                pbar.set_postfix(
+                    loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
+                    score=sum(train_score_losses[-10:]) / min(10, len(train_score_losses)),
+                    future_pairs=int(train_future_pairs[-1]),
+                    sum_trig=int(train_summary_triggers[-1]),
+                )
 
         elif args.objective == "answer_ce":
             ssm_cache: dict = {}
@@ -1817,9 +1868,7 @@ def main():
 
                 train_losses.append(raw_loss.item())
 
-                for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
-                    if is_last:
-                        ssm_cache.pop(vid, None)
+                _clear_finished_states(model, batch, ssm_cache)
 
                 pbar.set_postfix(loss=sum(train_losses[-10:]) / min(10, len(train_losses)))
         else:
@@ -1928,6 +1977,24 @@ def main():
         writer.add_scalar("train/loss", np.mean(train_losses), epoch)
         writer.add_scalar("train/lr", lr, epoch)
         writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
+        if args.objective == "score_token":
+            writer.add_scalar("train/loss_score", finite_mean(train_score_losses), epoch)
+            writer.add_scalar("train/loss_future", finite_mean(train_future_losses), epoch)
+            writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
+            writer.add_scalar("train/num_valid_windows", finite_mean(train_valid_windows), epoch)
+            writer.add_scalar("train/num_future_pairs", finite_mean(train_future_pairs), epoch)
+            writer.add_scalar("train/num_summary_triggers", finite_mean(train_summary_triggers), epoch)
+            writer.add_scalar("train/num_skipped_summary_boundaries", finite_mean(train_skipped_summary), epoch)
+            print(
+                f"  train total={finite_mean(train_losses):.4f} "
+                f"score={finite_mean(train_score_losses):.4f} "
+                f"future={finite_mean(train_future_losses):.4f} "
+                f"summary={finite_mean(train_summary_losses):.4f} "
+                f"valid_w={finite_mean(train_valid_windows):.1f} "
+                f"future_pairs={finite_mean(train_future_pairs):.1f} "
+                f"summary_triggers={finite_mean(train_summary_triggers):.1f} "
+                f"skipped_summary={finite_mean(train_skipped_summary):.1f}"
+            )
         if args.objective == "mil_rank":
             writer.add_scalar("train/normal_language_loss", finite_mean(train_normal_losses), epoch)
             writer.add_scalar("train/abnormal_language_loss", finite_mean(train_abnormal_losses), epoch)
@@ -1944,6 +2011,7 @@ def main():
             metrics = validate_score_token(
                 model, val_loader, processor, tokenizer, device,
                 args.status_prompt, score_token_id, sum_token_id,
+                binary_threshold=args.binary_threshold,
             )
             print(f"  val: mse={metrics.get('mse',0):.4f}  acc={metrics.get('accuracy',0):.3f}  "
                   f"auc={metrics.get('auc',0):.3f}  ap={metrics.get('ap',0):.3f}")
