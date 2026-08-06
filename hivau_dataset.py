@@ -112,13 +112,34 @@ class HIVAUDataset(Dataset):
             # Per-window labels are for temporal evaluation; MIL pairing uses video_label.
             clip_soft: List[float] = []
             clip_bin: List[int] = []
+            # --- parse clip captions if available ---
+            clip_captions: List[str] = []
+            flat_captions: List[Tuple[float, float, str]] = []
+            raw_clips = meta.get("clips", None)
+            raw_captions = meta.get("clips_caption", None)
+            if raw_clips is not None and raw_captions is not None:
+                for event_clips, event_captions in zip(raw_clips, raw_captions):
+                    for (cs, ce), cap in zip(event_clips, event_captions):
+                        flat_captions.append((float(cs), float(ce), str(cap)))
             n_clips = math.ceil(n / self.clip_span)
+            win_dur = self.clip_span / video_fps
             for ci in range(n_clips):
                 start = ci * self.clip_span
                 end = min(start + self.clip_span, n)
                 clip_fl = frame_labels[start:end:sample_interval]
                 clip_soft.append(float(clip_fl.mean()))
                 clip_bin.append(1 if clip_fl.any() else 0)
+                # best-matching caption for this window
+                win_s = ci * win_dur
+                win_e = win_s + win_dur
+                best_cap = ""
+                best_overlap = 0.0
+                for cs, ce, cap in flat_captions:
+                    overlap = min(win_e, ce) - max(win_s, cs)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_cap = cap
+                clip_captions.append(best_cap)
 
             if self.feature_cache_root is not None:
                 load_feature_cache(
@@ -152,6 +173,7 @@ class HIVAUDataset(Dataset):
                     "is_last_chunk": (hi == n_clips),
                     "clip_soft": clip_soft[lo:hi],
                     "clip_bin": clip_bin[lo:hi],
+                    "clip_captions": clip_captions[lo:hi],
                 })
 
         # ---- sanity checks ----
@@ -229,6 +251,7 @@ class HIVAUDataset(Dataset):
                 "labels": soft,
                 "binary": binary,
                 "valid_mask": valid,
+                "clip_captions": meta.get("clip_captions", []),
             }
 
         try:
@@ -288,6 +311,7 @@ class HIVAUDataset(Dataset):
             "labels": soft,
             "binary": binary,
             "valid_mask": valid,
+            "clip_captions": meta.get("clip_captions", []),
         }
 
 def hivau_collate(batch: List[dict]) -> dict:
@@ -302,6 +326,7 @@ def hivau_collate(batch: List[dict]) -> dict:
         "labels": torch.stack([b["labels"] for b in batch], dim=0),
         "binary": torch.stack([b["binary"] for b in batch], dim=0),
         "valid_mask": torch.stack([b["valid_mask"] for b in batch], dim=0),
+        "clip_captions": [b.get("clip_captions", []) for b in batch],
     }
     if "features" in batch[0]:
         out["features"] = torch.stack([b["features"] for b in batch], dim=0)

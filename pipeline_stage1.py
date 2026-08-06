@@ -80,31 +80,52 @@ def _find_eos(tokenizer) -> int:
     return tokenizer.eos_token_id
 
 
+def _collect_last_window_texts(
+    batch: dict,
+    valid_b: torch.Tensor,
+    valid_w: torch.Tensor,
+    last_mask: torch.Tensor,
+    valid_mask_cpu: torch.Tensor,
+) -> List[str]:
+    """Return summary text for each last-window-of-chunk, or empty strings."""
+    captions_per_chunk = batch.get("clip_captions", None)
+    if captions_per_chunk is None:
+        return [""] * int(last_mask.sum().item())
+    B = valid_mask_cpu.shape[0]
+    texts: List[str] = []
+    last_indices = last_mask.nonzero(as_tuple=True)[0]
+    idx_to_bw = list(zip(valid_b.tolist(), valid_w.tolist()))
+    for li in last_indices.tolist():
+        b, w = idx_to_bw[li]
+        caps = captions_per_chunk[b]
+        if isinstance(caps, list) and w < len(caps):
+            texts.append(str(caps[w]))
+        else:
+            texts.append("")
+    return texts
+
+
 def _compute_warmup_steps(total_steps: int) -> int:
     if total_steps <= 1:
         return 0
     return min(total_steps - 1, max(1, int(0.03 * total_steps)))
 
 
-def _add_score_token(tokenizer, model) -> int:
-    """Add ``<SCORE>`` special token and resize model embeddings.
+def _add_special_tokens(tokenizer, model) -> Tuple[int, int]:
+    """Add ``<SCORE>`` and ``<SUM>`` special tokens and resize embeddings.
 
-    Returns the token id of ``<SCORE>``.
+    Returns ``(score_token_id, sum_token_id)``.
     """
-    num_added = tokenizer.add_special_tokens({"additional_special_tokens": ["<SCORE>"]})
+    num_added = tokenizer.add_special_tokens(
+        {"additional_special_tokens": ["<SCORE>", "<SUM>"]}
+    )
     if num_added > 0:
         model.resize_token_embeddings(len(tokenizer))
     score_id = tokenizer.convert_tokens_to_ids("<SCORE>")
-    if not isinstance(score_id, int):
-        raise RuntimeError("Failed to add <SCORE> token")
-    return score_id
-
-
-def _find_score_token_id(tokenizer) -> int:
-    sid = tokenizer.convert_tokens_to_ids("<SCORE>")
-    if not isinstance(sid, int):
-        raise RuntimeError("<SCORE> token not found in tokenizer")
-    return sid
+    sum_id = tokenizer.convert_tokens_to_ids("<SUM>")
+    if not isinstance(score_id, int) or not isinstance(sum_id, int):
+        raise RuntimeError("Failed to add <SCORE> or <SUM> token")
+    return score_id, sum_id
 
 
 # ---------------------------------------------------------------------------
@@ -118,18 +139,21 @@ def build_score_token_batch(
     targets: torch.Tensor,
     score_token_id: int,
     prompt_text: str = "Current video status:",
+    sum_token_id: int | None = None,
+    summary_texts: List[str] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Build a batch for one-pass anomaly scoring via ``<SCORE>`` token.
 
     Each sample:  ``[state_token] + prompt_embeds + [<SCORE>_embed]``
 
-    The LLM processes the whole sequence; the hidden state at the ``<SCORE>``
-    position is later extracted and fed into a scalar regression head.
+    If ``summary_texts`` is provided (last-window-of-clip),
+    appends ``[<SUM>] + summary_tokens + [<EOS>]`` after ``<SCORE>``.
 
     Returns:
         inputs_embeds: ``[N, L, H]``
         attention_mask: ``[N, L]``  bool
         score_mask: ``[N, L]``  bool, True only at ``<SCORE>`` position
+        labels: ``[N, L]``  long, -100 everywhere except summary token positions
     """
     device = state_tokens.device
     N, H = state_tokens.shape
@@ -142,17 +166,50 @@ def build_score_token_batch(
     prompt_part = prompt_emb.unsqueeze(0).expand(N, -1, -1)            # [N, Lp, H]
     score_part = score_emb.unsqueeze(0).unsqueeze(0).expand(N, 1, -1)  # [N, 1, H]
 
-    embeds = torch.cat([state_part, prompt_part, score_part], dim=1)  # [N, 1+Lp+1, H]
-    L = embeds.shape[1]
+    has_summary = (
+        summary_texts is not None
+        and len(summary_texts) > 0
+        and sum_token_id is not None
+    )
+    pre_score_len = 1 + len(prompt_ids)  # state + prompt, <SCORE> is at position pre_score_len
 
+    extra_parts: List[torch.Tensor] = []
+    max_text_len = 0
+    text_token_lists: List[List[int]] = []
+    if has_summary:
+        sum_emb = embed_fn.weight[sum_token_id]
+        extra_parts.append(sum_emb.unsqueeze(0).unsqueeze(0).expand(N, 1, -1))  # [N, 1, H]
+        for st in summary_texts:
+            ids = tokenizer.encode(st, add_special_tokens=False)
+            ids.append(_find_eos(tokenizer))
+            text_token_lists.append(ids)
+            max_text_len = max(max_text_len, len(ids))
+
+    embeds = torch.cat([state_part, prompt_part, score_part] + extra_parts, dim=1)
+    L_base = embeds.shape[1]
+
+    labels: torch.Tensor
+    if has_summary and max_text_len > 0:
+        labels = torch.full((N, L_base + max_text_len), -100, dtype=torch.long, device=device)
+        text_embeds = torch.zeros(N, max_text_len, H, device=device, dtype=embeds.dtype)
+        for i, ids in enumerate(text_token_lists):
+            if len(ids) > 0:
+                text_embeds[i, :len(ids)] = embed_fn.weight[ids]
+                labels[i, L_base:L_base + len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+        embeds = torch.cat([embeds, text_embeds], dim=1)
+    else:
+        labels = torch.full((N, L_base), -100, dtype=torch.long, device=device)
+
+    L = embeds.shape[1]
     attn = torch.ones(N, L, dtype=torch.bool, device=device)
     score_mask = torch.zeros(N, L, dtype=torch.bool, device=device)
-    score_mask[:, -1] = True                                          # last position
+    score_mask[:, pre_score_len] = True                              # <SCORE> position
 
     return {
         "inputs_embeds": embeds,
         "attention_mask": attn,
         "score_mask": score_mask,
+        "labels": labels,
     }
 
 
@@ -603,8 +660,13 @@ class StreamingVADGenerationModel(nn.Module):
         tokenizer,
         score_token_id: int,
         prompt_text: str,
-    ) -> torch.Tensor:
-        """One-pass LLM forward → ``<SCORE>`` hidden state → scalar scores.
+        sum_token_id: int | None = None,
+        summary_texts: List[str] | None = None,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """One-pass LLM forward → ``<SCORE>`` hidden → scalar scores (+ optional CE).
+
+        When ``summary_texts`` is provided, also returns the CE loss from the
+        LLM's own lm_head over the summary token positions.
 
         Args:
             state_embeddings: ``[N, H]``  SSM output tokens (flattened).
@@ -612,29 +674,39 @@ class StreamingVADGenerationModel(nn.Module):
             tokenizer: tokenizer for prompt encoding.
             score_token_id: id of ``<SCORE>`` token.
             prompt_text: text prompt preceding ``<SCORE>``.
+            sum_token_id: id of ``<SUM>`` token (optional).
+            summary_texts: per-sample summary strings (optional).
 
         Returns:
             scores: ``[N]``  scalar anomaly scores.
+            ce_loss: scalar CE loss (only if summary_texts provided).
         """
-        if state_embeddings.shape[0] == 0:
+        N = state_embeddings.shape[0]
+        if N == 0:
             return state_embeddings.new_zeros(0)
 
+        dummy_targets = state_embeddings.new_zeros(N)
         batch = build_score_token_batch(
-            embed_fn, tokenizer, state_embeddings,
-            state_embeddings.new_zeros(state_embeddings.shape[0]),
+            embed_fn, tokenizer, state_embeddings, dummy_targets,
             score_token_id, prompt_text,
+            sum_token_id=sum_token_id, summary_texts=summary_texts,
         )
         out = self.qwen(
             inputs_embeds=batch["inputs_embeds"],
             attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
             output_hidden_states=True,
             use_cache=False,
             return_dict=True,
         )
-        # last hidden state at <SCORE> positions
+        # score
         score_mask = batch["score_mask"].to(out.hidden_states[-1].device)
         hidden = out.hidden_states[-1][score_mask]                   # [N, H]
-        return self.score_head(hidden).squeeze(-1)                   # [N]
+        scores = self.score_head(hidden).squeeze(-1)                 # [N]
+
+        if summary_texts is not None:
+            return scores, out.loss
+        return scores
 
 
 def _verify_attention_backend(model: nn.Module, requested: str) -> None:
@@ -1258,6 +1330,7 @@ def validate_score_token(
     device: torch.device,
     prompt_text: str,
     score_token_id: int,
+    sum_token_id: int | None = None,
 ) -> dict:
     """One-pass score token evaluation."""
     model.eval()
@@ -1390,6 +1463,8 @@ def main():
     parser.add_argument("--lambda-rank", type=float, default=1.0)
     parser.add_argument("--lambda-sparse", type=float, default=1e-3)
     parser.add_argument("--mil-margin", type=float, default=0.5)
+    parser.add_argument("--lambda-sum", type=float, default=0.1,
+                       help="weight for summary CE loss on last windows of each chunk")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
@@ -1425,9 +1500,11 @@ def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     score_token_id = None
+    sum_token_id = None
     if args.objective == "score_token":
-        score_token_id = _add_score_token(tokenizer, qwen)
-        print(f"Added <SCORE> token (id={score_token_id}), vocab size now {len(tokenizer)}")
+        score_token_id, sum_token_id = _add_special_tokens(tokenizer, qwen)
+        print(f"Added <SCORE> (id={score_token_id}) and <SUM> (id={sum_token_id}), "
+              f"vocab size now {len(tokenizer)}")
 
     # ---- LoRA ----
     lora_config = LoraConfig(
@@ -1545,6 +1622,7 @@ def main():
             "max_windows": args.max_windows,
             "d_ssm": args.d_ssm,
             "score_token_id": score_token_id,
+            "sum_token_id": sum_token_id,
             "lora_r": args.lora_r,
             "lora_alpha": args.lora_alpha,
             "lambda_normal": args.lambda_normal,
@@ -1584,6 +1662,7 @@ def main():
                 valid_mask = valid_mask_cpu.to(device)
                 binary = binary.to(device)
                 labels = labels.to(device)
+                B, max_w = binary.shape
 
                 # --- encode ---
                 if "features" in batch:
@@ -1620,17 +1699,41 @@ def main():
                 all_state = state_emb[valid_b, valid_w]                   # [Nv, H]
                 all_target = labels[valid_b, valid_w]                     # [Nv]  continuous
 
+                # --- find last-window-of-chunk indices ---
+                last_mask = torch.zeros(len(valid_b), dtype=torch.bool, device=device)
+                for b in range(B):
+                    bw = valid_w[valid_b == b]
+                    if len(bw) > 0:
+                        last_offset = (valid_b == b).nonzero(as_tuple=True)[0][bw.argmax()]
+                        last_mask[last_offset] = True
+
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
 
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    scores = model.forward_score_token(
-                        all_state, embed_fn, tokenizer,
-                        score_token_id, args.status_prompt,
-                    )
-                    raw_loss = F.mse_loss(scores, all_target)
-                raw_loss = raw_loss / group_size
-                raw_loss.backward()
+                    total_loss = all_state.new_tensor(0.0)
+                    # non-last windows: score only
+                    if (~last_mask).any():
+                        scores_nl = model.forward_score_token(
+                            all_state[~last_mask], embed_fn, tokenizer,
+                            score_token_id, args.status_prompt,
+                        )
+                        total_loss = total_loss + F.mse_loss(scores_nl, all_target[~last_mask])
+                    # last windows: score + summary CE
+                    if last_mask.any():
+                        summary_texts = _collect_last_window_texts(
+                            batch, valid_b, valid_w, last_mask, valid_mask_cpu,
+                        )
+                        scores_l, ce_loss = model.forward_score_token(
+                            all_state[last_mask], embed_fn, tokenizer,
+                            score_token_id, args.status_prompt,
+                            sum_token_id=sum_token_id, summary_texts=summary_texts,
+                        )
+                        total_loss = total_loss + F.mse_loss(scores_l, all_target[last_mask])
+                        if ce_loss is not None:
+                            total_loss = total_loss + args.lambda_sum * ce_loss
+                    total_loss = total_loss / group_size
+                total_loss.backward()
 
                 is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
                 if is_update:
@@ -1639,7 +1742,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-                train_losses.append(float(raw_loss.detach().item() * group_size))
+                train_losses.append(float(total_loss.detach().item() * group_size))
 
                 for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
                     if is_last:
@@ -1840,7 +1943,7 @@ def main():
         if args.objective == "score_token" and val_loader is not None:
             metrics = validate_score_token(
                 model, val_loader, processor, tokenizer, device,
-                args.status_prompt, score_token_id,
+                args.status_prompt, score_token_id, sum_token_id,
             )
             print(f"  val: mse={metrics.get('mse',0):.4f}  acc={metrics.get('accuracy',0):.3f}  "
                   f"auc={metrics.get('auc',0):.3f}  ap={metrics.get('ap',0):.3f}")
