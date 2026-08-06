@@ -1,4 +1,11 @@
-"""Prepare explicit clip-level anomaly labels for HIVAU annotations."""
+"""Deprecated helper for explicit clip-level anomaly labels.
+
+Current Stage 1 training does not require clip-level anomaly labels.  SCORE
+supervision is built from ``events`` plus ``events_summary_split[].judgement``;
+HIVAU ``clips`` and ``clips_caption`` are used only for SUMMARY supervision.
+This script is kept for historical/manual-label experiments and is not called
+by the Stage 1 data pipeline.
+"""
 
 import argparse
 import json

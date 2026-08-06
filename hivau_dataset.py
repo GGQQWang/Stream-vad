@@ -11,10 +11,10 @@ correctly in loss, metrics, and logging.
 
 import json
 import math
+import warnings
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Sequence
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
@@ -23,15 +23,8 @@ from feature_cache import load_feature_cache
 from stage1_streaming import build_window_infos, sampled_fps, window_span_frames
 
 
-MISSING_CLIP_LABELS_ERROR = (
-    "This annotation file does not contain explicit clip-level anomaly labels. "
-    "Run prepare_hivau_clip_labels.py first. "
-    "HIVAU events must not be used as anomaly intervals."
-)
-
-
-def _read_video_label(meta: dict, frame_labels: np.ndarray) -> int:
-    """Prefer explicit video-level labels; fall back to temporal events."""
+def _read_video_label(meta: dict, frame_labels=None) -> int:
+    """Prefer explicit video-level labels without using event locations."""
     if "video_label" in meta:
         return int(meta["video_label"])
     if "label" in meta:
@@ -41,7 +34,7 @@ def _read_video_label(meta: dict, frame_labels: np.ndarray) -> int:
                 return 0
             return 1 if any(_label_value_is_abnormal(x) for x in label) else 0
         return 1 if _label_value_is_abnormal(label) else 0
-    return 1 if frame_labels.any() else 0
+    return 0
 
 
 def _label_value_is_abnormal(label) -> bool:
@@ -54,43 +47,156 @@ def _label_value_is_abnormal(label) -> bool:
         return True
 
 
-def _extract_anomaly_clip_intervals(meta: dict, video_id: str) -> List[List[float]]:
-    clips = meta.get("clips")
-    clip_labels = meta.get("clip_anomaly_labels")
-    if clip_labels is None:
-        raise ValueError(f"{MISSING_CLIP_LABELS_ERROR} video={video_id}")
-    if clips is None:
-        raise ValueError(f"Missing clips for clip-level anomaly labels: video={video_id}")
-    if len(clips) != len(clip_labels):
+def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | None = None) -> int:
+    """Parse HIVAU event judgement into 0=normal or 1=anomaly.
+
+    Negated phrases are checked before positive phrases so strings such as
+    "No anomaly exists in this video" are not misread as abnormal.
+    """
+    if not isinstance(judgement, str):
         raise ValueError(
-            f"clip_anomaly_labels event count mismatch: "
-            f"video={video_id}, clips={len(clips)}, labels={len(clip_labels)}"
+            f"Unparseable event judgement: video={video_id}, "
+            f"event_idx={event_idx}, judgement={judgement!r}"
+        )
+    normalized = " ".join(judgement.lower().strip().split())
+    if not normalized:
+        raise ValueError(
+            f"Unparseable event judgement: video={video_id}, "
+            f"event_idx={event_idx}, judgement={judgement!r}"
+        )
+    negative_patterns = (
+        "there is no anomaly",
+        "there are no anomalies",
+        "no anomaly",
+        "no anomalies",
+        "no abnormal event",
+        "no abnormal events",
+    )
+    positive_patterns = (
+        "an anomaly exists",
+        "anomalous event exists",
+        "an abnormal event exists",
+        "abnormal event exists",
+        "an anomaly is present",
+    )
+    if any(pattern in normalized for pattern in negative_patterns):
+        return 0
+    if any(pattern in normalized for pattern in positive_patterns):
+        return 1
+    raise ValueError(
+        f"Unparseable event judgement: video={video_id}, "
+        f"event_idx={event_idx}, judgement={judgement!r}"
+    )
+
+
+def _validate_time_interval(
+    interval: Sequence[float],
+    *,
+    video_id: str,
+    field: str,
+    event_idx: int,
+    clip_idx: int | None = None,
+) -> tuple[float, float]:
+    loc = f"video={video_id}, {field}, event={event_idx}"
+    if clip_idx is not None:
+        loc += f", clip={clip_idx}"
+    if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+        raise ValueError(f"Invalid time interval length: {loc}, interval={interval!r}")
+    try:
+        start = float(interval[0])
+        end = float(interval[1])
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid time interval values: {loc}, interval={interval!r}")
+    if not (math.isfinite(start) and math.isfinite(end)) or not (start < end):
+        raise ValueError(f"Invalid time interval values: {loc}, interval={interval!r}")
+    return start, end
+
+
+def seconds_to_frame_interval(
+    start_sec: float,
+    end_sec: float,
+    *,
+    fps: float,
+    n_frames: int,
+    video_id: str = "",
+    event_idx: int | None = None,
+    field: str = "event",
+) -> tuple[int, int] | None:
+    if fps <= 0 or not math.isfinite(float(fps)):
+        raise ValueError(f"Invalid fps: video={video_id}, fps={fps!r}")
+    if n_frames <= 0:
+        raise ValueError(f"Invalid n_frames: video={video_id}, n_frames={n_frames!r}")
+    start_frame = math.floor(float(start_sec) * float(fps))
+    end_frame = math.ceil(float(end_sec) * float(fps))
+    clipped_start = max(0, start_frame)
+    clipped_end = min(int(n_frames), end_frame)
+    if clipped_start != start_frame or clipped_end != end_frame:
+        warnings.warn(
+            f"{field} time exceeds video bounds and was clipped: "
+            f"video={video_id}, event_idx={event_idx}, "
+            f"seconds=({start_sec}, {end_sec}), frames=({start_frame}, {end_frame}), "
+            f"n_frames={n_frames}",
+            RuntimeWarning,
+        )
+    if clipped_end <= clipped_start:
+        return None
+    return clipped_start, clipped_end
+
+
+def _extract_anomaly_event_intervals(
+    meta: dict,
+    video_id: str,
+    fps: float,
+    n_frames: int,
+    debug_events: bool = False,
+) -> tuple[List[List[float]], int, int]:
+    events = meta.get("events", []) or []
+    summaries = meta.get("events_summary_split", []) or []
+    if len(events) != len(summaries):
+        raise ValueError(
+            f"events/events_summary_split count mismatch: video={video_id}, "
+            f"events={len(events)}, events_summary_split={len(summaries)}"
         )
 
+    video_label = _read_video_label(meta)
     intervals: List[List[float]] = []
-    for event_idx, event_clips in enumerate(clips):
-        event_labels = clip_labels[event_idx]
-        if len(event_clips) != len(event_labels):
-            raise ValueError(
-                f"clip_anomaly_labels clip count mismatch: "
-                f"video={video_id}, event={event_idx}, "
-                f"clips={len(event_clips)}, labels={len(event_labels)}"
+    abnormal_events = 0
+    normal_events = 0
+    for event_idx, event_range in enumerate(events):
+        start_sec, end_sec = _validate_time_interval(
+            event_range,
+            video_id=video_id,
+            field="events",
+            event_idx=event_idx,
+        )
+        judgement = summaries[event_idx].get("judgement") if isinstance(summaries[event_idx], dict) else None
+        event_label = parse_event_judgement(judgement, video_id=video_id, event_idx=event_idx)
+        frame_interval = seconds_to_frame_interval(
+            start_sec,
+            end_sec,
+            fps=fps,
+            n_frames=n_frames,
+            video_id=video_id,
+            event_idx=event_idx,
+            field="event",
+        )
+        if debug_events:
+            print(
+                f"HIVAU event: video={video_id}, event_idx={event_idx}, "
+                f"seconds=({start_sec}, {end_sec}), frames={frame_interval}, "
+                f"event_label={event_label}, judgement={judgement!r}"
             )
-        for clip_idx, (clip_range, label) in enumerate(zip(event_clips, event_labels)):
-            if label is None:
+        if event_label == 1:
+            abnormal_events += 1
+            if video_label == 0:
                 raise ValueError(
-                    f"Missing clip anomaly label: "
-                    f"video={video_id}, event={event_idx}, clip={clip_idx}"
+                    f"video label says normal, but event judgement says anomaly: "
+                    f"video={video_id}, event_idx={event_idx}, judgement={judgement!r}"
                 )
-            if label not in (0, 1):
-                raise ValueError(
-                    f"Invalid clip anomaly label: "
-                    f"video={video_id}, event={event_idx}, clip={clip_idx}, label={label!r}"
-                )
-            if int(label) == 1:
-                start_sec, end_sec = clip_range
-                intervals.append([float(start_sec), float(end_sec)])
-    return intervals
+            intervals.append([start_sec, end_sec])
+        else:
+            normal_events += 1
+    return intervals, abnormal_events, normal_events
 
 
 def _pad_int(values: List[int], length: int, pad_value: int) -> List[int]:
@@ -107,7 +213,7 @@ def _pad_list(values: List[list], length: int) -> List[list]:
     return out
 
 
-def _parse_summary_clips(meta: dict, fps: float, n_frames: int) -> List[dict]:
+def _parse_summary_clips(meta: dict, fps: float, n_frames: int, video_id: str = "") -> List[dict]:
     """Parse HIVAU clip-level text annotations into frame boundaries.
 
     Supported formats:
@@ -122,7 +228,11 @@ def _parse_summary_clips(meta: dict, fps: float, n_frames: int) -> List[dict]:
 
     def _append_summary(clip_id: str, start: int, end: int, text) -> None:
         caption = str(text)
+        if not caption:
+            return
         key = (max(0, start), min(n_frames, end), caption)
+        if key[1] <= key[0]:
+            return
         if key in seen_summary:
             return
         seen_summary.add(key)
@@ -140,22 +250,80 @@ def _parse_summary_clips(meta: dict, fps: float, n_frames: int) -> List[dict]:
             if "clip_start_frame" in item:
                 start = int(item["clip_start_frame"])
             else:
-                start = int(float(item.get("clip_start", item.get("start", 0.0))) * fps)
+                start = math.floor(float(item.get("clip_start", item.get("start", 0.0))) * fps)
             if "clip_end_frame" in item:
                 end = int(item["clip_end_frame"])
             else:
-                end = int(float(item.get("clip_end", item.get("end", 0.0))) * fps)
+                end = math.ceil(float(item.get("clip_end", item.get("end", 0.0))) * fps)
             _append_summary(item.get("clip_id", f"summary_{i}"), start, end, item.get("text", item.get("caption", "")))
 
     raw_clips = meta.get("clips", None)
     raw_captions = meta.get("clips_caption", None)
     if raw_clips is not None and raw_captions is not None:
-        for event_idx, (event_clips, event_captions) in enumerate(zip(raw_clips, raw_captions)):
-            for clip_idx, ((cs, ce), cap) in enumerate(zip(event_clips, event_captions)):
+        if len(raw_clips) != len(raw_captions):
+            raise ValueError(
+                f"clips/clips_caption event count mismatch: video={video_id}, "
+                f"clips={len(raw_clips)}, captions={len(raw_captions)}"
+            )
+        events = meta.get("events", []) or []
+        for event_idx, event_clips in enumerate(raw_clips):
+            event_captions = raw_captions[event_idx]
+            if len(event_clips) != len(event_captions):
+                raise ValueError(
+                    f"clips/clips_caption clip count mismatch: "
+                    f"video={video_id}, event={event_idx}, "
+                    f"clips={len(event_clips)}, captions={len(event_captions)}"
+                )
+            event_frame_interval = None
+            if event_idx < len(events):
+                es, ee = _validate_time_interval(
+                    events[event_idx],
+                    video_id=video_id,
+                    field="events",
+                    event_idx=event_idx,
+                )
+                event_frame_interval = seconds_to_frame_interval(
+                    es,
+                    ee,
+                    fps=fps,
+                    n_frames=n_frames,
+                    video_id=video_id,
+                    event_idx=event_idx,
+                    field="event",
+                )
+            for clip_idx, (clip_range, cap) in enumerate(zip(event_clips, event_captions)):
+                cs, ce = _validate_time_interval(
+                    clip_range,
+                    video_id=video_id,
+                    field="clips",
+                    event_idx=event_idx,
+                    clip_idx=clip_idx,
+                )
+                clip_frame_interval = seconds_to_frame_interval(
+                    cs,
+                    ce,
+                    fps=fps,
+                    n_frames=n_frames,
+                    video_id=video_id,
+                    event_idx=event_idx,
+                    field="clip",
+                )
+                if clip_frame_interval is None:
+                    continue
+                if event_frame_interval is not None:
+                    ev_start, ev_end = event_frame_interval
+                    cl_start, cl_end = clip_frame_interval
+                    if cl_start < ev_start or cl_end > ev_end:
+                        warnings.warn(
+                            f"clip time is outside matching event bounds: "
+                            f"video={video_id}, event_idx={event_idx}, clip_idx={clip_idx}, "
+                            f"clip_frames=({cl_start}, {cl_end}), event_frames=({ev_start}, {ev_end})",
+                            RuntimeWarning,
+                        )
                 _append_summary(
                     f"event{event_idx}_clip{clip_idx}",
-                    int(float(cs) * fps),
-                    int(float(ce) * fps),
+                    clip_frame_interval[0],
+                    clip_frame_interval[1],
                     cap,
                 )
     return parsed
@@ -189,6 +357,7 @@ class HIVAUDataset(Dataset):
         feature_cache_model_id: str = "",
         min_pixels: int = 200704,
         max_pixels: int = 200704,
+        debug_events: bool = False,
     ):
         super().__init__()
         self.video_root = Path(video_root)
@@ -209,6 +378,13 @@ class HIVAUDataset(Dataset):
         # ---- pre-compute per-video clip labels, then chunk ----
         self.samples: List[dict] = []
         total_windows_all = 0
+        video_count = 0
+        normal_video_count = 0
+        abnormal_video_count = 0
+        total_event_count = 0
+        abnormal_event_count = 0
+        normal_event_count = 0
+        total_summary_triggers = 0
 
         for video_name, meta in raw.items():
             n = meta["n_frames"]
@@ -219,15 +395,29 @@ class HIVAUDataset(Dataset):
             if self.feature_cache_root is None and not video_path.exists():
                 continue
 
-            video_label = _read_video_label(meta, np.zeros(n, dtype=np.uint8))
-            anomaly_clip_intervals = _extract_anomaly_clip_intervals(meta, video_name)
-            summary_clips = _parse_summary_clips(meta, video_fps, n)
+            video_label = _read_video_label(meta)
+            if video_label == 0:
+                normal_video_count += 1
+            else:
+                abnormal_video_count += 1
+            video_count += 1
+            anomaly_event_intervals, n_abnormal_events, n_normal_events = _extract_anomaly_event_intervals(
+                meta,
+                video_name,
+                video_fps,
+                n,
+                debug_events=debug_events,
+            )
+            abnormal_event_count += n_abnormal_events
+            normal_event_count += n_normal_events
+            total_event_count += n_abnormal_events + n_normal_events
+            summary_clips = _parse_summary_clips(meta, video_fps, n, video_name)
             # ``window`` is the scoring time step.  It is not the HIVAU
             # semantic clip.  A chunk is only a TBPTT/memory management unit.
             window_infos = build_window_infos(
                 n_frames=n,
                 fps=video_fps,
-                anomaly_intervals=anomaly_clip_intervals,
+                anomaly_intervals=anomaly_event_intervals,
                 frames_per_clip=total_sampled_frames,
                 sample_interval=sample_interval,
                 summary_clips=summary_clips,
@@ -235,6 +425,7 @@ class HIVAUDataset(Dataset):
             clip_soft = [w.soft_label for w in window_infos]
             clip_bin = [1 if w.soft_label > 0.0 else 0 for w in window_infos]
             n_clips = math.ceil(n / self.clip_span)
+            total_summary_triggers += sum(len(w.summary_triggers) for w in window_infos)
 
             if self.feature_cache_root is not None:
                 load_feature_cache(
@@ -300,7 +491,11 @@ class HIVAUDataset(Dataset):
         print(
             f"HIVAUDataset: {len(self.samples)} chunks from "
             f"{len(video_window_counts)} videos, "
-            f"{total_windows_all} total windows"
+            f"{total_windows_all} total windows; "
+            f"videos={video_count}, normal_videos={normal_video_count}, "
+            f"abnormal_videos={abnormal_video_count}, events={total_event_count}, "
+            f"abnormal_events={abnormal_event_count}, normal_events={normal_event_count}, "
+            f"summary_triggers={total_summary_triggers}"
         )
 
     def __len__(self) -> int:

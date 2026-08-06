@@ -22,14 +22,12 @@ def _write_annotation(path: Path) -> None:
                     "video_label": 0,
                     "label": [],
                     "events": [],
+                    "events_summary_split": [],
                     "clips": [
                         [[0.0, 1.5]],
                     ],
                     "clips_caption": [
                         ["A normal scene."],
-                    ],
-                    "clip_anomaly_labels": [
-                        [0],
                     ],
                 },
                 "abnormal_vid": {
@@ -38,6 +36,9 @@ def _write_annotation(path: Path) -> None:
                     "video_label": 1,
                     "label": ["Abuse"],
                     "events": [[1.34, 1.5]],
+                    "events_summary_split": [
+                        {"judgement": "An anomaly exists, specifically, Physical Abuse."},
+                    ],
                     "clips": [
                         [[0.0, 1.34], [1.34, 1.5]],
                     ],
@@ -46,9 +47,6 @@ def _write_annotation(path: Path) -> None:
                             "A normal scene before the anomaly.",
                             "An abnormal action occurs.",
                         ],
-                    ],
-                    "clip_anomaly_labels": [
-                        [0, 1],
                     ],
                 },
             }
