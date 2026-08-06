@@ -114,11 +114,25 @@ def score_bce_loss(
     score_logits: torch.Tensor,
     soft_targets: torch.Tensor,
     valid_mask: torch.Tensor,
+    normalizer: int | float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     valid = valid_mask & (soft_targets >= 0)
     if not valid.any():
         raise ValueError("valid_mask contains no valid windows for score loss")
-    return F.binary_cross_entropy_with_logits(score_logits[valid], soft_targets[valid].float())
+    loss_sum = F.binary_cross_entropy_with_logits(
+        score_logits[valid],
+        soft_targets[valid].float(),
+        reduction="sum",
+    )
+    if normalizer is None:
+        normalizer = int(valid.sum().item())
+    if isinstance(normalizer, torch.Tensor):
+        denom = normalizer.to(device=loss_sum.device, dtype=loss_sum.dtype)
+    else:
+        denom = torch.tensor(float(normalizer), device=loss_sum.device, dtype=loss_sum.dtype)
+    if float(denom.detach().item()) <= 0:
+        raise ValueError("score loss normalizer must be positive")
+    return loss_sum / denom
 
 
 def _binary_auc(probs: torch.Tensor, binary: torch.Tensor) -> float:

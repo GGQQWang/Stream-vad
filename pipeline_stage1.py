@@ -1653,6 +1653,13 @@ def main():
         train_score_prob_min: List[float] = []
         train_score_prob_max: List[float] = []
         train_soft_target_mean: List[float] = []
+        train_valid_windows_total = 0.0
+        train_summary_triggers_total = 0.0
+        train_skipped_summary_total = 0.0
+        train_score_prob_sum = 0.0
+        train_soft_target_sum = 0.0
+        train_score_prob_min_global = math.inf
+        train_score_prob_max_global = -math.inf
 
         if args.objective == "score_token":
             # ---- fully-supervised score token ----
@@ -1711,7 +1718,12 @@ def main():
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
 
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    loss_score = score_bce_loss(score_logits, labels, valid_mask)
+                    loss_score = score_bce_loss(
+                        score_logits,
+                        labels,
+                        valid_mask,
+                        normalizer=valid_mask.numel(),
+                    )
 
                     triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
                     if triggers:
@@ -1744,9 +1756,14 @@ def main():
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
-                train_valid_windows.append(float(valid.sum().item()))
-                train_summary_triggers.append(float(summary_info["num_summary_triggers"]))
+                num_valid_windows = float(valid.sum().item())
+                num_summary_triggers = float(summary_info["num_summary_triggers"])
+                train_valid_windows.append(num_valid_windows)
+                train_summary_triggers.append(num_summary_triggers)
                 train_skipped_summary.append(float(skipped_summary))
+                train_valid_windows_total += num_valid_windows
+                train_summary_triggers_total += num_summary_triggers
+                train_skipped_summary_total += float(skipped_summary)
                 with torch.no_grad():
                     valid_probs = torch.sigmoid(score_logits[valid]).detach().float()
                     valid_targets = labels[valid].detach().float()
@@ -1754,6 +1771,16 @@ def main():
                     train_score_prob_min.append(float(valid_probs.min().item()))
                     train_score_prob_max.append(float(valid_probs.max().item()))
                     train_soft_target_mean.append(float(valid_targets.mean().item()))
+                    train_score_prob_sum += float(valid_probs.sum().item())
+                    train_soft_target_sum += float(valid_targets.sum().item())
+                    train_score_prob_min_global = min(
+                        train_score_prob_min_global,
+                        float(valid_probs.min().item()),
+                    )
+                    train_score_prob_max_global = max(
+                        train_score_prob_max_global,
+                        float(valid_probs.max().item()),
+                    )
 
                 _clear_finished_states(model, batch, ssm_cache)
 
@@ -1940,24 +1967,40 @@ def main():
         writer.add_scalar("train/lr", lr, epoch)
         writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
         if args.objective == "score_token":
+            score_prob_mean_epoch = (
+                train_score_prob_sum / train_valid_windows_total
+                if train_valid_windows_total > 0 else math.nan
+            )
+            soft_target_mean_epoch = (
+                train_soft_target_sum / train_valid_windows_total
+                if train_valid_windows_total > 0 else math.nan
+            )
+            score_prob_min_epoch = (
+                train_score_prob_min_global
+                if math.isfinite(train_score_prob_min_global) else math.nan
+            )
+            score_prob_max_epoch = (
+                train_score_prob_max_global
+                if math.isfinite(train_score_prob_max_global) else math.nan
+            )
             writer.add_scalar("train/loss_score", finite_mean(train_score_losses), epoch)
             writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
-            writer.add_scalar("train/score_prob_mean", finite_mean(train_score_prob_mean), epoch)
-            writer.add_scalar("train/score_prob_min", finite_mean(train_score_prob_min), epoch)
-            writer.add_scalar("train/score_prob_max", finite_mean(train_score_prob_max), epoch)
-            writer.add_scalar("train/soft_target_mean", finite_mean(train_soft_target_mean), epoch)
-            writer.add_scalar("train/num_valid_windows", finite_mean(train_valid_windows), epoch)
-            writer.add_scalar("train/num_summary_triggers", finite_mean(train_summary_triggers), epoch)
-            writer.add_scalar("train/num_skipped_summary_boundaries", finite_mean(train_skipped_summary), epoch)
+            writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
+            writer.add_scalar("train/score_prob_min", score_prob_min_epoch, epoch)
+            writer.add_scalar("train/score_prob_max", score_prob_max_epoch, epoch)
+            writer.add_scalar("train/soft_target_mean", soft_target_mean_epoch, epoch)
+            writer.add_scalar("train/num_valid_windows", train_valid_windows_total, epoch)
+            writer.add_scalar("train/num_summary_triggers", train_summary_triggers_total, epoch)
+            writer.add_scalar("train/num_skipped_summary_boundaries", train_skipped_summary_total, epoch)
             print(
                 f"  train total={finite_mean(train_losses):.4f} "
                 f"score={finite_mean(train_score_losses):.4f} "
                 f"summary={finite_mean(train_summary_losses):.4f} "
-                f"score_prob={finite_mean(train_score_prob_mean):.3f} "
-                f"target={finite_mean(train_soft_target_mean):.3f} "
-                f"valid_w={finite_mean(train_valid_windows):.1f} "
-                f"summary_triggers={finite_mean(train_summary_triggers):.1f} "
-                f"skipped_summary={finite_mean(train_skipped_summary):.1f}"
+                f"score_prob={score_prob_mean_epoch:.3f} "
+                f"target_mean={soft_target_mean_epoch:.3f} "
+                f"valid_windows_total={int(train_valid_windows_total)} "
+                f"summary_triggers_total={int(train_summary_triggers_total)} "
+                f"skipped_summary_total={int(train_skipped_summary_total)}"
             )
         if args.objective == "mil_rank":
             writer.add_scalar("train/normal_language_loss", finite_mean(train_normal_losses), epoch)

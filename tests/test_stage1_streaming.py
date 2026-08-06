@@ -176,6 +176,22 @@ def test_score_bce_matches_manual_valid_positions_only():
     assert targets.dtype.is_floating_point
 
 
+def test_score_bce_can_use_fixed_chunk_denominator_for_equal_window_weight():
+    logits = torch.zeros(8)
+    targets = torch.zeros(8)
+    full_valid = torch.ones(8, dtype=torch.bool)
+    tail_valid = torch.tensor([True, False, False, False, False, False, False, False])
+    full_loss = score_bce_loss(logits, targets, full_valid, normalizer=8)
+    tail_loss = score_bce_loss(logits, targets, tail_valid, normalizer=8)
+    expected_per_window = nn.functional.binary_cross_entropy_with_logits(
+        logits[:1],
+        targets[:1],
+        reduction="sum",
+    ) / 8
+    assert torch.allclose(tail_loss, expected_per_window)
+    assert tail_loss.item() == pytest.approx((full_loss / 8).item(), abs=1e-7)
+
+
 def test_score_padding_positions_do_not_affect_loss():
     logits = torch.tensor([0.0, 1.0, -100.0])
     targets = torch.tensor([0.2, 0.8, 1.0])
