@@ -51,7 +51,7 @@ def test_window_soft_labels_and_tail_denominator():
     infos = build_window_infos(
         n_frames=55,
         fps=10.0,
-        events=[[0.0, 0.0], [0.0, 2.0], [3.0, 3.9], [3.5, 4.2]],
+        anomaly_intervals=[[0.0, 0.0], [0.0, 2.0], [3.0, 3.9], [3.5, 4.2]],
         frames_per_clip=4,
         sample_interval=5,
     )
@@ -62,7 +62,7 @@ def test_window_soft_labels_and_tail_denominator():
     no_overlap = build_window_infos(
         n_frames=20,
         fps=10.0,
-        events=[],
+        anomaly_intervals=[],
         frames_per_clip=4,
         sample_interval=1,
     )
@@ -73,7 +73,7 @@ def test_summary_trigger_fires_when_clip_end_falls_inside_window():
     infos = build_window_infos(
         n_frames=60,
         fps=10.0,
-        events=[],
+        anomaly_intervals=[],
         frames_per_clip=4,
         sample_interval=5,
         summary_clips=[
@@ -91,7 +91,7 @@ def test_summary_trigger_mid_window_example_192_239_clip_end_201():
     infos = build_window_infos(
         n_frames=300,
         fps=30.0,
-        events=[],
+        anomaly_intervals=[],
         frames_per_clip=16,
         sample_interval=3,
         summary_clips=[
@@ -110,7 +110,7 @@ def test_one_chunk_multiple_summary_triggers():
     infos = build_window_infos(
         n_frames=400,
         fps=30.0,
-        events=[],
+        anomaly_intervals=[],
         frames_per_clip=16,
         sample_interval=3,
         summary_clips=[
@@ -127,7 +127,7 @@ def test_clip_cross_chunk_triggers_only_in_second_chunk():
     infos = build_window_infos(
         n_frames=700,
         fps=30.0,
-        events=[],
+        anomaly_intervals=[],
         frames_per_clip=16,
         sample_interval=3,
         summary_clips=[

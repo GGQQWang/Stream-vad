@@ -37,7 +37,7 @@ def build_window_infos(
     *,
     n_frames: int,
     fps: float,
-    events: Sequence[Sequence[float]],
+    anomaly_intervals: Sequence[Sequence[float]],
     frames_per_clip: int,
     sample_interval: int,
     summary_clips: Sequence[dict] | None = None,
@@ -56,9 +56,9 @@ def build_window_infos(
     n_windows = math.ceil(n_frames / span)
 
     abnormal = torch.zeros(n_frames, dtype=torch.bool)
-    for start_sec, end_sec in events:
-        lo = max(0, int(float(start_sec) * fps))
-        hi = min(n_frames, int(float(end_sec) * fps))
+    for start_sec, end_sec in anomaly_intervals:
+        lo = max(0, int(math.floor(float(start_sec) * fps)))
+        hi = min(n_frames, int(math.ceil(float(end_sec) * fps)))
         if hi > lo:
             abnormal[lo:hi] = True
 
