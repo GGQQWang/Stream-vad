@@ -10,24 +10,50 @@ from feature_cache import (
     save_feature_cache_atomic,
 )
 from hivau_dataset import HIVAUDataset
-from hivau_sampler import VideoPairSampler
 
 
 def _write_annotation(path: Path) -> None:
-    path.write_text(json.dumps({
-        "normal_vid": {
-            "n_frames": 45,
-            "fps": 30.0,
-            "video_label": 0,
-            "events": [],
-        },
-        "abnormal_vid": {
-            "n_frames": 45,
-            "fps": 30.0,
-            "video_label": 1,
-            "events": [[1.34, 1.5]],
-        },
-    }))
+    path.write_text(
+        json.dumps(
+            {
+                "normal_vid": {
+                    "n_frames": 45,
+                    "fps": 30.0,
+                    "video_label": 0,
+                    "label": [],
+                    "events": [],
+                    "clips": [
+                        [[0.0, 1.5]],
+                    ],
+                    "clips_caption": [
+                        ["A normal scene."],
+                    ],
+                    "clip_anomaly_labels": [
+                        [0],
+                    ],
+                },
+                "abnormal_vid": {
+                    "n_frames": 45,
+                    "fps": 30.0,
+                    "video_label": 1,
+                    "label": ["Abuse"],
+                    "events": [[1.34, 1.5]],
+                    "clips": [
+                        [[0.0, 1.34], [1.34, 1.5]],
+                    ],
+                    "clips_caption": [
+                        [
+                            "A normal scene before the anomaly.",
+                            "An abnormal action occurs.",
+                        ],
+                    ],
+                    "clip_anomaly_labels": [
+                        [0, 1],
+                    ],
+                },
+            }
+        )
+    )
 
 
 def _write_cache(root: Path, video_id: str, model_id: str = "fake-qwen") -> torch.Tensor:
@@ -211,7 +237,7 @@ def test_pipeline_cache_chunk_encoder_skips_processor_and_vit():
     assert model.seen_states[1] == {"state": 1}
 
 
-def test_cached_mil_smoke_backward_and_checkpoint(tmp_path):
+def test_cached_score_smoke_backward_and_checkpoint(tmp_path):
     ann = tmp_path / "ann.json"
     cache_root = tmp_path / "cache"
     _write_annotation(ann)
@@ -228,47 +254,35 @@ def test_cached_mil_smoke_backward_and_checkpoint(tmp_path):
         min_pixels=128,
         max_pixels=128,
     )
-    sampler = VideoPairSampler(ds.samples, shuffle=False)
-    normal_vid, normal_indices, abnormal_vid, abnormal_indices = next(sampler.iter_epoch(0))
-    assert normal_vid == "normal_vid"
-    assert abnormal_vid == "abnormal_vid"
+    normal_sample = ds[0]
+    abnormal_sample = ds[-1]
+    assert normal_sample["video_id"] == "normal_vid"
+    assert abnormal_sample["video_id"] == "abnormal_vid"
 
     scale = torch.nn.Parameter(torch.tensor(0.1))
-    alpha_logit = torch.nn.Parameter(torch.tensor(-2.1972246))
-    optimizer = torch.optim.SGD([scale, alpha_logit], lr=0.01)
+    optimizer = torch.optim.SGD([scale], lr=0.01)
 
-    state_cache = {}
+    normal_valid = normal_sample["valid_mask"]
+    abnormal_valid = abnormal_sample["valid_mask"]
+    normal_logits = normal_sample["features"][normal_valid, 0] * scale
+    abnormal_logits = abnormal_sample["features"][abnormal_valid, 0] * scale
+    logits = torch.cat([normal_logits, abnormal_logits])
+    targets = torch.cat([
+        normal_sample["labels"][normal_valid],
+        abnormal_sample["labels"][abnormal_valid],
+    ])
 
-    def _video_scores(indices):
-        scores = []
-        for idx in indices:
-            sample = ds[idx]
-            vid = sample["video_id"]
-            prev_state = state_cache.get(vid, torch.zeros(1))
-            valid = sample["valid_mask"]
-            feats = sample["features"][valid]
-            scores.append(feats[:, 0] * scale + prev_state + torch.sigmoid(alpha_logit))
-            state_cache[vid] = prev_state + feats[:, 0].sum().detach().reshape(1)
-        return torch.cat(scores)
-
-    normal_scores = _video_scores(normal_indices)
-    state_cache.pop(normal_vid, None)
-    abnormal_scores = _video_scores(abnormal_indices)
-    state_cache.pop(abnormal_vid, None)
-    loss = normal_scores.square().mean() + torch.relu(0.5 - abnormal_scores.max() + normal_scores.max())
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets)
     loss.backward()
     optimizer.step()
 
     ckpt = tmp_path / "train_state.pt"
     torch.save({
-        "adapter": {"scale": scale.detach().clone()},
-        "ssm": {},
-        "alpha_logit": alpha_logit.detach().clone(),
-        "objective": "mil_rank",
+        "score_scale": scale.detach().clone(),
+        "objective": "score_token",
     }, ckpt)
     loaded = torch.load(ckpt, map_location="cpu", weights_only=True)
     assert torch.isfinite(loss)
     assert scale.grad is not None
-    assert alpha_logit.grad is not None
-    assert loaded["objective"] == "mil_rank"
-    assert torch.allclose(loaded["alpha_logit"], alpha_logit.detach())
+    assert loaded["objective"] == "score_token"
+    assert torch.allclose(loaded["score_scale"], scale.detach())
