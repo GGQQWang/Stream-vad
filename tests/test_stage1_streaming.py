@@ -161,7 +161,7 @@ def test_score_loss_and_metrics_keep_soft_labels():
     loss.backward()
     metrics = score_metrics_from_logits(logits.detach(), targets, valid, binary_threshold=0.5)
     assert loss.isfinite()
-    assert metrics["soft_targets"].tolist() == [0.2, 0.8]
+    assert metrics["soft_targets"].tolist() == pytest.approx([0.2, 0.8], abs=1e-7)
     assert metrics["binary_targets"].tolist() == [0, 1]
     assert logits.grad is not None
 
@@ -218,7 +218,7 @@ def test_score_metrics_use_soft_labels_and_thresholded_binary_labels():
     logits = torch.logit(torch.tensor([0.1, 0.3, 0.7, 0.9]))
     valid = torch.ones(4, dtype=torch.bool)
     metrics = score_metrics_from_logits(logits, soft, valid, binary_threshold=0.5)
-    assert metrics["soft_targets"].tolist() == [0.0, 0.2, 0.8, 1.0]
+    assert metrics["soft_targets"].tolist() == pytest.approx([0.0, 0.2, 0.8, 1.0], abs=1e-7)
     assert metrics["binary_targets"].tolist() == [0, 0, 1, 1]
     assert metrics["mse"] == pytest.approx(
         nn.functional.mse_loss(torch.sigmoid(logits), soft).item(), abs=1e-7,
