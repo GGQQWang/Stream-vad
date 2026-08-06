@@ -1300,9 +1300,8 @@ def validate_score_token(
 ) -> dict:
     """One-pass score token evaluation."""
     model.eval()
-    all_probs: List[float] = []
-    all_soft_labels: List[float] = []
-    all_binary_labels: List[int] = []
+    all_logits: List[torch.Tensor] = []
+    all_soft_targets: List[torch.Tensor] = []
     ssm_cache: dict = {}
     embed_fn = _find_embed(model.qwen)
 
@@ -1356,50 +1355,31 @@ def validate_score_token(
                 all_state, embed_fn, tokenizer,
                 prompt_text,
             )
-        logits = labels.new_full(labels.shape, 0.0)
-        logits[valid_b, valid_w] = logits_flat.float()
-        metric_parts = score_metrics_from_logits(
-            logits, labels, valid_mask, binary_threshold=binary_threshold,
-        )
-        all_probs.extend(metric_parts["score_prob"].cpu().tolist())
-        all_soft_labels.extend(metric_parts["soft_targets"].cpu().tolist())
-        all_binary_labels.extend(metric_parts["binary_targets"].cpu().tolist())
+        all_logits.append(logits_flat.detach().float().cpu())
+        all_soft_targets.append(labels[valid_b, valid_w].detach().float().cpu())
 
     model.train()
 
-    probs_arr = np.array(all_probs)
-    soft_arr = np.array(all_soft_labels)
-    binary_arr = np.array(all_binary_labels)
-
-    metrics = {"n_samples": len(binary_arr)}
-    if HAS_SKLEARN and len(set(binary_arr.tolist())) > 1:
-        metrics["auc"] = roc_auc_score(binary_arr, probs_arr)
-        metrics["ap"] = average_precision_score(binary_arr, probs_arr)
+    if all_logits:
+        logits_all = torch.cat(all_logits, dim=0)
+        soft_all = torch.cat(all_soft_targets, dim=0)
+        valid_all = torch.ones_like(soft_all, dtype=torch.bool)
+        metrics = score_metrics_from_logits(
+            logits_all, soft_all, valid_all, binary_threshold=binary_threshold,
+        )
+        try:
+            metrics["loss_score"] = float(score_bce_loss(logits_all, soft_all, valid_all).item())
+        except ValueError:
+            metrics["loss_score"] = math.nan
+        metrics["n_samples"] = int(metrics["num_valid_windows"])
     else:
-        print("WARNING: validation has a single binary class; AUC/AP set to NaN.")
-        metrics["auc"] = math.nan
-        metrics["ap"] = math.nan
+        empty = torch.empty(0)
+        metrics = score_metrics_from_logits(empty, empty, torch.empty(0, dtype=torch.bool), binary_threshold)
+        metrics["loss_score"] = math.nan
+        metrics["n_samples"] = 0
 
-    if len(probs_arr):
-        metrics["mse"] = float(np.mean((probs_arr - soft_arr) ** 2))
-        metrics["mae"] = float(np.mean(np.abs(probs_arr - soft_arr)))
-        pred = (probs_arr >= binary_threshold).astype(int)
-        metrics["accuracy"] = float((pred == binary_arr).mean())
-        tp = int(((pred == 1) & (binary_arr == 1)).sum())
-        fp = int(((pred == 1) & (binary_arr == 0)).sum())
-        fn = int(((pred == 0) & (binary_arr == 1)).sum())
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        metrics["precision"] = float(precision)
-        metrics["recall"] = float(recall)
-        metrics["f1"] = float(2 * precision * recall / max(precision + recall, 1e-12))
-    else:
-        metrics["mse"] = math.nan
-        metrics["mae"] = math.nan
-        metrics["accuracy"] = 0.0
-        metrics["precision"] = 0.0
-        metrics["recall"] = 0.0
-        metrics["f1"] = 0.0
+    if math.isnan(float(metrics["auc"])) or math.isnan(float(metrics["ap"])):
+        print("WARNING: Validation contains only one binary class; AUC and AP are reported as NaN.")
 
     return metrics
 
@@ -1447,6 +1427,7 @@ def main():
     parser.add_argument("--lambda-rank", type=float, default=1.0)
     parser.add_argument("--lambda-sparse", type=float, default=1e-3)
     parser.add_argument("--mil-margin", type=float, default=0.5)
+    parser.add_argument("--lambda-score", type=float, default=1.0)
     parser.add_argument("--lambda-sum", type=float, default=0.1,
                        help="weight for clip-boundary summary CE loss")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
@@ -1617,6 +1598,7 @@ def main():
             "lambda_abnormal": args.lambda_abnormal,
             "lambda_rank": args.lambda_rank,
             "lambda_sparse": args.lambda_sparse,
+            "lambda_score": args.lambda_score,
             "lambda_sum": args.lambda_sum,
             "mil_margin": args.mil_margin,
             "binary_threshold": args.binary_threshold,
@@ -1648,6 +1630,10 @@ def main():
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
+        train_score_prob_mean: List[float] = []
+        train_score_prob_min: List[float] = []
+        train_score_prob_max: List[float] = []
+        train_soft_target_mean: List[float] = []
 
         if args.objective == "score_token":
             # ---- fully-supervised score token ----
@@ -1723,7 +1709,7 @@ def main():
                         summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
 
                     raw_total_loss = (
-                        loss_score
+                        args.lambda_score * loss_score
                         + args.lambda_sum * loss_summary
                     )
                     total_loss = raw_total_loss / group_size
@@ -1742,6 +1728,13 @@ def main():
                 train_valid_windows.append(float(valid.sum().item()))
                 train_summary_triggers.append(float(summary_info["num_summary_triggers"]))
                 train_skipped_summary.append(float(skipped_summary))
+                with torch.no_grad():
+                    valid_probs = torch.sigmoid(score_logits[valid]).detach().float()
+                    valid_targets = labels[valid].detach().float()
+                    train_score_prob_mean.append(float(valid_probs.mean().item()))
+                    train_score_prob_min.append(float(valid_probs.min().item()))
+                    train_score_prob_max.append(float(valid_probs.max().item()))
+                    train_soft_target_mean.append(float(valid_targets.mean().item()))
 
                 _clear_finished_states(model, batch, ssm_cache)
 
@@ -1930,6 +1923,10 @@ def main():
         if args.objective == "score_token":
             writer.add_scalar("train/loss_score", finite_mean(train_score_losses), epoch)
             writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
+            writer.add_scalar("train/score_prob_mean", finite_mean(train_score_prob_mean), epoch)
+            writer.add_scalar("train/score_prob_min", finite_mean(train_score_prob_min), epoch)
+            writer.add_scalar("train/score_prob_max", finite_mean(train_score_prob_max), epoch)
+            writer.add_scalar("train/soft_target_mean", finite_mean(train_soft_target_mean), epoch)
             writer.add_scalar("train/num_valid_windows", finite_mean(train_valid_windows), epoch)
             writer.add_scalar("train/num_summary_triggers", finite_mean(train_summary_triggers), epoch)
             writer.add_scalar("train/num_skipped_summary_boundaries", finite_mean(train_skipped_summary), epoch)
@@ -1937,6 +1934,8 @@ def main():
                 f"  train total={finite_mean(train_losses):.4f} "
                 f"score={finite_mean(train_score_losses):.4f} "
                 f"summary={finite_mean(train_summary_losses):.4f} "
+                f"score_prob={finite_mean(train_score_prob_mean):.3f} "
+                f"target={finite_mean(train_soft_target_mean):.3f} "
                 f"valid_w={finite_mean(train_valid_windows):.1f} "
                 f"summary_triggers={finite_mean(train_summary_triggers):.1f} "
                 f"skipped_summary={finite_mean(train_skipped_summary):.1f}"
@@ -1959,8 +1958,16 @@ def main():
                 args.status_prompt, score_token_id, sum_token_id,
                 binary_threshold=args.binary_threshold,
             )
-            print(f"  val: mse={metrics.get('mse',0):.4f}  acc={metrics.get('accuracy',0):.3f}  "
-                  f"auc={metrics.get('auc',0):.3f}  ap={metrics.get('ap',0):.3f}")
+            print(
+                f"  val: loss_score={metrics.get('loss_score', math.nan):.4f} "
+                f"mse={metrics.get('mse', math.nan):.4f} mae={metrics.get('mae', math.nan):.4f} "
+                f"auc={metrics.get('auc', math.nan):.3f} ap={metrics.get('ap', math.nan):.3f} "
+                f"acc={metrics.get('accuracy', 0):.3f} precision={metrics.get('precision', 0):.3f} "
+                f"recall={metrics.get('recall', 0):.3f} f1={metrics.get('f1', 0):.3f} "
+                f"score_mean={metrics.get('score_mean', math.nan):.3f} "
+                f"target_mean={metrics.get('target_mean', math.nan):.3f} "
+                f"n={metrics.get('num_valid_windows', 0)}"
+            )
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     writer.add_scalar(f"val/{k}", v, epoch)

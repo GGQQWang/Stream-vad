@@ -117,8 +117,28 @@ def score_bce_loss(
 ) -> torch.Tensor:
     valid = valid_mask & (soft_targets >= 0)
     if not valid.any():
-        raise ValueError("score loss has no valid windows")
+        raise ValueError("valid_mask contains no valid windows for score loss")
     return F.binary_cross_entropy_with_logits(score_logits[valid], soft_targets[valid].float())
+
+
+def _binary_auc(probs: torch.Tensor, binary: torch.Tensor) -> float:
+    pos = probs[binary == 1]
+    neg = probs[binary == 0]
+    if pos.numel() == 0 or neg.numel() == 0:
+        return math.nan
+    cmp = (pos[:, None] > neg[None, :]).float()
+    ties = (pos[:, None] == neg[None, :]).float() * 0.5
+    return float((cmp + ties).mean().item())
+
+
+def _average_precision(probs: torch.Tensor, binary: torch.Tensor) -> float:
+    if binary.sum().item() == 0 or binary.sum().item() == binary.numel():
+        return math.nan
+    order = torch.argsort(probs, descending=True)
+    y = binary[order].float()
+    tp = torch.cumsum(y, dim=0)
+    precision = tp / torch.arange(1, y.numel() + 1, device=y.device, dtype=torch.float32)
+    return float((precision * y).sum().item() / y.sum().clamp_min(1).item())
 
 
 def score_metrics_from_logits(
@@ -136,15 +156,40 @@ def score_metrics_from_logits(
             "score_prob": probs,
             "soft_targets": soft,
             "binary_targets": binary,
+            "num_valid_windows": 0,
+            "score_mean": math.nan,
+            "target_mean": math.nan,
             "mse": math.nan,
             "mae": math.nan,
+            "auc": math.nan,
+            "ap": math.nan,
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
         }
+    pred = (probs >= binary_threshold).long()
+    tp = int(((pred == 1) & (binary == 1)).sum().item())
+    fp = int(((pred == 1) & (binary == 0)).sum().item())
+    fn = int(((pred == 0) & (binary == 1)).sum().item())
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
     return {
         "score_prob": probs,
         "soft_targets": soft,
         "binary_targets": binary,
+        "num_valid_windows": int(probs.numel()),
+        "score_mean": float(probs.mean().item()),
+        "target_mean": float(soft.mean().item()),
         "mse": float(F.mse_loss(probs, soft).item()),
         "mae": float(F.l1_loss(probs, soft).item()),
+        "auc": _binary_auc(probs, binary),
+        "ap": _average_precision(probs, binary),
+        "accuracy": float((pred == binary).float().mean().item()),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
     }
 
 

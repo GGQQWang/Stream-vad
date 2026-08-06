@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 
@@ -165,6 +166,38 @@ def test_score_loss_and_metrics_keep_soft_labels():
     assert logits.grad is not None
 
 
+def test_score_bce_matches_manual_valid_positions_only():
+    logits = torch.tensor([0.0, 1.0, -1.0])
+    targets = torch.tensor([0.2, 0.8, 0.1])
+    valid = torch.tensor([True, True, False])
+    loss = score_bce_loss(logits, targets, valid)
+    expected = nn.functional.binary_cross_entropy_with_logits(logits[:2], targets[:2])
+    assert torch.allclose(loss, expected)
+    assert targets.dtype.is_floating_point
+
+
+def test_score_padding_positions_do_not_affect_loss():
+    logits = torch.tensor([0.0, 1.0, -100.0])
+    targets = torch.tensor([0.2, 0.8, 1.0])
+    valid = torch.tensor([True, True, False])
+    base = score_bce_loss(logits, targets, valid)
+    changed = score_bce_loss(
+        torch.tensor([0.0, 1.0, 100.0]),
+        torch.tensor([0.2, 0.8, 0.0]),
+        valid,
+    )
+    assert torch.allclose(base, changed)
+
+
+def test_score_all_windows_equal_weight_even_with_summary_trigger():
+    logits = torch.tensor([0.0, 0.5, 1.0, 1.5])
+    targets = torch.tensor([0.0, 0.25, 0.75, 1.0])
+    valid = torch.ones(4, dtype=torch.bool)
+    loss = score_bce_loss(logits, targets, valid)
+    expected = nn.functional.binary_cross_entropy_with_logits(logits, targets)
+    assert torch.allclose(loss, expected)
+
+
 def test_summary_batch_masks_and_zero_loss_without_triggers():
     tok = _TinyTokenizer()
     embed = nn.Embedding(8, 4)
@@ -178,6 +211,66 @@ def test_summary_batch_masks_and_zero_loss_without_triggers():
     zero, info = summary_ce_loss(lm, embed, tok, states[:0], query, [])
     assert zero.item() == 0.0
     assert info["num_summary_triggers"] == 0
+
+
+def test_score_metrics_use_soft_labels_and_thresholded_binary_labels():
+    soft = torch.tensor([0.0, 0.2, 0.8, 1.0])
+    logits = torch.logit(torch.tensor([0.1, 0.3, 0.7, 0.9]))
+    valid = torch.ones(4, dtype=torch.bool)
+    metrics = score_metrics_from_logits(logits, soft, valid, binary_threshold=0.5)
+    assert metrics["soft_targets"].tolist() == [0.0, 0.2, 0.8, 1.0]
+    assert metrics["binary_targets"].tolist() == [0, 0, 1, 1]
+    assert metrics["mse"] == nn.functional.mse_loss(torch.sigmoid(logits), soft).item()
+    assert metrics["mae"] == nn.functional.l1_loss(torch.sigmoid(logits), soft).item()
+
+
+def test_score_metrics_logits_zero_probability_half():
+    logits = torch.tensor([0.0])
+    soft = torch.tensor([1.0])
+    valid = torch.tensor([True])
+    metrics = score_metrics_from_logits(logits, soft, valid)
+    assert metrics["score_prob"].item() == 0.5
+
+
+def test_score_metrics_single_class_auc_ap_nan_but_classification_defined():
+    logits = torch.tensor([-2.0, -1.0, 0.0])
+    soft = torch.tensor([0.0, 0.2, 0.1])
+    valid = torch.ones(3, dtype=torch.bool)
+    metrics = score_metrics_from_logits(logits, soft, valid, binary_threshold=0.5)
+    assert np.isnan(metrics["auc"])
+    assert np.isnan(metrics["ap"])
+    assert isinstance(metrics["accuracy"], float)
+    assert isinstance(metrics["precision"], float)
+    assert isinstance(metrics["recall"], float)
+    assert isinstance(metrics["f1"], float)
+
+
+def test_score_metrics_cross_batch_global_auc_not_batch_average():
+    probs1 = torch.tensor([0.4, 0.3])
+    targets1 = torch.tensor([0.0, 1.0])
+    probs2 = torch.tensor([0.2, 0.9])
+    targets2 = torch.tensor([0.0, 1.0])
+    valid = torch.ones(2, dtype=torch.bool)
+    batch_avg_auc = (
+        score_metrics_from_logits(torch.logit(probs1), targets1, valid)["auc"]
+        + score_metrics_from_logits(torch.logit(probs2), targets2, valid)["auc"]
+    ) / 2
+    global_metrics = score_metrics_from_logits(
+        torch.logit(torch.cat([probs1, probs2])),
+        torch.cat([targets1, targets2]),
+        torch.ones(4, dtype=torch.bool),
+    )
+    assert global_metrics["auc"] == 0.75
+    assert global_metrics["auc"] != batch_avg_auc
+
+
+def test_score_loss_empty_valid_mask_raises_clear_error():
+    with pytest.raises(ValueError, match="valid_mask contains no valid windows"):
+        score_bce_loss(
+            torch.tensor([0.0, 1.0]),
+            torch.tensor([-1.0, -1.0]),
+            torch.tensor([False, False]),
+        )
 
 
 def test_summary_query_gradient_and_average_loss():
