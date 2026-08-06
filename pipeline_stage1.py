@@ -524,13 +524,19 @@ class StreamingVADGenerationModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """SSM + gated residual over precomputed per-window visual vectors."""
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
-        ssm_out = torch.zeros_like(window_batch)
+        ssm_param = next(self.ssm.parameters())
+        adapter_param = next(self.adapter.parameters())
+        ssm_out = torch.zeros(
+            window_batch.shape,
+            device=ssm_param.device,
+            dtype=ssm_param.dtype,
+        )
         for b in range(window_batch.shape[0]):
             vid = chunk_video_ids[b]
             bw = valid_w[valid_b == b]
             if len(bw) == 0:
                 continue
-            wv = window_batch[b, bw].unsqueeze(0)
+            wv = window_batch[b, bw].to(device=ssm_param.device, dtype=ssm_param.dtype).unsqueeze(0)
             prev = ssm_state_cache.get(vid)
             had_prev = prev is not None
             if training and prev is not None:
@@ -541,12 +547,14 @@ class StreamingVADGenerationModel(nn.Module):
                     f"reuse_prev={had_prev} detached={bool(training and had_prev)}"
                 )
             out, new_st = self.ssm.forward_chunk(wv, state=prev)
-            ssm_out[b, bw] = out.squeeze(0).to(dtype=ssm_out.dtype)
+            ssm_out[b, bw] = out.squeeze(0).to(device=ssm_out.device, dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
+        ssm_out = ssm_out.to(device=adapter_param.device, dtype=adapter_param.dtype)
         delta = self.adapter(ssm_out)
-        alpha = torch.sigmoid(self.alpha_logit)
-        state_embeddings = window_batch + alpha * delta
+        alpha = torch.sigmoid(self.alpha_logit).to(device=delta.device, dtype=delta.dtype)
+        base = window_batch.to(device=delta.device, dtype=delta.dtype)
+        state_embeddings = base + alpha * delta
         return state_embeddings, window_batch, ssm_state_cache
 
     def extract_window_features(
@@ -655,13 +663,22 @@ class StreamingVADGenerationModel(nn.Module):
         if N == 0:
             return state_embeddings.new_zeros(0)
 
-        device = state_embeddings.device
+        llm_weight = embed_fn.weight
+        llm_device = llm_weight.device
+        llm_dtype = llm_weight.dtype
+        state_embeddings = state_embeddings.to(device=llm_device, dtype=llm_dtype)
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-        prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=llm_device)
         prompt_emb = embed_fn(prompt_ids_t).unsqueeze(0).expand(N, -1, -1)
-        query = self.score_query.to(device=device, dtype=state_embeddings.dtype).reshape(1, 1, -1).expand(N, 1, -1)
+        query = self.score_query.to(device=llm_device, dtype=llm_dtype).reshape(1, 1, -1).expand(N, 1, -1)
         inputs = torch.cat([state_embeddings.unsqueeze(1), prompt_emb, query], dim=1)
-        attn = torch.ones(N, inputs.shape[1], dtype=torch.bool, device=device)
+        if inputs.dtype != llm_dtype or inputs.device != llm_device:
+            raise RuntimeError(
+                f"Qwen inputs_embeds must match embedding dtype/device: "
+                f"got dtype={inputs.dtype}, device={inputs.device}; "
+                f"expected dtype={llm_dtype}, device={llm_device}"
+            )
+        attn = torch.ones(N, inputs.shape[1], dtype=torch.bool, device=llm_device)
         out = self.qwen(
             inputs_embeds=inputs,
             attention_mask=attn,
@@ -670,6 +687,8 @@ class StreamingVADGenerationModel(nn.Module):
             return_dict=True,
         )
         hidden = out.hidden_states[-1][:, -1, :]
+        score_param = next(self.score_head.parameters())
+        hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
         return self.score_head(hidden).squeeze(-1)
 
 

@@ -4,6 +4,7 @@ Run:  python -m pytest tests/test_stage1_generation.py -v
    or: python tests/test_stage1_generation.py
 """
 import sys
+import types
 from pathlib import Path
 
 import torch
@@ -156,6 +157,72 @@ def test_stage1_score_components_defined_on_instances():
     assert "summary_query" not in StreamingVADGenerationModel.__dict__
 
 
+def test_score_path_casts_qwen_inputs_to_embedding_dtype_and_score_head_to_fp32():
+    from pipeline_stage1 import StreamingVADGenerationModel
+
+    class _Tokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    class _TinyQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 4).to(dtype=torch.bfloat16)
+            self.seen_dtype = None
+
+        def forward(self, inputs_embeds, **kwargs):
+            self.seen_dtype = inputs_embeds.dtype
+            hidden = self.proj(inputs_embeds)
+            return type("Out", (), {"hidden_states": [hidden]})
+
+    harness = nn.Module()
+    harness.score_query = nn.Parameter(torch.randn(1, 4, dtype=torch.float32))
+    harness.score_head = nn.Linear(4, 1).to(dtype=torch.float32)
+    harness.qwen = _TinyQwen()
+    harness.forward_score_token = types.MethodType(StreamingVADGenerationModel.forward_score_token, harness)
+
+    embed = nn.Embedding(8, 4).to(dtype=torch.bfloat16)
+    state = torch.randn(3, 4, dtype=torch.float32)
+    logits = harness.forward_score_token(state, embed, _Tokenizer(), "prompt")
+    assert harness.qwen.seen_dtype == torch.bfloat16
+    assert logits.dtype == torch.float32
+    logits.sum().backward()
+    assert harness.score_query.grad is not None
+    assert harness.score_query.grad.abs().sum().item() > 0
+
+
+def test_summary_path_casts_inputs_to_embedding_dtype_without_losing_query_grad():
+    from stage1_streaming import summary_ce_loss
+
+    class _Tokenizer:
+        eos_token_id = 3
+
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    class _TinyQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 8).to(dtype=torch.bfloat16)
+            self.seen_dtype = None
+
+        def forward(self, inputs_embeds, **kwargs):
+            self.seen_dtype = inputs_embeds.dtype
+            logits = self.proj(inputs_embeds).float()
+            return type("Out", (), {"logits": logits})
+
+    embed = nn.Embedding(8, 4).to(dtype=torch.bfloat16)
+    qwen = _TinyQwen()
+    summary_query = nn.Parameter(torch.randn(1, 4, dtype=torch.float32))
+    state = torch.randn(2, 4, dtype=torch.float32)
+    loss, info = summary_ce_loss(qwen, embed, _Tokenizer(), state, summary_query, ["a", "b"])
+    assert qwen.seen_dtype == torch.bfloat16
+    assert info["num_summary_triggers"] == 2
+    loss.backward()
+    assert summary_query.grad is not None
+    assert summary_query.grad.abs().sum().item() > 0
+
+
 def test_stage2_not_broken():
     """Stage 2 file should still compile."""
     import py_compile
@@ -170,5 +237,7 @@ if __name__ == "__main__":
     test_anomaly_score_direction()
     test_state_prompt_labels_masked()
     test_stage1_score_components_defined_on_instances()
+    test_score_path_casts_qwen_inputs_to_embedding_dtype_and_score_head_to_fp32()
+    test_summary_path_casts_inputs_to_embedding_dtype_without_losing_query_grad()
     test_stage2_not_broken()
     print("ALL CPU TESTS PASSED")

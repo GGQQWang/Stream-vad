@@ -220,7 +220,10 @@ def build_summary_query_batch(
     summary_texts: Sequence[str],
 ) -> dict:
     """Build ``[state] [summary_query] [caption tokens]`` teacher-forcing batch."""
-    device = state_tokens.device
+    llm_weight = embed_fn.weight
+    device = llm_weight.device
+    dtype = llm_weight.dtype
+    state_tokens = state_tokens.to(device=device, dtype=dtype)
     N, H = state_tokens.shape
     if N != len(summary_texts):
         raise ValueError("state token count must match summary text count")
@@ -234,17 +237,24 @@ def build_summary_query_batch(
         token_lists.append(ids)
         max_len = max(max_len, len(ids))
 
-    query = summary_query.to(device=device, dtype=state_tokens.dtype).reshape(1, 1, H).expand(N, 1, H)
+    query = summary_query.to(device=device, dtype=dtype).reshape(1, 1, H).expand(N, 1, H)
     base = torch.cat([state_tokens.unsqueeze(1), query], dim=1)
-    text_embeds = torch.zeros(N, max_len, H, device=device, dtype=state_tokens.dtype)
+    text_embeds = torch.zeros(N, max_len, H, device=device, dtype=dtype)
     labels = torch.full((N, 2 + max_len), IGNORE_INDEX, dtype=torch.long, device=device)
     for i, ids in enumerate(token_lists):
         if ids:
             id_t = torch.tensor(ids, dtype=torch.long, device=device)
             text_embeds[i, :len(ids)] = embed_fn(id_t)
             labels[i, 2:2 + len(ids)] = id_t
+    inputs_embeds = torch.cat([base, text_embeds], dim=1)
+    if inputs_embeds.dtype != dtype or inputs_embeds.device != device:
+        raise RuntimeError(
+            f"Qwen summary inputs_embeds must match embedding dtype/device: "
+            f"got dtype={inputs_embeds.dtype}, device={inputs_embeds.device}; "
+            f"expected dtype={dtype}, device={device}"
+        )
     return {
-        "inputs_embeds": torch.cat([base, text_embeds], dim=1),
+        "inputs_embeds": inputs_embeds,
         "attention_mask": torch.ones(N, 2 + max_len, dtype=torch.bool, device=device),
         "labels": labels,
         "caption_token_count": int(sum(len(ids) for ids in token_lists)),
