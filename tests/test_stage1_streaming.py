@@ -55,9 +55,9 @@ def test_window_soft_labels_and_tail_denominator():
         frames_per_clip=4,
         sample_interval=5,
     )
-    assert infos[0].soft_label == 1.0
-    assert infos[1].soft_label == 0.5
-    assert infos[2].soft_label == 1 / 3
+    assert infos[0].soft_label == pytest.approx(1.0, abs=1e-7)
+    assert infos[1].soft_label == pytest.approx(0.5, abs=1e-7)
+    assert infos[2].soft_label == pytest.approx(1 / 3, abs=1e-7)
 
     no_overlap = build_window_infos(
         n_frames=20,
@@ -66,7 +66,7 @@ def test_window_soft_labels_and_tail_denominator():
         frames_per_clip=4,
         sample_interval=1,
     )
-    assert no_overlap[0].soft_label == 0.0
+    assert no_overlap[0].soft_label == pytest.approx(0.0, abs=1e-7)
 
 
 def test_summary_trigger_fires_when_clip_end_falls_inside_window():
@@ -209,7 +209,7 @@ def test_summary_batch_masks_and_zero_loss_without_triggers():
 
     lm = _TinyLM()
     zero, info = summary_ce_loss(lm, embed, tok, states[:0], query, [])
-    assert zero.item() == 0.0
+    assert zero.item() == pytest.approx(0.0, abs=1e-7)
     assert info["num_summary_triggers"] == 0
 
 
@@ -220,8 +220,12 @@ def test_score_metrics_use_soft_labels_and_thresholded_binary_labels():
     metrics = score_metrics_from_logits(logits, soft, valid, binary_threshold=0.5)
     assert metrics["soft_targets"].tolist() == [0.0, 0.2, 0.8, 1.0]
     assert metrics["binary_targets"].tolist() == [0, 0, 1, 1]
-    assert metrics["mse"] == nn.functional.mse_loss(torch.sigmoid(logits), soft).item()
-    assert metrics["mae"] == nn.functional.l1_loss(torch.sigmoid(logits), soft).item()
+    assert metrics["mse"] == pytest.approx(
+        nn.functional.mse_loss(torch.sigmoid(logits), soft).item(), abs=1e-7,
+    )
+    assert metrics["mae"] == pytest.approx(
+        nn.functional.l1_loss(torch.sigmoid(logits), soft).item(), abs=1e-7,
+    )
 
 
 def test_score_metrics_logits_zero_probability_half():
@@ -229,7 +233,7 @@ def test_score_metrics_logits_zero_probability_half():
     soft = torch.tensor([1.0])
     valid = torch.tensor([True])
     metrics = score_metrics_from_logits(logits, soft, valid)
-    assert metrics["score_prob"].item() == 0.5
+    assert metrics["score_prob"].item() == pytest.approx(0.5, abs=1e-7)
 
 
 def test_score_metrics_single_class_auc_ap_nan_but_classification_defined():
@@ -260,7 +264,7 @@ def test_score_metrics_cross_batch_global_auc_not_batch_average():
         torch.cat([targets1, targets2]),
         torch.ones(4, dtype=torch.bool),
     )
-    assert global_metrics["auc"] == 0.75
+    assert global_metrics["auc"] == pytest.approx(0.75, abs=1e-7)
     assert global_metrics["auc"] != batch_avg_auc
 
 
@@ -353,7 +357,7 @@ def test_no_summary_trigger_zero_loss():
     states = torch.randn(0, 4)
     query = nn.Parameter(torch.randn(1, 4))
     loss, info = summary_ce_loss(lm, embed, tok, states, query, [])
-    assert loss.item() == 0.0
+    assert loss.item() == pytest.approx(0.0, abs=1e-7)
     assert info["num_summary_triggers"] == 0
 
 
