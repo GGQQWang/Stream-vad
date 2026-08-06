@@ -329,7 +329,7 @@ def test_queries_optimizer_and_checkpoint_round_trip(tmp_path):
         "score_head": model.score_head.state_dict(),
     }, path)
     loaded = TinyStage1()
-    state = torch.load(path, map_location="cpu")
+    state = torch.load(path, map_location="cpu", weights_only=True)
     loaded.score_query.data.copy_(state["score_query"])
     loaded.summary_query.data.copy_(state["summary_query"])
     loaded.score_head.load_state_dict(state["score_head"])

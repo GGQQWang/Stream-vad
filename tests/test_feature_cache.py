@@ -266,7 +266,7 @@ def test_cached_mil_smoke_backward_and_checkpoint(tmp_path):
         "alpha_logit": alpha_logit.detach().clone(),
         "objective": "mil_rank",
     }, ckpt)
-    loaded = torch.load(ckpt, map_location="cpu")
+    loaded = torch.load(ckpt, map_location="cpu", weights_only=True)
     assert torch.isfinite(loss)
     assert scale.grad is not None
     assert alpha_logit.grad is not None

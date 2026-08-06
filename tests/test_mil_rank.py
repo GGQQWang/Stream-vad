@@ -158,7 +158,7 @@ def test_checkpoint_round_trip_components_and_mil_hparams():
             "lora": lora,
             **hparams,
         }, path)
-        loaded = torch.load(path, map_location="cpu")
+        loaded = torch.load(path, map_location="cpu", weights_only=True)
     for key, value in ssm.state_dict().items():
         assert torch.allclose(value, loaded["ssm"][key])
     for key, value in adapter.state_dict().items():

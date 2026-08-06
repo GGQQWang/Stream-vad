@@ -93,7 +93,7 @@ def load_feature_cache(
     path = feature_cache_path(cache_root, video_id)
     if not path.is_file():
         raise FileNotFoundError(f"feature cache not found for {video_id}: {path}")
-    cache = torch.load(path, map_location=map_location)
+    cache = torch.load(path, map_location=map_location, weights_only=True)
     if "compressed_features" not in cache or "metadata" not in cache:
         raise ValueError(f"invalid feature cache file: {path}")
     validate_feature_cache_metadata(
