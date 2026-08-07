@@ -1,4 +1,6 @@
 from pathlib import Path
+import csv
+import json
 
 import numpy as np
 import pytest
@@ -11,8 +13,11 @@ from stage1_streaming import (
     build_window_infos,
     collect_summary_triggers,
     detach_state_cache,
+    dump_window_score_records,
+    make_window_score_record,
     score_bce_loss,
     score_metrics_from_logits,
+    sorted_window_score_records,
     summary_ce_loss,
 )
 
@@ -282,6 +287,63 @@ def test_score_metrics_cross_batch_global_auc_not_batch_average():
     )
     assert global_metrics["auc"] == pytest.approx(0.75, abs=1e-7)
     assert global_metrics["auc"] != batch_avg_auc
+
+
+def test_window_score_dump_fields_sorting_and_fp_fn(tmp_path):
+    valid = torch.tensor([True, False, True, True])
+    video_ids = ["v"] * 4
+    window_indices = [0, 1, 2, 3]
+    start_frames = [0, 48, 96, 144]
+    valid_end_frames = [48, 96, 144, 192]
+    soft_targets = torch.tensor([0.0, -1.0, 1.0, 1.0])
+    logits = torch.logit(torch.tensor([0.8, 0.1, 0.2, 0.9]))
+    records = []
+    for i in valid.nonzero(as_tuple=True)[0].tolist():
+        records.append(make_window_score_record(
+            video_id=video_ids[i],
+            window_index=window_indices[i],
+            start_frame=start_frames[i],
+            valid_end_frame=valid_end_frames[i],
+            fps=30.0,
+            soft_target=float(soft_targets[i].item()),
+            score_logit=float(logits[i].item()),
+            binary_threshold=0.5,
+        ))
+
+    assert len(records) == 3
+    assert {record["window_index"] for record in records} == {0, 2, 3}
+    for key in [
+        "video_id",
+        "window_index",
+        "start_frame",
+        "valid_end_frame",
+        "start_sec",
+        "end_sec",
+        "soft_target",
+        "binary_target",
+        "score_logit",
+        "score_prob",
+    ]:
+        assert key in records[0]
+
+    sorted_records = sorted_window_score_records(records, binary_threshold=0.5)
+    assert [record["window_index"] for record in sorted_records] == [3, 0, 2]
+    assert [record["rank"] for record in sorted_records] == [1, 2, 3]
+    assert sorted_records[1]["is_false_positive"] is True
+    assert sorted_records[2]["is_false_negative"] is True
+
+    json_path, csv_path = dump_window_score_records(
+        records,
+        tmp_path / "window_scores.json",
+        binary_threshold=0.5,
+    )
+    dumped = json.loads(json_path.read_text())
+    assert len(dumped) == 3
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [int(row["window_index"]) for row in rows] == [3, 0, 2]
+    assert rows[1]["is_false_positive"] == "True"
+    assert rows[2]["is_false_negative"] == "True"
 
 
 def test_score_loss_empty_valid_mask_raises_clear_error():

@@ -55,8 +55,12 @@ from mil_utils import (
 )
 from stage1_streaming import (
     collect_summary_triggers,
+    dump_window_score_records,
+    format_window_score_row,
+    make_window_score_record,
     score_bce_loss,
     score_metrics_from_logits,
+    sorted_window_score_records,
     summary_ce_loss,
 )
 
@@ -1316,11 +1320,13 @@ def validate_score_token(
     score_token_id: int,
     sum_token_id: int | None = None,
     binary_threshold: float = 0.5,
+    dump_window_scores: str = "",
 ) -> dict:
     """One-pass score token evaluation."""
     model.eval()
     all_logits: List[torch.Tensor] = []
     all_soft_targets: List[torch.Tensor] = []
+    window_score_records: List[dict] = []
     ssm_cache: dict = {}
     embed_fn = _find_embed(model.qwen)
 
@@ -1376,6 +1382,26 @@ def validate_score_token(
             )
         all_logits.append(logits_flat.detach().float().cpu())
         all_soft_targets.append(labels[valid_b, valid_w].detach().float().cpu())
+        if dump_window_scores:
+            logits_cpu = logits_flat.detach().float().cpu()
+            labels_cpu = labels.detach().float().cpu()
+            valid_b_cpu = valid_b.detach().cpu()
+            valid_w_cpu = valid_w.detach().cpu()
+            start_frames = batch["window_start_frames"]
+            valid_end_frames = batch["valid_end_frames"]
+            for i, (b_t, w_t) in enumerate(zip(valid_b_cpu, valid_w_cpu)):
+                b = int(b_t.item())
+                w = int(w_t.item())
+                window_score_records.append(make_window_score_record(
+                    video_id=batch["video_id"][b],
+                    window_index=int(batch["chunk_start"][b]) + w,
+                    start_frame=int(start_frames[b, w].item()),
+                    valid_end_frame=int(valid_end_frames[b, w].item()),
+                    fps=float(batch["fps"][b]),
+                    soft_target=float(labels_cpu[b, w].item()),
+                    score_logit=float(logits_cpu[i].item()),
+                    binary_threshold=binary_threshold,
+                ))
 
     model.train()
 
@@ -1399,6 +1425,32 @@ def validate_score_token(
 
     if math.isnan(float(metrics["auc"])) or math.isnan(float(metrics["ap"])):
         print("WARNING: Validation contains only one binary class; AUC and AP are reported as NaN.")
+
+    if dump_window_scores:
+        json_path, csv_path = dump_window_score_records(
+            window_score_records,
+            dump_window_scores,
+            binary_threshold=binary_threshold,
+        )
+        print(f"Saved validation window scores: json={json_path} csv={csv_path}")
+        sorted_records = sorted_window_score_records(
+            window_score_records,
+            binary_threshold=binary_threshold,
+        )
+        print("top-10 highest scores")
+        for row in sorted_records[:10]:
+            print(format_window_score_row(int(row["rank"]), row))
+        false_positives = [row for row in sorted_records if row["is_false_positive"]]
+        print("top-10 false positives")
+        for row in false_positives[:10]:
+            print(format_window_score_row(int(row["rank"]), row))
+        low_positive = sorted(
+            (row for row in sorted_records if int(row["binary_target"]) == 1),
+            key=lambda r: float(r["score_prob"]),
+        )
+        print("top-10 lowest-scoring positive windows")
+        for row in low_positive[:10]:
+            print(format_window_score_row(int(row["rank"]), row))
 
     return metrics
 
@@ -1450,6 +1502,8 @@ def main():
     parser.add_argument("--lambda-sum", type=float, default=0.1,
                        help="weight for clip-boundary summary CE loss")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
+    parser.add_argument("--dump-window-scores", default="",
+                       help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
     parser.add_argument("--debug-state", action="store_true",
                        help="print SSM state reuse/detach/clear events for streaming checks")
     parser.add_argument("--seed", type=int, default=42)
@@ -2019,6 +2073,7 @@ def main():
                 model, val_loader, processor, tokenizer, device,
                 args.status_prompt, score_token_id, sum_token_id,
                 binary_threshold=args.binary_threshold,
+                dump_window_scores=args.dump_window_scores,
             )
             print(
                 f"  val: loss_score={metrics.get('loss_score', math.nan):.4f} "

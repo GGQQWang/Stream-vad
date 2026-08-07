@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Sequence
 
 import torch
@@ -205,6 +208,94 @@ def score_metrics_from_logits(
         "recall": float(recall),
         "f1": float(f1),
     }
+
+
+def make_window_score_record(
+    *,
+    video_id: str,
+    window_index: int,
+    start_frame: int,
+    valid_end_frame: int,
+    fps: float,
+    soft_target: float,
+    score_logit: float,
+    binary_threshold: float = 0.5,
+) -> dict:
+    score_prob = float(torch.sigmoid(torch.tensor(float(score_logit))).item())
+    binary_target = int(float(soft_target) >= float(binary_threshold))
+    return {
+        "video_id": str(video_id),
+        "window_index": int(window_index),
+        "start_frame": int(start_frame),
+        "valid_end_frame": int(valid_end_frame),
+        "start_sec": float(start_frame) / float(fps),
+        "end_sec": float(valid_end_frame) / float(fps),
+        "soft_target": float(soft_target),
+        "binary_target": binary_target,
+        "score_logit": float(score_logit),
+        "score_prob": score_prob,
+    }
+
+
+def sorted_window_score_records(records: Sequence[dict], binary_threshold: float = 0.5) -> List[dict]:
+    sorted_records = sorted(records, key=lambda r: float(r["score_prob"]), reverse=True)
+    out: List[dict] = []
+    for rank, record in enumerate(sorted_records, start=1):
+        row = dict(record)
+        binary_target = int(row["binary_target"])
+        score_prob = float(row["score_prob"])
+        row["rank"] = rank
+        row["is_false_positive"] = bool(binary_target == 0 and score_prob >= binary_threshold)
+        row["is_false_negative"] = bool(binary_target == 1 and score_prob < binary_threshold)
+        out.append(row)
+    return out
+
+
+def dump_window_score_records(
+    records: Sequence[dict],
+    output_path: str | Path,
+    binary_threshold: float = 0.5,
+) -> tuple[Path, Path]:
+    json_path = Path(output_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_records = sorted_window_score_records(records, binary_threshold=binary_threshold)
+    csv_path = json_path.with_name(f"{json_path.stem}_sorted.csv")
+
+    with open(json_path, "w") as f:
+        json.dump(list(records), f, indent=2)
+
+    fieldnames = [
+        "rank",
+        "video_id",
+        "window_index",
+        "start_frame",
+        "valid_end_frame",
+        "start_sec",
+        "end_sec",
+        "soft_target",
+        "binary_target",
+        "score_logit",
+        "score_prob",
+        "is_false_positive",
+        "is_false_negative",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in sorted_records:
+            writer.writerow({key: row[key] for key in fieldnames})
+    return json_path, csv_path
+
+
+def format_window_score_row(rank: int, record: dict) -> str:
+    return (
+        f"{rank:4d} {record['video_id']} "
+        f"w={int(record['window_index'])} "
+        f"{float(record['start_sec']):.3f}-{float(record['end_sec']):.3f}s "
+        f"soft={float(record['soft_target']):.3f} "
+        f"bin={int(record['binary_target'])} "
+        f"prob={float(record['score_prob']):.6f}"
+    )
 
 
 def collect_summary_triggers(batch: dict, valid_mask: torch.Tensor) -> tuple[List[tuple[int, int, dict]], int]:
