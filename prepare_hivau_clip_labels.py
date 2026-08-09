@@ -1,10 +1,11 @@
 """Deprecated helper for explicit clip-level anomaly labels.
 
-Current Stage 1 training does not require clip-level anomaly labels.  SCORE
-supervision is built from ``events`` plus ``events_summary_split[].judgement``;
-HIVAU ``clips`` and ``clips_caption`` are used only for SUMMARY supervision.
-This script is kept for historical/manual-label experiments and is not called
-by the Stage 1 data pipeline.
+Current Stage 1 training does not require clip-level anomaly labels and does
+not use event judgement text for SCORE labels.  SCORE supervision is built
+from UCF abnormal video membership plus that video's ``events``.  HIVAU
+``clips`` and ``clips_caption`` are used only for SUMMARY supervision.  This
+script is kept for historical/manual-label experiments and is not called by
+the Stage 1 data pipeline.
 """
 
 import argparse

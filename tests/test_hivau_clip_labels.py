@@ -7,6 +7,7 @@ from hivau_dataset import HIVAUDataset, parse_event_judgement, seconds_to_frame_
 
 
 def _write_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data))
 
 
@@ -15,18 +16,30 @@ def _touch_video(root, video_id):
     (root / f"{video_id}.mp4").write_bytes(b"")
 
 
-def _make_dataset(tmp_path, raw, *, total_sampled_frames=4, sample_interval=5, max_windows=4):
+def _make_dataset(
+    tmp_path,
+    raw,
+    *,
+    abnormal_ids=(),
+    total_sampled_frames=4,
+    sample_interval=5,
+    max_windows=4,
+):
     ann = tmp_path / "ann.json"
     videos = tmp_path / "videos"
+    anomaly_root = tmp_path / "Anomaly-Videos-ALL"
     _write_json(ann, raw)
     for video_id in raw:
         _touch_video(videos, video_id)
+    for video_id in abnormal_ids:
+        _touch_video(anomaly_root / "Class", video_id)
     return HIVAUDataset(
         ann,
         videos,
         total_sampled_frames=total_sampled_frames,
         sample_interval=sample_interval,
         max_windows=max_windows,
+        anomaly_video_root=anomaly_root if abnormal_ids else None,
     )
 
 
@@ -38,17 +51,17 @@ def test_normal_video_events_do_not_create_score_labels(tmp_path):
             "label": [],
             "events": [[1.0, 4.0]],
             "events_summary_split": [
-                {"judgement": "There is no anomaly in the video."},
+                {"judgement": "The anomaly exists, but this text must not affect SCORE."},
             ],
             "clips": [[[1.0, 2.0], [2.0, 3.0]]],
             "clips_caption": [["person walks", "person stands"]],
         }
     }
-    ds = _make_dataset(tmp_path, raw)
+    ds = _make_dataset(tmp_path, raw, abnormal_ids=())
     assert all(v == pytest.approx(0.0, abs=1e-7) for v in ds.samples[0]["clip_soft"])
 
 
-def test_abnormal_video_uses_only_abnormal_event_for_score(tmp_path):
+def test_abnormal_video_uses_all_events_for_score(tmp_path):
     raw = {
         "Abuse001_x264": {
             "n_frames": 80,
@@ -56,15 +69,34 @@ def test_abnormal_video_uses_only_abnormal_event_for_score(tmp_path):
             "label": ["Abuse"],
             "events": [[1.0, 3.0], [5.0, 7.0]],
             "events_summary_split": [
-                {"judgement": "An anomaly exists, specifically, Physical Abuse."},
                 {"judgement": "No anomaly exists in this video."},
+                {"judgement": "This text is intentionally unparseable."},
             ],
             "clips": [[[1.0, 2.0]], [[5.0, 6.0]]],
             "clips_caption": [["abnormal action"], ["normal later action"]],
         }
     }
-    ds = _make_dataset(tmp_path, raw)
-    assert ds.samples[0]["clip_soft"] == pytest.approx([0.5, 0.5, 0.0, 0.0], abs=1e-7)
+    ds = _make_dataset(tmp_path, raw, abnormal_ids=("Abuse001_x264",))
+    assert ds.samples[0]["clip_soft"] == pytest.approx([0.5, 0.5, 0.5, 0.5], abs=1e-7)
+
+
+def test_training_video_not_in_anomaly_root_is_normal_even_if_annotation_label_abuse(tmp_path):
+    raw = {
+        "Abuse001_x264": {
+            "n_frames": 40,
+            "fps": 10.0,
+            "label": ["Abuse"],
+            "events": [[1.0, 3.0]],
+            "events_summary_split": [
+                {"judgement": "An anomaly exists."},
+            ],
+            "clips": [[]],
+            "clips_caption": [[]],
+        }
+    }
+    ds = _make_dataset(tmp_path, raw, abnormal_ids=("OtherAbuseVideo",))
+    assert ds.samples[0]["video_label"] == 0
+    assert ds.samples[0]["clip_soft"] == pytest.approx([0.0, 0.0], abs=1e-7)
 
 
 def test_partial_window_overlap_uses_sampled_frames(tmp_path):
@@ -81,7 +113,14 @@ def test_partial_window_overlap_uses_sampled_frames(tmp_path):
             "clips_caption": [[]],
         }
     }
-    ds = _make_dataset(tmp_path, raw, total_sampled_frames=4, sample_interval=3, max_windows=2)
+    ds = _make_dataset(
+        tmp_path,
+        raw,
+        abnormal_ids=("Abuse001_x264",),
+        total_sampled_frames=4,
+        sample_interval=3,
+        max_windows=2,
+    )
     assert ds.samples[0]["clip_soft"][0] == pytest.approx(0.5, abs=1e-7)
 
 
@@ -100,11 +139,18 @@ def test_overlapping_abnormal_events_use_union_not_duplicate_counting(tmp_path):
             "clips_caption": [[], []],
         }
     }
-    ds = _make_dataset(tmp_path, raw, total_sampled_frames=6, sample_interval=10, max_windows=2)
+    ds = _make_dataset(
+        tmp_path,
+        raw,
+        abnormal_ids=("Abuse001_x264",),
+        total_sampled_frames=6,
+        sample_interval=10,
+        max_windows=2,
+    )
     assert ds.samples[0]["clip_soft"][0] == pytest.approx(5 / 6, abs=1e-7)
 
 
-def test_normal_video_with_anomaly_judgement_is_conflict(tmp_path):
+def test_judgement_text_does_not_affect_score_or_raise(tmp_path):
     raw = {
         "Normal_Videos001_x264": {
             "n_frames": 60,
@@ -118,11 +164,11 @@ def test_normal_video_with_anomaly_judgement_is_conflict(tmp_path):
             "clips_caption": [[]],
         }
     }
-    with pytest.raises(ValueError, match="video label says normal, but event judgement says anomaly"):
-        _make_dataset(tmp_path, raw)
+    ds = _make_dataset(tmp_path, raw)
+    assert all(v == pytest.approx(0.0, abs=1e-7) for v in ds.samples[0]["clip_soft"])
 
 
-def test_unparseable_judgement_raises_with_video_and_event_idx(tmp_path):
+def test_unparseable_judgement_does_not_affect_abnormal_score_labels(tmp_path):
     raw = {
         "Abuse001_x264": {
             "n_frames": 60,
@@ -136,8 +182,8 @@ def test_unparseable_judgement_raises_with_video_and_event_idx(tmp_path):
             "clips_caption": [[]],
         }
     }
-    with pytest.raises(ValueError, match="video=Abuse001_x264, event_idx=0"):
-        _make_dataset(tmp_path, raw)
+    ds = _make_dataset(tmp_path, raw, abnormal_ids=("Abuse001_x264",))
+    assert ds.samples[0]["clip_soft"] == pytest.approx([0.5, 1.0, 0.0], abs=1e-7)
 
 
 def test_judgement_negation_has_priority():
@@ -157,6 +203,70 @@ def test_seconds_to_frame_interval_uses_floor_and_ceil():
     assert interval == (math.floor(3.933 * 30), math.ceil(15.867 * 30))
 
 
+def test_event_conversion_uses_each_video_fps(tmp_path):
+    raw = {
+        "Abuse10fps": {
+            "n_frames": 40,
+            "fps": 10.0,
+            "label": ["Abuse"],
+            "events": [[1.0, 2.0]],
+            "events_summary_split": [
+                {"judgement": "An anomaly exists."},
+            ],
+            "clips": [[]],
+            "clips_caption": [[]],
+        },
+        "Abuse20fps": {
+            "n_frames": 80,
+            "fps": 20.0,
+            "label": ["Abuse"],
+            "events": [[1.0, 2.0]],
+            "events_summary_split": [
+                {"judgement": "An anomaly exists."},
+            ],
+            "clips": [[]],
+            "clips_caption": [[]],
+        },
+    }
+    ds = _make_dataset(
+        tmp_path,
+        raw,
+        abnormal_ids=("Abuse10fps", "Abuse20fps"),
+        total_sampled_frames=4,
+        sample_interval=5,
+        max_windows=4,
+    )
+    by_video = {sample["video_id"]: sample["clip_soft"] for sample in ds.samples}
+    assert by_video["Abuse10fps"] == pytest.approx([0.5, 0.5], abs=1e-7)
+    assert by_video["Abuse20fps"] == pytest.approx([0.0, 1.0, 1.0, 0.0], abs=1e-7)
+
+
+def test_half_open_event_boundary_on_sampled_frames(tmp_path):
+    raw = {
+        "Abuse001_x264": {
+            "n_frames": 20,
+            "fps": 1.0,
+            "label": ["Abuse"],
+            "events": [[3.0, 9.0]],
+            "events_summary_split": [
+                {"judgement": "An anomaly exists."},
+            ],
+            "clips": [[]],
+            "clips_caption": [[]],
+        }
+    }
+    ds = _make_dataset(
+        tmp_path,
+        raw,
+        abnormal_ids=("Abuse001_x264",),
+        total_sampled_frames=4,
+        sample_interval=3,
+        max_windows=2,
+    )
+    # sampled frames in window 0 are 0, 3, 6, 9; half-open [3, 9) includes 3 and 6 only.
+    assert ds.samples[0]["clip_soft"][0] == pytest.approx(0.5, abs=1e-7)
+
+
 def test_tail_short_window_uses_valid_sampled_frame_denominator(tmp_path):
     raw = {
         "Abuse001_x264": {
@@ -171,8 +281,65 @@ def test_tail_short_window_uses_valid_sampled_frame_denominator(tmp_path):
             "clips_caption": [[]],
         }
     }
-    ds = _make_dataset(tmp_path, raw, total_sampled_frames=4, sample_interval=3, max_windows=2)
+    ds = _make_dataset(
+        tmp_path,
+        raw,
+        abnormal_ids=("Abuse001_x264",),
+        total_sampled_frames=4,
+        sample_interval=3,
+        max_windows=2,
+    )
     assert ds.samples[0]["clip_soft"] == pytest.approx([0.0, 1.0], abs=1e-7)
+
+
+def test_event_exceeding_video_end_is_clipped_with_warning(tmp_path):
+    raw = {
+        "Abuse001_x264": {
+            "n_frames": 14,
+            "fps": 10.0,
+            "label": ["Abuse"],
+            "events": [[1.2, 2.0]],
+            "events_summary_split": [
+                {"judgement": "An anomaly exists."},
+            ],
+            "clips": [[]],
+            "clips_caption": [[]],
+        }
+    }
+    with pytest.warns(RuntimeWarning, match="event time exceeds video bounds"):
+        ds = _make_dataset(
+            tmp_path,
+            raw,
+            abnormal_ids=("Abuse001_x264",),
+            total_sampled_frames=4,
+            sample_interval=3,
+            max_windows=2,
+        )
+    assert ds.samples[0]["clip_soft"] == pytest.approx([0.0, 1.0], abs=1e-7)
+
+
+def test_invalid_event_times_raise_clear_errors(tmp_path):
+    bad_events = [
+        [-0.1, 1.0],
+        [1.0, 1.0],
+        [float("nan"), 2.0],
+    ]
+    for idx, event in enumerate(bad_events):
+        raw = {
+            f"AbuseBad{idx}": {
+                "n_frames": 40,
+                "fps": 10.0,
+                "label": ["Abuse"],
+                "events": [event],
+                "events_summary_split": [
+                    {"judgement": "An anomaly exists."},
+                ],
+                "clips": [[]],
+                "clips_caption": [[]],
+            }
+        }
+        with pytest.raises(ValueError, match="Invalid time interval values"):
+            _make_dataset(tmp_path / str(idx), raw, abnormal_ids=(f"AbuseBad{idx}",))
 
 
 def test_summary_triggers_are_independent_of_event_score_label(tmp_path):

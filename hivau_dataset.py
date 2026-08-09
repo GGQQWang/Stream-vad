@@ -47,6 +47,25 @@ def _label_value_is_abnormal(label) -> bool:
         return True
 
 
+def collect_abnormal_video_ids(anomaly_video_root: str | Path | None) -> set[str]:
+    """Collect abnormal video ids from an Anomaly-Videos-ALL tree.
+
+    The original UCF split defines abnormality by membership in the anomaly
+    video collection.  File stems are used as video ids, e.g. ``Abuse001_x264``
+    for ``Abuse001_x264.mp4``.
+    """
+    if not anomaly_video_root:
+        return set()
+    root = Path(anomaly_video_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Anomaly video root does not exist: {root}")
+    ids: set[str] = set()
+    for path in root.rglob("*"):
+        if path.is_file():
+            ids.add(path.stem)
+    return ids
+
+
 def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | None = None) -> int:
     """Parse HIVAU event judgement into 0=normal or 1=anomaly.
 
@@ -107,7 +126,7 @@ def _validate_time_interval(
         end = float(interval[1])
     except (TypeError, ValueError):
         raise ValueError(f"Invalid time interval values: {loc}, interval={interval!r}")
-    if not (math.isfinite(start) and math.isfinite(end)) or not (start < end):
+    if not (math.isfinite(start) and math.isfinite(end)) or start < 0 or not (start < end):
         raise ValueError(f"Invalid time interval values: {loc}, interval={interval!r}")
     return start, end
 
@@ -143,22 +162,16 @@ def seconds_to_frame_interval(
     return clipped_start, clipped_end
 
 
-def _extract_anomaly_event_intervals(
+def _extract_event_intervals_for_score(
     meta: dict,
     video_id: str,
     fps: float,
     n_frames: int,
+    is_abnormal_video: bool,
     debug_events: bool = False,
 ) -> tuple[List[List[float]], int, int]:
     events = meta.get("events", []) or []
-    summaries = meta.get("events_summary_split", []) or []
-    if len(events) != len(summaries):
-        raise ValueError(
-            f"events/events_summary_split count mismatch: video={video_id}, "
-            f"events={len(events)}, events_summary_split={len(summaries)}"
-        )
 
-    video_label = _read_video_label(meta)
     intervals: List[List[float]] = []
     abnormal_events = 0
     normal_events = 0
@@ -169,8 +182,6 @@ def _extract_anomaly_event_intervals(
             field="events",
             event_idx=event_idx,
         )
-        judgement = summaries[event_idx].get("judgement") if isinstance(summaries[event_idx], dict) else None
-        event_label = parse_event_judgement(judgement, video_id=video_id, event_idx=event_idx)
         frame_interval = seconds_to_frame_interval(
             start_sec,
             end_sec,
@@ -184,15 +195,10 @@ def _extract_anomaly_event_intervals(
             print(
                 f"HIVAU event: video={video_id}, event_idx={event_idx}, "
                 f"seconds=({start_sec}, {end_sec}), frames={frame_interval}, "
-                f"event_label={event_label}, judgement={judgement!r}"
+                f"video_label={int(is_abnormal_video)}"
             )
-        if event_label == 1:
+        if is_abnormal_video:
             abnormal_events += 1
-            if video_label == 0:
-                raise ValueError(
-                    f"video label says normal, but event judgement says anomaly: "
-                    f"video={video_id}, event_idx={event_idx}, judgement={judgement!r}"
-                )
             intervals.append([start_sec, end_sec])
         else:
             normal_events += 1
@@ -358,6 +364,7 @@ class HIVAUDataset(Dataset):
         min_pixels: int = 200704,
         max_pixels: int = 200704,
         debug_events: bool = False,
+        anomaly_video_root: str | Path | None = None,
     ):
         super().__init__()
         self.video_root = Path(video_root)
@@ -370,6 +377,8 @@ class HIVAUDataset(Dataset):
         self.feature_cache_model_id = feature_cache_model_id
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        self.use_abnormal_video_ids = anomaly_video_root is not None and str(anomaly_video_root) != ""
+        self.abnormal_video_ids = collect_abnormal_video_ids(anomaly_video_root)
 
         # ---- load annotations ----
         with open(annotation_path, "r") as f:
@@ -395,17 +404,21 @@ class HIVAUDataset(Dataset):
             if self.feature_cache_root is None and not video_path.exists():
                 continue
 
-            video_label = _read_video_label(meta)
+            if self.use_abnormal_video_ids:
+                video_label = 1 if video_name in self.abnormal_video_ids else 0
+            else:
+                video_label = _read_video_label(meta)
             if video_label == 0:
                 normal_video_count += 1
             else:
                 abnormal_video_count += 1
             video_count += 1
-            anomaly_event_intervals, n_abnormal_events, n_normal_events = _extract_anomaly_event_intervals(
+            anomaly_event_intervals, n_abnormal_events, n_normal_events = _extract_event_intervals_for_score(
                 meta,
                 video_name,
                 video_fps,
                 n,
+                is_abnormal_video=(video_label == 1),
                 debug_events=debug_events,
             )
             abnormal_event_count += n_abnormal_events

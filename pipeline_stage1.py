@@ -1466,6 +1466,8 @@ def main():
     parser.add_argument("--val-json", default="")
     parser.add_argument("--video-root", required=True)
     parser.add_argument("--val-video-root", default="")
+    parser.add_argument("--anomaly-video-root", default="",
+                       help="optional Anomaly-Videos-ALL root; file stems define abnormal video ids for SCORE labels")
     parser.add_argument("--feature-cache-root", default="",
                        help="optional frozen ViT feature cache root; skips video decoding, processor, and ViT")
     parser.add_argument("--log-dir", default="./logs/stage1")
@@ -1586,6 +1588,7 @@ def main():
         feature_cache_model_id=args.model_path,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
+        anomaly_video_root=args.anomaly_video_root or None,
     )
     from hivau_dataset import hivau_collate
     from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
@@ -1618,6 +1621,7 @@ def main():
             feature_cache_model_id=args.model_path,
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
+            anomaly_video_root=args.anomaly_video_root or None,
         )
         if args.objective in ("answer_ce", "score_token"):
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
