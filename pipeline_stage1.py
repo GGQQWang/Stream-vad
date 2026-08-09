@@ -1769,7 +1769,11 @@ def main():
                 score_logits_flat = model.forward_score_token(
                     all_state, embed_fn, tokenizer, args.status_prompt,
                 )
-                score_logits = state_emb.new_full((B, max_w), 0.0)
+                score_logits = torch.zeros(
+                    (B, max_w),
+                    device=score_logits_flat.device,
+                    dtype=score_logits_flat.dtype,
+                )
                 score_logits[valid_b, valid_w] = score_logits_flat
 
                 group_start = (step // args.grad_accum) * args.grad_accum

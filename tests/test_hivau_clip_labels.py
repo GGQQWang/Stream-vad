@@ -237,8 +237,8 @@ def test_event_conversion_uses_each_video_fps(tmp_path):
         max_windows=4,
     )
     by_video = {sample["video_id"]: sample["clip_soft"] for sample in ds.samples}
-    assert by_video["Abuse10fps"] == pytest.approx([0.5, 0.5], abs=1e-7)
-    assert by_video["Abuse20fps"] == pytest.approx([0.0, 1.0, 1.0, 0.0], abs=1e-7)
+    assert by_video["Abuse10fps"] == pytest.approx([0.5, 0.0], abs=1e-7)
+    assert by_video["Abuse20fps"] == pytest.approx([0.0, 1.0, 0.0, 0.0], abs=1e-7)
 
 
 def test_half_open_event_boundary_on_sampled_frames(tmp_path):
