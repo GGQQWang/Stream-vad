@@ -107,7 +107,7 @@ def _check_stage1_config(state: dict, model_path: str) -> None:
         raise ValueError(f"Stage-1 inference requires objective='score_token', got {objective!r}")
 
 
-def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object, torch.dtype]:
+def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object, torch.dtype, str]:
     stage1_dir = Path(args.stage1_dir)
     state_path = stage1_dir / "train_state.pt"
     lora_dir = stage1_dir / "lora_adapter"
@@ -124,6 +124,7 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     qwen = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
+        attn_implementation="flash_attention_2",
         device_map=None,
         low_cpu_mem_usage=True,
     ).to(args.device)
@@ -154,7 +155,8 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         print("WARNING: alpha_logit missing from checkpoint; using model default.")
     model.debug_state = False
     model.eval()
-    return model, processor, tokenizer, dtype
+    prompt_text = str(state.get("prompt", "Current video status:"))
+    return model, processor, tokenizer, dtype, prompt_text
 
 
 def _auc_ap(scores: np.ndarray, gt: np.ndarray) -> tuple[float | None, float | None]:
@@ -162,20 +164,9 @@ def _auc_ap(scores: np.ndarray, gt: np.ndarray) -> tuple[float | None, float | N
         return None, None
     try:
         from sklearn.metrics import average_precision_score, roc_auc_score
-        return float(roc_auc_score(gt, scores)), float(average_precision_score(gt, scores))
     except ImportError:
-        order = np.argsort(scores)
-        ranks = np.empty_like(order, dtype=np.float64)
-        ranks[order] = np.arange(1, len(scores) + 1)
-        pos = gt == 1
-        n_pos = int(pos.sum())
-        n_neg = int((gt == 0).sum())
-        auc = float((ranks[pos].sum() - n_pos * (n_pos + 1) / 2) / max(n_pos * n_neg, 1))
-        desc = np.argsort(-scores)
-        y = gt[desc].astype(np.float64)
-        precision = np.cumsum(y) / np.arange(1, len(y) + 1)
-        ap = float((precision * y).sum() / max(y.sum(), 1.0))
-        return auc, ap
+        raise ImportError("scikit-learn is required for UCF evaluation")
+    return float(roc_auc_score(gt, scores)), float(average_precision_score(gt, scores))
 
 
 def load_gt(gt_root: str | Path, video_id: str, n_frames: int) -> np.ndarray:
@@ -216,6 +207,7 @@ def infer_video(
     refs,
     device: torch.device,
     dtype: torch.dtype,
+    prompt_text: str,
     output_dir: Path,
     gt_root: str | Path,
     debug_state: bool,
@@ -276,7 +268,7 @@ def infer_video(
                     states,
                     embed_fn,
                     tokenizer,
-                    prompt_text="Current video status:",
+                    prompt_text=prompt_text,
                 )
             probs = torch.sigmoid(logits).detach().float().cpu()
             logits_cpu = logits.detach().float().cpu()
@@ -304,6 +296,19 @@ def infer_video(
         print(f"SSM_STATE_CLEAR video={video_id}")
 
     rows.sort(key=lambda r: int(r["window_index"]))
+    if not rows:
+        raise ValueError(f"{video_id}: no valid windows were produced")
+    if int(rows[0]["start_frame"]) != 0:
+        raise ValueError(f"{video_id}: first window starts at {rows[0]['start_frame']}, expected 0")
+    for prev, cur in zip(rows[:-1], rows[1:]):
+        if int(prev["end_frame"]) != int(cur["start_frame"]):
+            raise ValueError(
+                f"{video_id}: non-contiguous windows between "
+                f"window {prev['window_index']} [{prev['start_frame']}, {prev['end_frame']}) "
+                f"and window {cur['window_index']} [{cur['start_frame']}, {cur['end_frame']})"
+            )
+    if int(rows[-1]["end_frame"]) != n_frames:
+        raise ValueError(f"{video_id}: last window ends at {rows[-1]['end_frame']}, expected n_frames={n_frames}")
     save_window_csv(output_dir / f"{video_id}_window_scores.csv", rows)
 
     standard_scores = np.zeros(n_frames, dtype=np.float32)
@@ -384,7 +389,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     normalized_manifest = normalize_manifest(args.test_manifest, output_dir, args.video_id)
-    model, processor, tokenizer, dtype = load_stage1_model(args)
+    model, processor, tokenizer, dtype, prompt_text = load_stage1_model(args)
 
     dataset = HIVAUDataset(
         normalized_manifest,
@@ -418,6 +423,7 @@ def main() -> None:
             refs=refs,
             device=args.device,
             dtype=dtype,
+            prompt_text=prompt_text,
             output_dir=output_dir,
             gt_root=args.gt_root,
             debug_state=args.debug_state,
