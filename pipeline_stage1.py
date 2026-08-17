@@ -1511,6 +1511,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--resume", default="",
+                       help="path to a saved checkpoint dir (contains train_state.pt and lora_adapter/); "
+                            "training continues from the next epoch with restored optimizer/scheduler")
     args = parser.parse_args()
     if args.save_every < 1:
         raise ValueError("--save-every must be >= 1")
@@ -1644,6 +1647,83 @@ def main():
 
     embed_fn = _find_embed(model.qwen)
 
+    # ---- resume ----
+    start_epoch = 0
+    global_step = 0
+    best_metric = 0.0
+    if args.resume:
+        resume_path = Path(args.resume)
+        if resume_path.is_dir():
+            state_path = resume_path / "train_state.pt"
+            lora_dir = resume_path / "lora_adapter"
+        else:
+            state_path = resume_path
+            lora_dir = resume_path.parent / "lora_adapter"
+        if not state_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint not found: {state_path}")
+        if not lora_dir.is_dir():
+            raise FileNotFoundError(f"resume LoRA adapter not found: {lora_dir}")
+
+        ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
+
+        # config consistency: silently resuming with different data/model
+        # config produces garbage — fail loudly instead
+        for key in ("frames_per_clip", "sample_interval", "max_windows",
+                    "d_ssm", "min_pixels", "max_pixels"):
+            if key in ckpt and int(ckpt[key]) != int(getattr(args, key)):
+                raise ValueError(
+                    f"resume config mismatch: {key}={ckpt[key]!r}, "
+                    f"expected {getattr(args, key)!r}"
+                )
+        if "objective" in ckpt and ckpt["objective"] != args.objective:
+            raise ValueError(
+                f"resume objective mismatch: checkpoint={ckpt['objective']!r}, "
+                f"requested {args.objective!r}"
+            )
+        if "feature_cache_model_id" in ckpt and str(ckpt["feature_cache_model_id"]) != str(args.model_path):
+            raise ValueError(
+                f"resume model mismatch: checkpoint feature_cache_model_id="
+                f"{ckpt['feature_cache_model_id']!r}, expected {args.model_path!r}"
+            )
+
+        # model components
+        model.ssm.load_state_dict(ckpt["ssm"])
+        model.adapter.load_state_dict(ckpt["adapter"])
+        if "score_head" in ckpt:
+            model.score_head.load_state_dict(ckpt["score_head"])
+        for attr in ("score_query", "summary_query"):
+            if attr in ckpt:
+                param = getattr(model, attr)
+                param.data.copy_(ckpt[attr].to(param.device, param.dtype))
+        if "alpha_logit" in ckpt:
+            model.alpha_logit.data.copy_(
+                ckpt["alpha_logit"].to(model.alpha_logit.device, model.alpha_logit.dtype)
+            )
+
+        # LoRA adapter (must stay trainable, otherwise training is a no-op)
+        qwen.load_adapter(str(lora_dir), adapter_name="default", is_trainable=True)
+
+        # optimizer / scheduler state
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        if start_epoch >= args.epochs:
+            raise ValueError(
+                f"resume checkpoint is at epoch {ckpt.get('epoch')} but "
+                f"--epochs={args.epochs}; pass --epochs greater than the "
+                "resumed epoch (total epochs of the whole run)"
+            )
+        global_step = int(ckpt.get("global_step", 0))
+        best_metric = float(ckpt.get("best_metric", 0.0))
+        print(
+            f"Resumed from epoch {start_epoch - 1}: global_step={global_step}, "
+            f"best_metric={best_metric:.4f}, "
+            f"training epochs {start_epoch}..{args.epochs - 1}"
+        )
+
     def save_stage1_checkpoint(ckpt_dir: Path, epoch: int) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         model.qwen.save_pretrained(str(ckpt_dir / "lora_adapter"))
@@ -1658,6 +1738,7 @@ def main():
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
+            "best_metric": best_metric,
             "objective": args.objective,
             "prompt": args.status_prompt,
             "normal_answer": args.normal_answer,
@@ -1690,10 +1771,8 @@ def main():
     # ---- loop ----
     model.train()
     qwen.train()
-    global_step = 0
-    best_metric = 0.0
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         train_losses: List[float] = []
         train_normal_losses: List[float] = []
         train_abnormal_losses: List[float] = []
