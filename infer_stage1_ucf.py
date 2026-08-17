@@ -7,6 +7,7 @@ import csv
 import json
 import math
 import os
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -198,6 +199,16 @@ def save_window_csv(path: Path, rows: List[dict]) -> None:
             writer.writerow(row)
 
 
+def _synchronize(device: torch.device) -> None:
+    """Block until all pending work on ``device`` finishes.
+
+    CUDA launches are asynchronous, so wall-clock timing without a sync only
+    measures launch overhead, not actual execution.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def infer_video(
     *,
     model: StreamingVADGenerationModel,
@@ -221,9 +232,20 @@ def infer_video(
     ssm_cache: dict = {}
     rows: List[dict] = []
 
+    # timing accumulators (wall-clock; processing excludes data loading)
+    data_loading_sec = 0.0
+    processing_sec = 0.0
+    steady_processing_sec = 0.0   # excludes first chunk (CUDA warmup)
+    first_chunk_scored = 0
+
     with torch.no_grad():
         for chunk_i, ref in enumerate(refs):
+            # data loading (frame decode / feature-cache read) is timed
+            # separately from model processing
+            t0 = time.perf_counter()
             batch = hivau_collate([dataset[ref.index]])
+            data_loading_sec += time.perf_counter() - t0
+
             valid_mask_cpu = batch["valid_mask"]
             valid_mask = valid_mask_cpu.to(device)
             if debug_state:
@@ -231,6 +253,8 @@ def infer_video(
                     f"SSM_STATE video={video_id} chunk={chunk_i} "
                     f"reuse_prev={video_id in ssm_cache}"
                 )
+
+            t1 = time.perf_counter()
 
             if "features" in batch:
                 window_batch = batch["features"].to(device=device, dtype=dtype)
@@ -262,6 +286,8 @@ def infer_video(
             valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
             if len(valid_b) == 0:
                 continue
+            if chunk_i == 0:
+                first_chunk_scored = len(valid_b)
             states = state_emb[valid_b, valid_w]
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                 logits = model.forward_score_token(
@@ -272,6 +298,11 @@ def infer_video(
                 )
             probs = torch.sigmoid(logits).detach().float().cpu()
             logits_cpu = logits.detach().float().cpu()
+            _synchronize(device)
+            elapsed = time.perf_counter() - t1
+            processing_sec += elapsed
+            if chunk_i > 0:
+                steady_processing_sec += elapsed
             start_frames = batch["window_start_frames"]
             valid_end_frames = batch["valid_end_frames"]
             for i, (b_t, w_t) in enumerate(zip(valid_b.cpu(), valid_w.cpu())):
@@ -344,6 +375,12 @@ def infer_video(
                     f"score_prob={row['score_prob']:.6f}"
                 )
 
+    video_duration_sec = n_frames / fps
+    rtf_processing = processing_sec / video_duration_sec if video_duration_sec > 0 else math.inf
+    rtf_full = (data_loading_sec + processing_sec) / video_duration_sec if video_duration_sec > 0 else math.inf
+    avg_window_ms = 1000.0 * processing_sec / max(len(rows), 1)
+    steady_window_ms = 1000.0 * steady_processing_sec / max(len(rows) - first_chunk_scored, 1)
+
     print(
         f"video_id={video_id} n_frames={n_frames} fps={fps} num_windows={len(rows)} "
         f"score_min={float(score_values.min()) if len(score_values) else math.nan:.6f} "
@@ -353,7 +390,10 @@ def infer_video(
         f"standard_auc={standard_auc if standard_auc is not None else 'N/A'} "
         f"standard_ap={standard_ap if standard_ap is not None else 'N/A'} "
         f"causal_auc={causal_auc if causal_auc is not None else 'N/A'} "
-        f"causal_ap={causal_ap if causal_ap is not None else 'N/A'}"
+        f"causal_ap={causal_ap if causal_ap is not None else 'N/A'} "
+        f"proc_sec={processing_sec:.2f} rtf_proc={rtf_processing:.3f} "
+        f"rtf_full={rtf_full:.3f} avg_win_ms={avg_window_ms:.1f} "
+        f"steady_win_ms={steady_window_ms:.1f}"
     )
     return {
         "video_id": video_id,
@@ -364,6 +404,12 @@ def infer_video(
         "standard_ap": standard_ap,
         "causal_auc": causal_auc,
         "causal_ap": causal_ap,
+        "processing_sec": processing_sec,
+        "data_loading_sec": data_loading_sec,
+        "rtf_processing": rtf_processing,
+        "rtf_full": rtf_full,
+        "avg_window_ms": avg_window_ms,
+        "steady_window_ms": steady_window_ms,
         "gt": gt,
         "standard_scores": standard_scores,
         "causal_scores": causal_scores,
@@ -442,12 +488,23 @@ def main() -> None:
     global_standard_auc, global_standard_ap = _auc_ap(standard_all, gt_all)
     global_causal_auc, global_causal_ap = _auc_ap(causal_all, causal_gt_all)
 
+    total_processing_sec = sum(float(v["processing_sec"]) for v in videos)
+    total_data_sec = sum(float(v["data_loading_sec"]) for v in videos)
+    total_video_sec = sum(float(v["n_frames"]) / float(v["fps"]) for v in videos)
+    total_windows = sum(int(v["num_windows"]) for v in videos)
+
     metrics = {
         "num_videos": len(videos),
         "global_standard_auc": global_standard_auc,
         "global_standard_ap": global_standard_ap,
         "global_causal_auc": global_causal_auc,
         "global_causal_ap": global_causal_ap,
+        "total_processing_sec": total_processing_sec,
+        "total_data_loading_sec": total_data_sec,
+        "total_video_sec": total_video_sec,
+        "rtf_processing": total_processing_sec / total_video_sec if total_video_sec > 0 else None,
+        "rtf_full": (total_processing_sec + total_data_sec) / total_video_sec if total_video_sec > 0 else None,
+        "avg_window_ms": 1000.0 * total_processing_sec / max(total_windows, 1),
         "videos": videos,
     }
     with open(output_dir / "metrics.json", "w") as f:
