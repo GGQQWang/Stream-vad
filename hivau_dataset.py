@@ -90,13 +90,21 @@ def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | N
         "no anomalies",
         "no abnormal event",
         "no abnormal events",
+        "no anomaly event",
+        "no anomaly events",
+        "anomaly does not exist",
+        "anomalies do not exist",
+        "anomaly is not present",
+        "abnormal event does not exist",
     )
     positive_patterns = (
-        "an anomaly exists",
-        "anomalous event exists",
-        "an abnormal event exists",
-        "abnormal event exists",
-        "an anomaly is present",
+        "anomaly exists",
+        "anomalies exist",
+        "an anomaly",
+        "anomalous event",
+        "abnormal event",
+        "potential anomaly",
+        "suspected anomaly",
     )
     if any(pattern in normalized for pattern in negative_patterns):
         return 0
@@ -169,8 +177,23 @@ def _extract_event_intervals_for_score(
     n_frames: int,
     is_abnormal_video: bool,
     debug_events: bool = False,
-) -> tuple[List[List[float]], int, int]:
+) -> tuple[List[List[float]], int, int, bool]:
+    """Extract per-event abnormal intervals for SCORE supervision.
+
+    Abnormal videos may contain normal events: HIVAU annotates every
+    temporal event in a video and stores the per-event verdict in
+    ``events_summary_split[i]["judgement"]`` ("An anomaly exists" /
+    "No anomaly exists").  Events whose judgement is normal are excluded
+    even when the video itself is abnormal.  Events without a judgement
+    fall back to video-level membership.
+
+    Returns ``(intervals, abnormal_events, normal_events, skip_video)``.
+    ``skip_video`` is True only for abnormal videos whose event judgements
+    leave zero abnormal events (annotation template errors); such videos
+    must be excluded from training entirely.
+    """
     events = meta.get("events", []) or []
+    event_judgements = meta.get("events_summary_split", []) or []
 
     intervals: List[List[float]] = []
     abnormal_events = 0
@@ -191,18 +214,46 @@ def _extract_event_intervals_for_score(
             event_idx=event_idx,
             field="event",
         )
+
+        # per-event anomaly decision: prefer the judgement text over
+        # video-level membership so normal events inside abnormal videos
+        # are not mislabeled as abnormal
+        is_abnormal_event = False
+        decision_source = "video_label"
+        if is_abnormal_video:
+            is_abnormal_event = True
+            if event_idx < len(event_judgements) and isinstance(event_judgements[event_idx], dict):
+                judgement = str(event_judgements[event_idx].get("judgement", ""))
+                if judgement:
+                    try:
+                        is_abnormal_event = bool(parse_event_judgement(
+                            judgement, video_id=video_id, event_idx=event_idx,
+                        ))
+                        decision_source = "event_judgement"
+                    except ValueError:
+                        warnings.warn(
+                            f"unparseable event judgement; falling back to video "
+                            f"membership: video={video_id}, event_idx={event_idx}, "
+                            f"judgement={judgement!r}",
+                            RuntimeWarning,
+                        )
+                        decision_source = "video_label_fallback"
+
         if debug_events:
             print(
                 f"HIVAU event: video={video_id}, event_idx={event_idx}, "
                 f"seconds=({start_sec}, {end_sec}), frames={frame_interval}, "
-                f"video_label={int(is_abnormal_video)}"
+                f"video_label={int(is_abnormal_video)}, "
+                f"abnormal={int(is_abnormal_event)} ({decision_source})"
             )
-        if is_abnormal_video:
+        if is_abnormal_event:
             abnormal_events += 1
             intervals.append([start_sec, end_sec])
         else:
             normal_events += 1
-    return intervals, abnormal_events, normal_events
+
+    skip_video = bool(is_abnormal_video and abnormal_events == 0)
+    return intervals, abnormal_events, normal_events, skip_video
 
 
 def _pad_int(values: List[int], length: int, pad_value: int) -> List[int]:
@@ -394,6 +445,7 @@ class HIVAUDataset(Dataset):
         abnormal_event_count = 0
         normal_event_count = 0
         total_summary_triggers = 0
+        skipped_template_broken = 0
 
         for video_name, meta in raw.items():
             n = meta["n_frames"]
@@ -413,7 +465,7 @@ class HIVAUDataset(Dataset):
             else:
                 abnormal_video_count += 1
             video_count += 1
-            anomaly_event_intervals, n_abnormal_events, n_normal_events = _extract_event_intervals_for_score(
+            anomaly_event_intervals, n_abnormal_events, n_normal_events, skip_video = _extract_event_intervals_for_score(
                 meta,
                 video_name,
                 video_fps,
@@ -421,6 +473,14 @@ class HIVAUDataset(Dataset):
                 is_abnormal_video=(video_label == 1),
                 debug_events=debug_events,
             )
+            if skip_video:
+                # abnormal video whose every event judgement says "no anomaly"
+                # (annotation template error): exclude entirely rather than
+                # training it as a fully normal sample
+                skipped_template_broken += 1
+                if debug_events:
+                    print(f"SKIP template-broken abnormal video: {video_name}")
+                continue
             abnormal_event_count += n_abnormal_events
             normal_event_count += n_normal_events
             total_event_count += n_abnormal_events + n_normal_events
@@ -508,7 +568,8 @@ class HIVAUDataset(Dataset):
             f"videos={video_count}, normal_videos={normal_video_count}, "
             f"abnormal_videos={abnormal_video_count}, events={total_event_count}, "
             f"abnormal_events={abnormal_event_count}, normal_events={normal_event_count}, "
-            f"summary_triggers={total_summary_triggers}"
+            f"summary_triggers={total_summary_triggers}, "
+            f"skipped_template_broken={skipped_template_broken}"
         )
 
     def __len__(self) -> int:

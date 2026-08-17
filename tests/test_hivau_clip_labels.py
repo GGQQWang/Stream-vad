@@ -61,7 +61,7 @@ def test_normal_video_events_do_not_create_score_labels(tmp_path):
     assert all(v == pytest.approx(0.0, abs=1e-7) for v in ds.samples[0]["clip_soft"])
 
 
-def test_abnormal_video_uses_all_events_for_score(tmp_path):
+def test_abnormal_video_filters_normal_events_by_judgement(tmp_path):
     raw = {
         "Abuse001_x264": {
             "n_frames": 80,
@@ -73,11 +73,34 @@ def test_abnormal_video_uses_all_events_for_score(tmp_path):
                 {"judgement": "This text is intentionally unparseable."},
             ],
             "clips": [[[1.0, 2.0]], [[5.0, 6.0]]],
-            "clips_caption": [["abnormal action"], ["normal later action"]],
+            "clips_caption": [["normal action"], ["abnormal later action"]],
         }
     }
     ds = _make_dataset(tmp_path, raw, abnormal_ids=("Abuse001_x264",))
-    assert ds.samples[0]["clip_soft"] == pytest.approx([0.5, 0.5, 0.5, 0.5], abs=1e-7)
+    # event 0 judged normal → excluded; event 1 unparseable → falls back to
+    # video membership → kept.  Only windows covering [5.0, 7.0]s get labels.
+    assert ds.samples[0]["clip_soft"] == pytest.approx([0.0, 0.0, 0.5, 0.5], abs=1e-7)
+
+
+def test_template_broken_abnormal_video_is_skipped(tmp_path):
+    raw = {
+        "Abuse001_x264": {
+            "n_frames": 80,
+            "fps": 10.0,
+            "label": ["Abuse"],
+            "events": [[1.0, 3.0], [5.0, 7.0]],
+            "events_summary_split": [
+                {"judgement": "No anomaly exists in this video."},
+                {"judgement": "No anomaly exists here either."},
+            ],
+            "clips": [[[1.0, 2.0]], [[5.0, 6.0]]],
+            "clips_caption": [["normal action"], ["normal action 2"]],
+        }
+    }
+    ds = _make_dataset(tmp_path, raw, abnormal_ids=("Abuse001_x264",))
+    # every event judged normal in an abnormal video → annotation template
+    # error → the video is excluded instead of trained as fully normal
+    assert len(ds.samples) == 0
 
 
 def test_training_video_not_in_anomaly_root_is_normal_even_if_annotation_label_abuse(tmp_path):
@@ -189,6 +212,20 @@ def test_unparseable_judgement_does_not_affect_abnormal_score_labels(tmp_path):
 def test_judgement_negation_has_priority():
     assert parse_event_judgement("No anomaly exists in this video.") == 0
     assert parse_event_judgement("An anomaly exists, specifically, Physical Abuse.") == 1
+
+
+def test_judgement_phrasing_variants():
+    # observed phrasings from the HIVAU UCF training annotations
+    assert parse_event_judgement("No, the anomaly does not exist.") == 0
+    assert parse_event_judgement("No anomaly exists, specifically no Abuse anomaly.") == 0
+    assert parse_event_judgement("There exists an anomaly, specifically Arson.") == 1
+    assert parse_event_judgement("There is an anomaly event (Arrest) in the video.") == 1
+    assert parse_event_judgement("There is a suspected anomaly, specifically Shoplifting.") == 1
+    assert parse_event_judgement("The anomaly exists and the man runs away.") == 1
+    assert parse_event_judgement("There is a potential anomaly, specifically a Burglary.") == 1
+    assert parse_event_judgement("There is a suspected anomaly, specifically Child Abuse.") == 1
+    with pytest.raises(ValueError):
+        parse_event_judgement("The scene contains people.")
 
 
 def test_seconds_to_frame_interval_uses_floor_and_ceil():
