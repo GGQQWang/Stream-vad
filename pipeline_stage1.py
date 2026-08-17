@@ -1669,7 +1669,8 @@ def main():
         # config consistency: silently resuming with different data/model
         # config produces garbage — fail loudly instead
         for key in ("frames_per_clip", "sample_interval", "max_windows",
-                    "d_ssm", "min_pixels", "max_pixels"):
+                    "d_ssm", "min_pixels", "max_pixels",
+                    "lora_r", "lora_alpha"):
             if key in ckpt and int(ckpt[key]) != int(getattr(args, key)):
                 raise ValueError(
                     f"resume config mismatch: {key}={ckpt[key]!r}, "
