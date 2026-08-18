@@ -296,6 +296,11 @@ def infer_video(
                     tokenizer,
                     prompt_text=prompt_text,
                 )
+            if not torch.isfinite(logits).all():
+                raise RuntimeError(
+                    f"{video_id}: non-finite score logits in chunk {chunk_i} "
+                    f"(logits min={float(logits.min())}, max={float(logits.max())})"
+                )
             probs = torch.sigmoid(logits).detach().float().cpu()
             logits_cpu = logits.detach().float().cpu()
             _synchronize(device)
@@ -460,20 +465,26 @@ def main() -> None:
     all_causal_gt = []
     all_causal = []
     videos = []
+    failed_videos: List[dict] = []
     for video_id, refs in tqdm(grouped.items(), desc="Infer videos"):
-        result = infer_video(
-            model=model,
-            processor=processor,
-            tokenizer=tokenizer,
-            dataset=dataset,
-            refs=refs,
-            device=args.device,
-            dtype=dtype,
-            prompt_text=prompt_text,
-            output_dir=output_dir,
-            gt_root=args.gt_root,
-            debug_state=args.debug_state,
-        )
+        try:
+            result = infer_video(
+                model=model,
+                processor=processor,
+                tokenizer=tokenizer,
+                dataset=dataset,
+                refs=refs,
+                device=args.device,
+                dtype=dtype,
+                prompt_text=prompt_text,
+                output_dir=output_dir,
+                gt_root=args.gt_root,
+                debug_state=args.debug_state,
+            )
+        except Exception as exc:  # keep one bad video from killing the whole run
+            failed_videos.append({"video_id": video_id, "error": str(exc)[:300]})
+            print(f"FAILED video={video_id}: {exc}")
+            continue
         videos.append({k: v for k, v in result.items() if k not in {"gt", "standard_scores", "causal_scores", "causal_valid"}})
         all_gt.append(result["gt"])
         all_standard.append(result["standard_scores"])
@@ -495,6 +506,8 @@ def main() -> None:
 
     metrics = {
         "num_videos": len(videos),
+        "num_failed_videos": len(failed_videos),
+        "failed_videos": failed_videos,
         "global_standard_auc": global_standard_auc,
         "global_standard_ap": global_standard_ap,
         "global_causal_auc": global_causal_auc,
