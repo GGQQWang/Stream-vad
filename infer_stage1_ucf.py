@@ -259,7 +259,7 @@ def infer_video(
             if "features" in batch:
                 window_batch = batch["features"].to(device=device, dtype=dtype)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    state_emb, _, ssm_cache = model.encode_window_features(
+                    state_emb, _, _, ssm_cache = model.encode_window_features(
                         window_batch,
                         valid_mask,
                         batch["video_id"],

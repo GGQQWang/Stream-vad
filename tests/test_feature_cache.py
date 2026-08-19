@@ -198,7 +198,7 @@ def test_pipeline_cache_chunk_encoder_skips_processor_and_vit():
             vid = chunk_video_ids[0]
             self.seen_states.append(ssm_state_cache.get(vid))
             ssm_state_cache[vid] = {"state": len(self.seen_states)}
-            return window_batch + 1.0, window_batch, ssm_state_cache
+            return window_batch + 1.0, window_batch, window_batch, ssm_state_cache
 
     class _BadProcessor:
         @property

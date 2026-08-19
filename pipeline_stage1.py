@@ -13,6 +13,7 @@ Three objectives supported:
 import argparse
 import math
 import os
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -63,6 +64,7 @@ from stage1_streaming import (
     sorted_window_score_records,
     summary_ce_loss,
 )
+from ibq_utils import IBQ_CODEBOOK_SIZE, IBQTokenCache, load_ibq_cache
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +513,15 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
+        # world-model auxiliary predictor: SSM hidden state h_t → one shared
+        # distribution over the IBQ codebook ("bag of tokens" of the future
+        # frame).  Training-only; discarded at inference.
+        self.world_predictor = nn.Sequential(
+            nn.Linear(d_ssm, d_ssm * 2),
+            nn.GELU(),
+            nn.Linear(d_ssm * 2, IBQ_CODEBOOK_SIZE),
+        )
+        self.world_codebook_size = IBQ_CODEBOOK_SIZE
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
@@ -559,7 +570,7 @@ class StreamingVADGenerationModel(nn.Module):
         alpha = torch.sigmoid(self.alpha_logit).to(device=delta.device, dtype=delta.dtype)
         base = window_batch.to(device=delta.device, dtype=delta.dtype)
         state_embeddings = base + alpha * delta
-        return state_embeddings, window_batch, ssm_state_cache
+        return state_embeddings, window_batch, ssm_out, ssm_state_cache
 
     def extract_window_features(
         self,
@@ -647,7 +658,7 @@ class StreamingVADGenerationModel(nn.Module):
             )
             stats = {}
 
-        state_embeddings, window_batch, ssm_state_cache = self.encode_window_features(
+        state_embeddings, window_batch, _, ssm_state_cache = self.encode_window_features(
             window_batch, valid_mask, chunk_video_ids, ssm_state_cache, training=training,
         )
 
@@ -694,6 +705,61 @@ class StreamingVADGenerationModel(nn.Module):
         score_param = next(self.score_head.parameters())
         hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
         return self.score_head(hidden).squeeze(-1)
+
+
+def _world_model_loss(
+    model: StreamingVADGenerationModel,
+    ibq_cache: IBQTokenCache,
+    batch: dict,
+    valid_mask_cpu: torch.Tensor,
+    valid_mask: torch.Tensor,
+    ssm_out: torch.Tensor,
+    horizon: int,
+    frame_idx: int,
+    detach_states: bool = False,
+) -> Tuple[torch.Tensor, dict]:
+    """Bag-of-tokens IBQ prediction CE from SSM hidden states.
+
+    For each valid window ``w`` of batch item ``b``: the predictor maps
+    ``ssm_out[b, w]`` (the causal SSM state after window ``w``) to a single
+    shared distribution over the IBQ codebook, and the loss is the mean CE
+    over the tokens of a randomly sampled frame of window
+    ``chunk_start + w + horizon``.  Windows without a future target are
+    skipped.
+
+    ``detach_states=True`` is used during predictor warmup so no gradient
+    flows into the SSM.
+    """
+    states = ssm_out.detach() if detach_states else ssm_out
+    world_logits = model.world_predictor(states)                    # [B, max_w, V]
+    log_probs = F.log_softmax(world_logits, dim=-1)                 # [B, max_w, V]
+
+    chunk_starts = batch["chunk_start"]
+    video_ids = batch["video_id"]
+    losses: List[torch.Tensor] = []
+    n_windows = 0
+    n_tokens = 0
+    for b in range(states.shape[0]):
+        vid = video_ids[b]
+        cs = int(chunk_starts[b])
+        for w in range(valid_mask_cpu.shape[1]):
+            if not bool(valid_mask_cpu[b, w]):
+                continue
+            try:
+                tgt = ibq_cache.get(vid, cs + w + horizon, frame_idx).long()
+            except IndexError:
+                continue                                     # no future window
+            tgt = tgt.to(device=log_probs.device)
+            per_window = -log_probs[b, w].gather(0, tgt).mean()
+            losses.append(per_window)
+            n_windows += 1
+            n_tokens += int(tgt.numel())
+    if not losses:
+        return states.new_zeros(()), {"num_world_windows": 0, "num_world_tokens": 0}
+    return torch.stack(losses).mean(), {
+        "num_world_windows": n_windows,
+        "num_world_tokens": n_tokens,
+    }
 
 
 def _verify_attention_backend(model: nn.Module, requested: str) -> None:
@@ -769,7 +835,7 @@ def validate_generative(
         if "features" in batch:
             window_batch = batch["features"].to(device=device, dtype=torch.bfloat16)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                state_emb, _, ssm_cache = model.encode_window_features(
+                state_emb, _, _, ssm_cache = model.encode_window_features(
                     window_batch, valid_mask, batch["video_id"], ssm_cache,
                     training=False,
                 )
@@ -945,7 +1011,7 @@ def _encode_chunk_states(
     if "features" in batch:
         window_batch = batch["features"].to(device=device, dtype=dtype)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-            state_emb, _, ssm_cache = model.encode_window_features(
+            state_emb, _, _, ssm_cache = model.encode_window_features(
                 window_batch, valid_mask,
                 batch["video_id"], ssm_cache,
                 training=training,
@@ -1342,7 +1408,7 @@ def validate_score_token(
         if "features" in batch:
             window_batch = batch["features"].to(device=device, dtype=torch.bfloat16)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                state_emb, _, ssm_cache = model.encode_window_features(
+                state_emb, _, _, ssm_cache = model.encode_window_features(
                     window_batch, valid_mask, batch["video_id"], ssm_cache,
                     training=False,
                 )
@@ -1503,6 +1569,14 @@ def main():
     parser.add_argument("--lambda-score", type=float, default=1.0)
     parser.add_argument("--lambda-sum", type=float, default=0.1,
                        help="weight for clip-boundary summary CE loss")
+    parser.add_argument("--lambda-world", type=float, default=0.0,
+                       help="weight for the world-model IBQ prediction loss (0 disables it)")
+    parser.add_argument("--world-horizon", type=int, default=1,
+                       help="predict the IBQ tokens of window t+horizon")
+    parser.add_argument("--world-warmup-steps", type=int, default=0,
+                       help="first N optimizer steps train ONLY the world predictor (h_t detached)")
+    parser.add_argument("--ibq-cache-root", default="",
+                       help="IBQ token cache root for the world-model loss")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -1647,6 +1721,30 @@ def main():
 
     embed_fn = _find_embed(model.qwen)
 
+    # ---- world-model IBQ cache (optional) ----
+    ibq_cache = None
+    if args.lambda_world > 0:
+        if not args.ibq_cache_root:
+            raise ValueError("--lambda-world > 0 requires --ibq-cache-root")
+        probe_video = train_ds.samples[0]["video_id"]
+        try:
+            probe_meta = load_ibq_cache(args.ibq_cache_root, video_id=probe_video)["metadata"]
+        except FileNotFoundError:
+            raise ValueError(
+                f"IBQ cache missing for {probe_video}; "
+                "run precompute_ibq_tokens.py first"
+            )
+        if int(probe_meta["frames_per_clip"]) != args.frames_per_clip or \
+           int(probe_meta["sample_interval"]) != args.sample_interval:
+            raise ValueError(
+                "IBQ cache windowing mismatch: "
+                f"cache={probe_meta['frames_per_clip']}/{probe_meta['sample_interval']}, "
+                f"args={args.frames_per_clip}/{args.sample_interval}"
+            )
+        ibq_cache = IBQTokenCache(args.ibq_cache_root)
+        print(f"World-model loss enabled: lambda_world={args.lambda_world}, "
+              f"horizon={args.world_horizon}, ibq_cache={args.ibq_cache_root}")
+
     # ---- resume ----
     start_epoch = 0
     global_step = 0
@@ -1690,6 +1788,8 @@ def main():
         # model components
         model.ssm.load_state_dict(ckpt["ssm"])
         model.adapter.load_state_dict(ckpt["adapter"])
+        if "world_predictor" in ckpt:
+            model.world_predictor.load_state_dict(ckpt["world_predictor"])
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):
@@ -1732,6 +1832,7 @@ def main():
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
+            "world_predictor": model.world_predictor.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -1759,6 +1860,10 @@ def main():
             "lambda_sparse": args.lambda_sparse,
             "lambda_score": args.lambda_score,
             "lambda_sum": args.lambda_sum,
+            "lambda_world": args.lambda_world,
+            "world_horizon": args.world_horizon,
+            "world_warmup_steps": args.world_warmup_steps,
+            "ibq_cache_root": args.ibq_cache_root,
             "mil_margin": args.mil_margin,
             "binary_threshold": args.binary_threshold,
             "feature_cache_root": args.feature_cache_root,
@@ -1784,6 +1889,7 @@ def main():
         train_ranking_hits: List[float] = []
         train_score_losses: List[float] = []
         train_summary_losses: List[float] = []
+        train_world_losses: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -1814,10 +1920,11 @@ def main():
                 B, max_w = binary.shape
 
                 # --- encode ---
+                ssm_out = None
                 if "features" in batch:
                     window_batch = batch["features"].to(device=device, dtype=dtype)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, visual_windows, ssm_cache = model.encode_window_features(
+                        state_emb, visual_windows, ssm_out, ssm_cache = model.encode_window_features(
                             window_batch, valid_mask, batch["video_id"], ssm_cache,
                             training=True,
                         )
@@ -1881,10 +1988,39 @@ def main():
                         loss_summary = state_emb.new_zeros(())
                         summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
 
-                    raw_total_loss = (
-                        args.lambda_score * loss_score
-                        + args.lambda_sum * loss_summary
+                    # --- world-model auxiliary loss (training-only, needs cache mode) ---
+                    use_world = (
+                        args.lambda_world > 0
+                        and ibq_cache is not None
+                        and ssm_out is not None
                     )
+                    world_info = {"num_world_windows": 0, "num_world_tokens": 0}
+                    if use_world:
+                        warmup_phase = (
+                            args.world_warmup_steps > 0
+                            and global_step < args.world_warmup_steps
+                        )
+                        frame_idx = random.randint(0, args.frames_per_clip - 1)
+                        loss_world, world_info = _world_model_loss(
+                            model, ibq_cache, batch, valid_mask_cpu, valid_mask,
+                            ssm_out, args.world_horizon, frame_idx,
+                            detach_states=warmup_phase,
+                        )
+                    else:
+                        loss_world = state_emb.new_zeros(())
+
+                    if use_world and (
+                        args.world_warmup_steps > 0
+                        and global_step < args.world_warmup_steps
+                    ):
+                        # predictor warmup: only the world predictor trains
+                        raw_total_loss = loss_world
+                    else:
+                        raw_total_loss = (
+                            args.lambda_score * loss_score
+                            + args.lambda_sum * loss_summary
+                            + args.lambda_world * loss_world
+                        )
                     total_loss = raw_total_loss / group_size
                 total_loss.backward()
 
@@ -1898,6 +2034,7 @@ def main():
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
+                train_world_losses.append(float(loss_world.detach().item()))
                 num_valid_windows = float(valid.sum().item())
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
@@ -1945,7 +2082,7 @@ def main():
                 if "features" in batch:
                     window_batch = batch["features"].to(device=device, dtype=dtype)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, _, ssm_cache = model.encode_window_features(
+                        state_emb, _, _, ssm_cache = model.encode_window_features(
                             window_batch, valid_mask, batch["video_id"], ssm_cache,
                             training=True,
                         )
@@ -2127,6 +2264,8 @@ def main():
             )
             writer.add_scalar("train/loss_score", finite_mean(train_score_losses), epoch)
             writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
+            if train_world_losses:
+                writer.add_scalar("train/loss_world", finite_mean(train_world_losses), epoch)
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
             writer.add_scalar("train/score_prob_min", score_prob_min_epoch, epoch)
             writer.add_scalar("train/score_prob_max", score_prob_max_epoch, epoch)
