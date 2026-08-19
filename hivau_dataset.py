@@ -88,6 +88,7 @@ def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | N
         "there are no anomalies",
         "no anomaly",
         "no anomalies",
+        "no possible anomaly",
         "no abnormal event",
         "no abnormal events",
         "no anomaly event",
@@ -101,11 +102,14 @@ def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | N
         "anomaly exists",
         "anomalies exist",
         "anomaly events",
+        "anomaly event",
         "an anomaly",
         "anomalous event",
         "abnormal event",
         "potential anomaly",
         "suspected anomaly",
+        "possible anomaly",
+        "identify the anomaly",
     )
     if any(pattern in normalized for pattern in negative_patterns):
         return 0
