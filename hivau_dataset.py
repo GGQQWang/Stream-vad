@@ -100,6 +100,7 @@ def parse_event_judgement(judgement: str, video_id: str = "", event_idx: int | N
     positive_patterns = (
         "anomaly exists",
         "anomalies exist",
+        "anomaly events",
         "an anomaly",
         "anomalous event",
         "abnormal event",

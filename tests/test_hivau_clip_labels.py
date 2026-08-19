@@ -224,6 +224,9 @@ def test_judgement_phrasing_variants():
     assert parse_event_judgement("The anomaly exists and the man runs away.") == 1
     assert parse_event_judgement("There is a potential anomaly, specifically a Burglary.") == 1
     assert parse_event_judgement("There is a suspected anomaly, specifically Child Abuse.") == 1
+    assert parse_event_judgement("Yes, anomaly events exist in the video.") == 1
+    assert parse_event_judgement("Multiple anomaly events exist in the video, specifically Shooting.") == 1
+    assert parse_event_judgement("There are no anomaly events in the video.") == 0
     with pytest.raises(ValueError):
         parse_event_judgement("The scene contains people.")
 
