@@ -60,7 +60,9 @@ def encode_frames(model, frames: torch.Tensor) -> torch.Tensor:
     std = torch.tensor(IBQ_STD, device=device, dtype=dtype).view(1, 3, 1, 1)
     x = (frames - mean) / std
     _, _, (_, _, token_ids) = model.encode(x)
-    return token_ids
+    # the tokenizer flattens the full [b, h, w] grid including the batch
+    # dim; reshape back to per-frame rows
+    return token_ids.reshape(frames.shape[0], -1)
 
 
 def build_ibq_cache_metadata(
