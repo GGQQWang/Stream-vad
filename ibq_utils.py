@@ -59,6 +59,8 @@ def encode_frames(model, frames: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor(IBQ_MEAN, device=device, dtype=dtype).view(1, 3, 1, 1)
     std = torch.tensor(IBQ_STD, device=device, dtype=dtype).view(1, 3, 1, 1)
     x = (frames - mean) / std
+    # the tokenizer runs in its own dtype (e.g. bf16); cast the input
+    x = x.to(dtype=model.dtype)
     _, _, (_, _, token_ids) = model.encode(x)
     # the tokenizer flattens the full [b, h, w] grid including the batch
     # dim; reshape back to per-frame rows
