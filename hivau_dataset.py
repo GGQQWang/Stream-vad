@@ -451,6 +451,7 @@ class HIVAUDataset(Dataset):
         normal_event_count = 0
         total_summary_triggers = 0
         skipped_template_broken = 0
+        skipped_missing_cache = 0
 
         for video_name, meta in raw.items():
             n = meta["n_frames"]
@@ -506,19 +507,28 @@ class HIVAUDataset(Dataset):
             total_summary_triggers += sum(len(w.summary_triggers) for w in window_infos)
 
             if self.feature_cache_root is not None:
-                load_feature_cache(
-                    self.feature_cache_root,
-                    video_id=video_name,
-                    n_windows=n_clips,
-                    n_frames=n,
-                    fps=video_fps,
-                    frames_per_clip=total_sampled_frames,
-                    sample_interval=sample_interval,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
-                    model_id=feature_cache_model_id,
-                    map_location="cpu",
-                )
+                try:
+                    load_feature_cache(
+                        self.feature_cache_root,
+                        video_id=video_name,
+                        n_windows=n_clips,
+                        n_frames=n,
+                        fps=video_fps,
+                        frames_per_clip=total_sampled_frames,
+                        sample_interval=sample_interval,
+                        min_pixels=min_pixels,
+                        max_pixels=max_pixels,
+                        model_id=feature_cache_model_id,
+                        map_location="cpu",
+                    )
+                except FileNotFoundError:
+                    # annotation entry with neither a video file nor a cache
+                    # entry (e.g. video missing from disk): skip it like the
+                    # no-cache path does
+                    skipped_missing_cache += 1
+                    if debug_events:
+                        print(f"SKIP missing video+feature cache: {video_name}")
+                    continue
 
             total_windows_all += n_clips
 
@@ -574,7 +584,8 @@ class HIVAUDataset(Dataset):
             f"abnormal_videos={abnormal_video_count}, events={total_event_count}, "
             f"abnormal_events={abnormal_event_count}, normal_events={normal_event_count}, "
             f"summary_triggers={total_summary_triggers}, "
-            f"skipped_template_broken={skipped_template_broken}"
+            f"skipped_template_broken={skipped_template_broken}, "
+            f"skipped_missing_cache={skipped_missing_cache}"
         )
 
     def __len__(self) -> int:
