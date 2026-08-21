@@ -1643,6 +1643,13 @@ def main():
     ).to(device)
     model.debug_state = bool(args.debug_state)
 
+    if args.lambda_world <= 0:
+        # world model disabled: freeze the predictor so it costs no
+        # optimizer memory and receives no gradients (the output layer
+        # alone has ~67M parameters)
+        for p in model.world_predictor.parameters():
+            p.requires_grad = False
+
     # ---- param counts ----
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
