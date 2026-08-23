@@ -519,14 +519,18 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
-        # world-model auxiliary predictor: SSM hidden state h_t → embedding
-        # vector → dot product with the FROZEN IBQ codebook → shared
-        # distribution ("bag of tokens" of the future frame).  The codebook
-        # is a non-persistent buffer loaded from the IBQ cache at startup;
-        # no trainable [V, H] output layer is needed (~67M params saved).
+        # world-model auxiliary predictor:
+        #   projected causal SSM representation [llm_hidden]  (ssm_out from
+        #   SSMBlock.out_proj, which maps the internal Mamba dim to the LLM
+        #   hidden size)
+        #   -> compact latent [d_ssm]
+        #   -> IBQ codebook embedding [IBQ_CODE_EMBED_DIM]
+        # Logits are computed as a dot product against the FROZEN IBQ
+        # codebook (a non-persistent buffer loaded from the IBQ cache at
+        # startup); no trainable [V, H] output layer is needed.
         # Training-only; discarded at inference.
         self.world_predictor = nn.Sequential(
-            nn.Linear(d_ssm, d_ssm),
+            nn.Linear(llm_hidden, d_ssm),
             nn.GELU(),
             nn.LayerNorm(d_ssm),
             nn.Linear(d_ssm, IBQ_CODE_EMBED_DIM),
@@ -546,7 +550,20 @@ class StreamingVADGenerationModel(nn.Module):
 
     def world_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Codebook logits via dot product with the frozen IBQ embedding."""
+        expected_dim = self.world_predictor[0].in_features
+        if h.shape[-1] != expected_dim:
+            raise RuntimeError(
+                f"world_predictor input dim mismatch: "
+                f"got {h.shape[-1]}, expected {expected_dim}, "
+                f"shape={tuple(h.shape)}"
+            )
         z = self.world_predictor(h)                     # [..., E]
+        if z.shape[-1] != self.ibq_codebook.shape[-1]:
+            raise RuntimeError(
+                f"IBQ embedding dim mismatch: "
+                f"predictor={z.shape[-1]}, "
+                f"codebook={self.ibq_codebook.shape[-1]}"
+            )
         return F.linear(z, self.ibq_codebook)           # [..., V]
 
     def encode_window_features(
@@ -727,6 +744,37 @@ class StreamingVADGenerationModel(nn.Module):
         return self.score_head(hidden).squeeze(-1)
 
 
+def _sanitize_optimizer_state(
+    saved_state: dict,
+    optimizer: torch.optim.Optimizer,
+    dropped_shapes: set,
+) -> dict:
+    """Drop saved optimizer slots for params whose shapes no longer exist.
+
+    Used when a module (e.g. world_predictor) was reinitialized after a
+    shape change: its saved ``exp_avg``/``exp_avg_sq`` entries and its
+    param-group ids are removed, so the positional param mapping inside
+    ``optimizer.load_state_dict`` stays aligned for every other module.
+    """
+    saved_state = {k: v for k, v in saved_state.items()}
+    state = dict(saved_state.get("state", {}))
+    groups = [dict(g) for g in saved_state.get("param_groups", [])]
+
+    dropped_ids = {
+        pid for pid, slot in state.items()
+        if slot.get("exp_avg") is not None
+        and tuple(slot["exp_avg"].shape) in dropped_shapes
+    }
+    for pid in dropped_ids:
+        state.pop(pid, None)
+    for g in groups:
+        g["params"] = [pid for pid in g.get("params", []) if pid not in dropped_ids]
+
+    saved_state["state"] = state
+    saved_state["param_groups"] = groups
+    return saved_state
+
+
 def _world_model_loss(
     model: StreamingVADGenerationModel,
     ibq_cache: IBQTokenCache,
@@ -738,7 +786,7 @@ def _world_model_loss(
     frame_idx: int,
     detach_states: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
-    """Bag-of-tokens IBQ prediction CE from SSM hidden states.
+    """Bag-of-tokens IBQ prediction CE from the projected SSM representation.
 
     For each valid window ``w`` of batch item ``b``: the predictor maps
     ``ssm_out[b, w]`` (the causal SSM state after window ``w``) to a single
@@ -1685,6 +1733,14 @@ def main():
     model.debug_state = bool(args.debug_state)
     model.ssm.debug_device = bool(args.debug_device)
 
+    # one-time world-model shape sanity checks (not per batch)
+    assert model.world_predictor[0].in_features == model.llm_hidden, (
+        f"world_predictor expects {model.llm_hidden}-dim input, "
+        f"got {model.world_predictor[0].in_features}"
+    )
+    assert model.world_predictor[-1].out_features == IBQ_CODE_EMBED_DIM
+    assert model.ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+
     if args.lambda_world <= 0:
         # world model disabled: freeze the predictor so it costs no
         # optimizer memory and receives no gradients (the output layer
@@ -1848,14 +1904,22 @@ def main():
         # model components
         model.ssm.load_state_dict(ckpt["ssm"])
         model.adapter.load_state_dict(ckpt["adapter"])
+        world_predictor_reinit = False
         if "world_predictor" in ckpt:
             try:
                 model.world_predictor.load_state_dict(ckpt["world_predictor"])
             except RuntimeError:
+                world_predictor_reinit = True
                 print(
-                    "WARNING: world_predictor shape mismatch with checkpoint; "
-                    "using random init (safe if the predictor was never trained)"
+                    "WARNING: world_predictor checkpoint shape is incompatible "
+                    "after the input-dimension fix; reinitializing "
+                    "world_predictor with random weights."
                 )
+                if args.lambda_world > 0:
+                    print(
+                        "WARNING: resuming with lambda_world > 0 will train "
+                        "the world predictor from scratch."
+                    )
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):
@@ -1872,7 +1936,15 @@ def main():
 
         # optimizer / scheduler state
         if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+            saved_opt = ckpt["optimizer"]
+            if world_predictor_reinit:
+                saved_opt = _sanitize_optimizer_state(
+                    saved_opt, optimizer,
+                    dropped_shapes={
+                        tuple(t.shape) for t in ckpt["world_predictor"].values()
+                    },
+                )
+            optimizer.load_state_dict(saved_opt)
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
 
