@@ -1621,10 +1621,18 @@ def main():
     # but the context is a different device, kernels fail with
     # "Pointer argument ... cannot be accessed from Triton".
     if device.type == "cuda":
-        torch.cuda.set_device(device)
+        # normalize "cuda" (no index) to an explicit device so every
+        # downstream .to(device) targets a concrete GPU
+        device_index = (
+            device.index
+            if device.index is not None
+            else torch.cuda.current_device()
+        )
+        torch.cuda.set_device(device_index)
+        device = torch.device("cuda", device_index)
         print(f"Training device: {device}")
         print(f"Current CUDA device: {torch.cuda.current_device()}")
-        print(f"GPU: {torch.cuda.get_device_name(device)}")
+        print(f"GPU: {torch.cuda.get_device_name(device_index)}")
     else:
         print(f"Training device: {device} (CPU)")
     os.makedirs(args.log_dir, exist_ok=True)

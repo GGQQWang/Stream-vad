@@ -82,8 +82,18 @@ def _assert_scan_devices(
     dt_bias: torch.Tensor,
     ssm_state: Optional[torch.Tensor],
 ) -> None:
-    """Fail loudly when any Triton scan input lives on another device."""
+    """Fail loudly when the CUDA context or any scan input mismatches."""
     expected = u.device
+
+    # context check first: Triton launches on the current device, so a
+    # stale context fails even when every tensor agrees
+    if expected.type == "cuda":
+        current = torch.cuda.current_device()
+        if expected.index is not None and current != expected.index:
+            raise RuntimeError(
+                f"Mamba CUDA context mismatch: "
+                f"current_cuda={current}, expected={expected}"
+            )
     parts = [("u", u), ("x", x_scan), ("dt", dt), ("A", A), ("B", B_scan),
              ("C", C_scan), ("D", D_scan), ("dt_bias", dt_bias)]
     if z_scan is not None:
