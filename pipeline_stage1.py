@@ -744,35 +744,20 @@ class StreamingVADGenerationModel(nn.Module):
         return self.score_head(hidden).squeeze(-1)
 
 
-def _sanitize_optimizer_state(
-    saved_state: dict,
-    optimizer: torch.optim.Optimizer,
-    dropped_shapes: set,
-) -> dict:
-    """Drop saved optimizer slots for params whose shapes no longer exist.
+def _state_dict_shapes_match(module: nn.Module, saved: dict) -> bool:
+    """Check a saved state dict against a module BEFORE loading it.
 
-    Used when a module (e.g. world_predictor) was reinitialized after a
-    shape change: its saved ``exp_avg``/``exp_avg_sq`` entries and its
-    param-group ids are removed, so the positional param mapping inside
-    ``optimizer.load_state_dict`` stays aligned for every other module.
+    ``load_state_dict`` may partially copy tensors before raising on a
+    shape mismatch; comparing keys and shapes first guarantees the module
+    is either fully loadable or left completely untouched.
     """
-    saved_state = {k: v for k, v in saved_state.items()}
-    state = dict(saved_state.get("state", {}))
-    groups = [dict(g) for g in saved_state.get("param_groups", [])]
-
-    dropped_ids = {
-        pid for pid, slot in state.items()
-        if slot.get("exp_avg") is not None
-        and tuple(slot["exp_avg"].shape) in dropped_shapes
-    }
-    for pid in dropped_ids:
-        state.pop(pid, None)
-    for g in groups:
-        g["params"] = [pid for pid in g.get("params", []) if pid not in dropped_ids]
-
-    saved_state["state"] = state
-    saved_state["param_groups"] = groups
-    return saved_state
+    current = module.state_dict()
+    if current.keys() != saved.keys():
+        return False
+    for key, tensor in current.items():
+        if tuple(tensor.shape) != tuple(saved[key].shape):
+            return False
+    return True
 
 
 def _world_model_loss(
@@ -1904,22 +1889,38 @@ def main():
         # model components
         model.ssm.load_state_dict(ckpt["ssm"])
         model.adapter.load_state_dict(ckpt["adapter"])
-        world_predictor_reinit = False
+        world_predictor_compatible = True
         if "world_predictor" in ckpt:
-            try:
+            if _state_dict_shapes_match(
+                model.world_predictor, ckpt["world_predictor"],
+            ):
                 model.world_predictor.load_state_dict(ckpt["world_predictor"])
-            except RuntimeError:
-                world_predictor_reinit = True
+            else:
+                # keep the freshly initialized predictor; never partially
+                # load an incompatible state dict
+                world_predictor_compatible = False
                 print(
-                    "WARNING: world_predictor checkpoint shape is incompatible "
-                    "after the input-dimension fix; reinitializing "
-                    "world_predictor with random weights."
+                    "WARNING: world_predictor checkpoint is incompatible "
+                    "with the current architecture; keeping the newly "
+                    "initialized world_predictor."
                 )
                 if args.lambda_world > 0:
                     print(
-                        "WARNING: resuming with lambda_world > 0 will train "
-                        "the world predictor from scratch."
+                        "WARNING: world_predictor is newly initialized and "
+                        "will be trained from scratch while the other "
+                        "compatible modules are resumed."
                     )
+        else:
+            # checkpoint predates the world predictor; the predictor stays
+            # fresh.  If it is trainable (lambda_world > 0) the saved
+            # optimizer state also lacks its slots.
+            if args.lambda_world > 0:
+                world_predictor_compatible = False
+                print(
+                    "WARNING: checkpoint predates world_predictor; the "
+                    "predictor is newly initialized and the optimizer state "
+                    "will be reset."
+                )
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):
@@ -1934,19 +1935,31 @@ def main():
         # LoRA adapter (must stay trainable, otherwise training is a no-op)
         qwen.load_adapter(str(lora_dir), adapter_name="default", is_trainable=True)
 
-        # optimizer / scheduler state
-        if "optimizer" in ckpt:
-            saved_opt = ckpt["optimizer"]
-            if world_predictor_reinit:
-                saved_opt = _sanitize_optimizer_state(
-                    saved_opt, optimizer,
-                    dropped_shapes={
-                        tuple(t.shape) for t in ckpt["world_predictor"].values()
-                    },
-                )
-            optimizer.load_state_dict(saved_opt)
-        if "scheduler" in ckpt:
+        # optimizer / scheduler state: restore only when the trainable
+        # parameter set matches the checkpoint, otherwise keep the fresh
+        # optimizer/scheduler created above
+        optimizer_restored = False
+        scheduler_restored = False
+        training_state_reset = False
+        if "optimizer" in ckpt and world_predictor_compatible:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            optimizer_restored = True
+        elif "optimizer" in ckpt:
+            training_state_reset = True
+            print(
+                "WARNING: optimizer state was not restored because "
+                "world_predictor architecture changed. Model weights for "
+                "compatible modules were restored, but optimizer moments "
+                "are reinitialized."
+            )
+        if "scheduler" in ckpt and optimizer_restored:
             scheduler.load_state_dict(ckpt["scheduler"])
+            scheduler_restored = True
+        if training_state_reset:
+            print(
+                "WARNING: optimizer and scheduler states were reset because "
+                "world_predictor architecture changed."
+            )
 
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         if start_epoch >= args.epochs:
@@ -1955,13 +1968,27 @@ def main():
                 f"--epochs={args.epochs}; pass --epochs greater than the "
                 "resumed epoch (total epochs of the whole run)"
             )
-        global_step = int(ckpt.get("global_step", 0))
+        if optimizer_restored:
+            global_step = int(ckpt.get("global_step", 0))
+        else:
+            global_step = 0
+            if training_state_reset:
+                print(
+                    "WARNING: global_step reset to 0 because "
+                    "optimizer/scheduler were reinitialized."
+                )
         best_metric = float(ckpt.get("best_metric", 0.0))
         print(
             f"Resumed from epoch {start_epoch - 1}: global_step={global_step}, "
             f"best_metric={best_metric:.4f}, "
             f"training epochs {start_epoch}..{args.epochs - 1}"
         )
+        if training_state_reset:
+            print(
+                "Optimizer/scheduler were reset due to world_predictor "
+                "architecture change. Training continues from epoch "
+                f"{start_epoch} with fresh optimizer state."
+            )
 
     def save_stage1_checkpoint(ckpt_dir: Path, epoch: int) -> None:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
