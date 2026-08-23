@@ -537,17 +537,17 @@ class StreamingVADGenerationModel(nn.Module):
             persistent=False,
         )
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
-
-    def world_logits(self, h: torch.Tensor) -> torch.Tensor:
-        """Codebook logits via dot product with the frozen IBQ embedding."""
-        z = self.world_predictor(h)                     # [..., E]
-        return F.linear(z, self.ibq_codebook)           # [..., V]
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
 
         # Full Qwen model with LoRA
         self.qwen = qwen
+
+    def world_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Codebook logits via dot product with the frozen IBQ embedding."""
+        z = self.world_predictor(h)                     # [..., E]
+        return F.linear(z, self.ibq_codebook)           # [..., V]
 
     def encode_window_features(
         self,
