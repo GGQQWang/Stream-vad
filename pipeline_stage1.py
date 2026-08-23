@@ -64,7 +64,13 @@ from stage1_streaming import (
     sorted_window_score_records,
     summary_ce_loss,
 )
-from ibq_utils import IBQ_CODEBOOK_SIZE, IBQTokenCache, load_ibq_cache
+from ibq_utils import (
+    IBQ_CODE_EMBED_DIM,
+    IBQ_CODEBOOK_SIZE,
+    IBQTokenCache,
+    load_codebook,
+    load_ibq_cache,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -513,15 +519,29 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
-        # world-model auxiliary predictor: SSM hidden state h_t → one shared
-        # distribution over the IBQ codebook ("bag of tokens" of the future
-        # frame).  Training-only; discarded at inference.
+        # world-model auxiliary predictor: SSM hidden state h_t → embedding
+        # vector → dot product with the FROZEN IBQ codebook → shared
+        # distribution ("bag of tokens" of the future frame).  The codebook
+        # is a non-persistent buffer loaded from the IBQ cache at startup;
+        # no trainable [V, H] output layer is needed (~67M params saved).
+        # Training-only; discarded at inference.
         self.world_predictor = nn.Sequential(
-            nn.Linear(d_ssm, d_ssm * 2),
+            nn.Linear(d_ssm, d_ssm),
             nn.GELU(),
-            nn.Linear(d_ssm * 2, IBQ_CODEBOOK_SIZE),
+            nn.LayerNorm(d_ssm),
+            nn.Linear(d_ssm, IBQ_CODE_EMBED_DIM),
+        )
+        self.register_buffer(
+            "ibq_codebook",
+            torch.empty(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM),
+            persistent=False,
         )
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
+
+    def world_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Codebook logits via dot product with the frozen IBQ embedding."""
+        z = self.world_predictor(h)                     # [..., E]
+        return F.linear(z, self.ibq_codebook)           # [..., V]
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
@@ -731,7 +751,7 @@ def _world_model_loss(
     flows into the SSM.
     """
     states = ssm_out.detach() if detach_states else ssm_out
-    world_logits = model.world_predictor(states)                    # [B, max_w, V]
+    world_logits = model.world_logits(states)                       # [B, max_w, V]
     log_probs = F.log_softmax(world_logits, dim=-1)                 # [B, max_w, V]
 
     chunk_starts = batch["chunk_start"]
@@ -1749,6 +1769,17 @@ def main():
                 f"args={args.frames_per_clip}/{args.sample_interval}"
             )
         ibq_cache = IBQTokenCache(args.ibq_cache_root)
+        # load the frozen codebook for dot-product logits
+        codebook = load_codebook(args.ibq_cache_root).to(
+            device=model.ibq_codebook.device, dtype=model.ibq_codebook.dtype,
+        )
+        if tuple(codebook.shape) != tuple(model.ibq_codebook.shape):
+            raise ValueError(
+                f"IBQ codebook shape mismatch: {tuple(codebook.shape)} vs "
+                f"expected {tuple(model.ibq_codebook.shape)}"
+            )
+        model.ibq_codebook.copy_(codebook)
+        del codebook
         print(f"World-model loss enabled: lambda_world={args.lambda_world}, "
               f"horizon={args.world_horizon}, ibq_cache={args.ibq_cache_root}")
 
@@ -1796,7 +1827,13 @@ def main():
         model.ssm.load_state_dict(ckpt["ssm"])
         model.adapter.load_state_dict(ckpt["adapter"])
         if "world_predictor" in ckpt:
-            model.world_predictor.load_state_dict(ckpt["world_predictor"])
+            try:
+                model.world_predictor.load_state_dict(ckpt["world_predictor"])
+            except RuntimeError:
+                print(
+                    "WARNING: world_predictor shape mismatch with checkpoint; "
+                    "using random init (safe if the predictor was never trained)"
+                )
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):

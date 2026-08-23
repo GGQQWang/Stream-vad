@@ -33,6 +33,7 @@ from ibq_utils import (
     build_ibq_cache_metadata,
     encode_frames,
     load_ibq_tokenizer,
+    save_codebook,
     save_ibq_cache_atomic,
 )
 from stage1_streaming import build_window_infos
@@ -92,6 +93,10 @@ def main() -> None:
     model_id = args.model_id or str(args.ibq_model_dir)
     cache_root = Path(args.cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
+
+    # persist the frozen codebook once so training can compute dot-product
+    # logits against it without loading the tokenizer
+    save_codebook(cache_root, model)
 
     n_done = 0
     n_skip = 0

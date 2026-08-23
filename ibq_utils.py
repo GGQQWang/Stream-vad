@@ -28,6 +28,31 @@ IBQ_STD = (0.26862954, 0.26130258, 0.27577711)
 IBQ_FRAME_SIZE = (448, 224)
 IBQ_TOKENS_PER_FRAME = 392
 IBQ_CODEBOOK_SIZE = 131072
+IBQ_CODE_EMBED_DIM = 256
+
+
+def save_codebook(cache_root: str | Path, model) -> Path:
+    """Persist the tokenizer's (frozen) codebook into the cache root.
+
+    Training computes codebook logits as a dot product against this
+    frozen embedding instead of learning a huge [V, H] output layer.
+    """
+    path = Path(cache_root) / "_codebook.pt"
+    if path.is_file():
+        return path
+    weight = model.quantize.embedding.weight.detach().cpu()
+    torch.save({"codebook": weight}, path)
+    return path
+
+
+def load_codebook(cache_root: str | Path) -> torch.Tensor:
+    path = Path(cache_root) / "_codebook.pt"
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"IBQ codebook not found at {path}; re-run precompute_ibq_tokens.py "
+            "once (it saves the codebook automatically)"
+        )
+    return torch.load(path, map_location="cpu", weights_only=True)["codebook"]
 
 
 def load_ibq_tokenizer(model_dir: str | Path, device, dtype=torch.float32):
