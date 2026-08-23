@@ -808,7 +808,11 @@ def _world_model_loss(
             n_windows += 1
             n_tokens += int(tgt.numel())
     if not losses:
-        return states.new_zeros(()), {"num_world_windows": 0, "num_world_tokens": 0}
+        # no future window has an IBQ target in this batch: return a zero
+        # loss that is still connected to the autograd graph so
+        # .backward() works when the warmup phase targets loss_world alone
+        zero_loss = world_logits.sum() * 0.0
+        return zero_loss, {"num_world_windows": 0, "num_world_tokens": 0}
     return torch.stack(losses).mean(), {
         "num_world_windows": n_windows,
         "num_world_tokens": n_tokens,
@@ -2160,6 +2164,7 @@ def main():
                         and ssm_out is not None
                     )
                     world_info = {"num_world_windows": 0, "num_world_tokens": 0}
+                    warmup_phase = False
                     if use_world:
                         warmup_phase = (
                             args.world_warmup_steps > 0
@@ -2174,10 +2179,7 @@ def main():
                     else:
                         loss_world = state_emb.new_zeros(())
 
-                    if use_world and (
-                        args.world_warmup_steps > 0
-                        and global_step < args.world_warmup_steps
-                    ):
+                    if use_world and warmup_phase:
                         # predictor warmup: only the world predictor trains
                         raw_total_loss = loss_world
                     else:
@@ -2187,6 +2189,16 @@ def main():
                             + args.lambda_world * loss_world
                         )
                     total_loss = raw_total_loss / group_size
+
+                if not total_loss.requires_grad:
+                    raise RuntimeError(
+                        "total_loss unexpectedly has no grad: "
+                        f"use_world={use_world}, warmup_phase={warmup_phase}, "
+                        f"num_world_windows={world_info['num_world_windows']}, "
+                        f"loss_score_requires_grad={loss_score.requires_grad}, "
+                        f"loss_summary_requires_grad={loss_summary.requires_grad}, "
+                        f"loss_world_requires_grad={loss_world.requires_grad}"
+                    )
                 total_loss.backward()
 
                 is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
