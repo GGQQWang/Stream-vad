@@ -67,11 +67,44 @@ class SSMState:
 # helpers — extract Mamba2 internals
 # ---------------------------------------------------------------------------
 
+_MAMBA_DEBUG_DEVICE_PRINTED = False
+
+
+def _assert_scan_devices(
+    u: torch.Tensor,
+    x_scan: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B_scan: torch.Tensor,
+    C_scan: torch.Tensor,
+    D_scan: torch.Tensor,
+    z_scan: Optional[torch.Tensor],
+    dt_bias: torch.Tensor,
+    ssm_state: Optional[torch.Tensor],
+) -> None:
+    """Fail loudly when any Triton scan input lives on another device."""
+    expected = u.device
+    parts = [("u", u), ("x", x_scan), ("dt", dt), ("A", A), ("B", B_scan),
+             ("C", C_scan), ("D", D_scan), ("dt_bias", dt_bias)]
+    if z_scan is not None:
+        parts.append(("z", z_scan))
+    if ssm_state is not None:
+        parts.append(("initial_states", ssm_state))
+    mismatches = [f"{name}={t.device}" for name, t in parts if t.device != expected]
+    if mismatches:
+        current = torch.cuda.current_device() if expected.type == "cuda" else "N/A"
+        raise RuntimeError(
+            f"Mamba device mismatch: current_cuda={current}, "
+            f"expected={expected}, " + ", ".join(mismatches)
+        )
+
+
 def _mamba_chunk_forward(
     blk: nn.Module,
     u: torch.Tensor,                  # [B, L, d_model]
     conv_state: Optional[torch.Tensor] = None,   # [B, D_conv, d_conv]
     ssm_state: Optional[torch.Tensor] = None,    # [B, nheads, headdim, d_state]
+    debug_device: bool = False,
 ) -> Tuple[torch.Tensor, SSMState]:
     """Differentiable chunk forward through one Mamba2 block.
 
@@ -79,6 +112,11 @@ def _mamba_chunk_forward(
     """
     assert not blk.use_mem_eff_path, "forward_chunk requires use_mem_eff_path=False"
     batch, seqlen, _ = u.shape
+
+    # Triton kernels launch on the *current* CUDA device; make sure the
+    # context matches the input before any kernel runs.
+    if u.device.type == "cuda":
+        torch.cuda.set_device(u.device)
 
     # 1. project
     zxbcdt = blk.in_proj(u)                                      # [B, L, d_in_proj]
@@ -139,16 +177,45 @@ def _mamba_chunk_forward(
         {} if blk.dt_limit == (0.0, float("inf")) else {"dt_limit": blk.dt_limit}
     )
 
+    # materialize the exact tensors handed to Triton, then verify devices
+    x_scan = rearrange(x, "b l (h p) -> b l h p", p=blk.headdim)
+    B_scan = rearrange(B, "b l (g n) -> b l g n", g=blk.ngroups)
+    C_scan = rearrange(C, "b l (g n) -> b l g n", g=blk.ngroups)
+    D_scan = rearrange(blk.D, "(h p) -> h p", p=blk.headdim) if blk.D_has_hdim else blk.D
+    z_scan = rearrange(z, "b l (h p) -> b l h p", p=blk.headdim) if not blk.rmsnorm else None
+    dt_bias = blk.dt_bias
+
+    _assert_scan_devices(
+        u, x_scan, dt, A, B_scan, C_scan, D_scan, z_scan, dt_bias, ssm_state,
+    )
+
+    global _MAMBA_DEBUG_DEVICE_PRINTED
+    if debug_device and not _MAMBA_DEBUG_DEVICE_PRINTED:
+        _MAMBA_DEBUG_DEVICE_PRINTED = True
+        print(
+            "[Mamba Device Debug]\n"
+            f"  current_cuda = {torch.cuda.current_device()}\n"
+            f"  u = {u.device}\n"
+            f"  x = {x_scan.device}\n"
+            f"  dt = {dt.device}\n"
+            f"  A = {A.device}\n"
+            f"  B = {B_scan.device}\n"
+            f"  C = {C_scan.device}\n"
+            f"  D = {D_scan.device}\n"
+            f"  dt_bias = {dt_bias.device}\n"
+            f"  ssm_state = {None if ssm_state is None else ssm_state.device}"
+        )
+
     y, final_ssm_state = mamba_chunk_scan_combined(
-        rearrange(x, "b l (h p) -> b l h p", p=blk.headdim),
+        x_scan,
         dt,           # raw dt — scan handles softplus internally
         A,
-        rearrange(B, "b l (g n) -> b l g n", g=blk.ngroups),
-        rearrange(C, "b l (g n) -> b l g n", g=blk.ngroups),
+        B_scan,
+        C_scan,
         chunk_size=blk.chunk_size,
-        D=rearrange(blk.D, "(h p) -> h p", p=blk.headdim) if blk.D_has_hdim else blk.D,
-        z=rearrange(z, "b l (h p) -> b l h p", p=blk.headdim) if not blk.rmsnorm else None,
-        dt_bias=blk.dt_bias,
+        D=D_scan,
+        z=z_scan,
+        dt_bias=dt_bias,
         dt_softplus=True,
         initial_states=ssm_state,
         return_final_states=True,
@@ -220,6 +287,9 @@ class SSMBlock(nn.Module):
         # inference cache (for forward_step streaming)
         self._cache: Optional[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = None
 
+        # print Mamba tensor devices once before the first Triton scan
+        self.debug_device = False
+
     # ------------------------------------------------------------------
     # Full-sequence forward (training, no state carry)
     # ------------------------------------------------------------------
@@ -261,10 +331,20 @@ class SSMBlock(nn.Module):
             h = norm(h)
 
             prev = state.get(i) if state else None
+            if prev is not None and (
+                prev.conv_state.device != h.device
+                or prev.ssm_state.device != h.device
+            ):
+                # cached state from another device (should not happen once
+                # the CUDA context is fixed); move only on mismatch
+                prev = prev.to_device(h.device)
             conv_s = prev.conv_state if prev else None
             ssm_s = prev.ssm_state if prev else None
 
-            h, ns = _mamba_chunk_forward(blk, h, conv_state=conv_s, ssm_state=ssm_s)
+            h, ns = _mamba_chunk_forward(
+                blk, h, conv_state=conv_s, ssm_state=ssm_s,
+                debug_device=self.debug_device,
+            )
             new_state[i] = ns
             h = h + residual
 

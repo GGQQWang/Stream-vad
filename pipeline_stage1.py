@@ -1602,6 +1602,8 @@ def main():
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
     parser.add_argument("--debug-state", action="store_true",
                        help="print SSM state reuse/detach/clear events for streaming checks")
+    parser.add_argument("--debug-device", action="store_true",
+                       help="print Mamba tensor devices once before the first Triton scan")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-every", type=int, default=1)
@@ -1614,6 +1616,17 @@ def main():
 
     set_seed(args.seed)
     device = torch.device(args.device)
+    # Make the current CUDA device context match args.device.  Triton
+    # kernels launch on the *current* device; if tensors live on cuda:N
+    # but the context is a different device, kernels fail with
+    # "Pointer argument ... cannot be accessed from Triton".
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+        print(f"Training device: {device}")
+        print(f"Current CUDA device: {torch.cuda.current_device()}")
+        print(f"GPU: {torch.cuda.get_device_name(device)}")
+    else:
+        print(f"Training device: {device} (CPU)")
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(args.log_dir)
 
@@ -1662,6 +1675,7 @@ def main():
         vit_micro_batch=args.vit_micro_batch,
     ).to(device)
     model.debug_state = bool(args.debug_state)
+    model.ssm.debug_device = bool(args.debug_device)
 
     if args.lambda_world <= 0:
         # world model disabled: freeze the predictor so it costs no
