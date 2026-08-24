@@ -421,6 +421,7 @@ class HIVAUDataset(Dataset):
         max_pixels: int = 200704,
         debug_events: bool = False,
         anomaly_video_root: str | Path | None = None,
+        require_spatial: bool = False,
     ):
         super().__init__()
         self.video_root = Path(video_root)
@@ -431,6 +432,7 @@ class HIVAUDataset(Dataset):
         self.clip_span = total_sampled_frames * sample_interval
         self.feature_cache_root = Path(feature_cache_root) if feature_cache_root else None
         self.feature_cache_model_id = feature_cache_model_id
+        self.require_spatial = bool(require_spatial)
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.use_abnormal_video_ids = anomaly_video_root is not None and str(anomaly_video_root) != ""
@@ -520,6 +522,7 @@ class HIVAUDataset(Dataset):
                         max_pixels=max_pixels,
                         model_id=feature_cache_model_id,
                         map_location="cpu",
+                        require_spatial=self.require_spatial,
                     )
                 except FileNotFoundError:
                     # annotation entry with neither a video file nor a cache
@@ -619,6 +622,25 @@ class HIVAUDataset(Dataset):
                 )
                 features = torch.cat([features, pad], dim=0)
 
+            spatial_features = None
+            spatial_mask = None
+            if self.require_spatial:
+                sf = cache["spatial_features"][ci_start:ci_end].to(torch.float32)
+                sm = cache["spatial_mask"][ci_start:ci_end].bool()
+                R_max = sf.shape[1]
+                if n_actual < self.max_windows:
+                    pad_sf = torch.zeros(
+                        self.max_windows - n_actual, R_max, sf.shape[-1],
+                        dtype=sf.dtype,
+                    )
+                    pad_sm = torch.zeros(
+                        self.max_windows - n_actual, R_max, dtype=torch.bool,
+                    )
+                    sf = torch.cat([sf, pad_sf], dim=0)
+                    sm = torch.cat([sm, pad_sm], dim=0)
+                spatial_features = sf
+                spatial_mask = sm
+
             soft = torch.tensor(meta["clip_soft"], dtype=torch.float32)
             binary = torch.tensor(meta["clip_bin"], dtype=torch.float32)
             valid = torch.zeros(self.max_windows, dtype=torch.bool)
@@ -637,6 +659,8 @@ class HIVAUDataset(Dataset):
                 "n_total_windows": meta["n_total_windows"],
                 "is_last_chunk": meta["is_last_chunk"],
                 "features": features,
+                "spatial_features": spatial_features,
+                "spatial_mask": spatial_mask,
                 "labels": soft,
                 "binary": binary,
                 "valid_mask": valid,
@@ -737,6 +761,13 @@ def hivau_collate(batch: List[dict]) -> dict:
     }
     if "features" in batch[0]:
         out["features"] = torch.stack([b["features"] for b in batch], dim=0)
+    if batch[0].get("spatial_features") is not None:
+        out["spatial_features"] = torch.stack(
+            [b["spatial_features"] for b in batch], dim=0,
+        )
+        out["spatial_mask"] = torch.stack(
+            [b["spatial_mask"] for b in batch], dim=0,
+        )
     else:
         out["frames"] = [b["frames"] for b in batch]     # list of [max_w, F, C, H, W]
     return out

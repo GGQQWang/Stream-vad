@@ -54,10 +54,16 @@ def _extract_chunk_features(
     grid_thw = processed["video_grid_thw"].to(device)
 
     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-        window_batch = model.extract_window_features(
+        window_batch, spatial_features, spatial_mask = model.extract_window_features(
             pixel_values, grid_thw, valid_mask, return_stats=False,
+            return_spatial=True,
         )
-    return window_batch[0, valid_w.to(device)].detach().cpu()
+    w = valid_w.to(device)
+    return (
+        window_batch[0, w].detach().cpu(),
+        spatial_features[0, w].detach().cpu(),
+        spatial_mask[0, w].detach().cpu(),
+    )
 
 
 def main() -> None:
@@ -155,9 +161,16 @@ def main() -> None:
             pass
 
         parts: List[torch.Tensor] = []
+        spatial_parts: List[torch.Tensor] = []
+        mask_parts: List[torch.Tensor] = []
         for ref in refs:
             batch = hivau_collate([dataset[ref.index]])
-            parts.append(_extract_chunk_features(model, processor, batch, device, compute_dtype))
+            pooled, spatial, smask = _extract_chunk_features(
+                model, processor, batch, device, compute_dtype,
+            )
+            parts.append(pooled)
+            spatial_parts.append(spatial)
+            mask_parts.append(smask)
 
         compressed = torch.cat(parts, dim=0).to(save_dtype)
         if compressed.shape[0] != first["n_total_windows"]:
@@ -165,10 +178,28 @@ def main() -> None:
                 f"{video_id}: extracted {compressed.shape[0]} windows, "
                 f"expected {first['n_total_windows']}"
             )
+
+        # pad per-window spatial tokens to the video's R_max
+        R_max = max(s.shape[1] for s in spatial_parts)
+        C = compressed.shape[-1]
+        n_windows = compressed.shape[0]
+        spatial_all = torch.zeros(
+            n_windows, R_max, C, dtype=save_dtype,
+        )
+        mask_all = torch.zeros(n_windows, R_max, dtype=torch.bool)
+        ptr = 0
+        for s, m in zip(spatial_parts, mask_parts):
+            n = s.shape[0]
+            spatial_all[ptr:ptr + n, :s.shape[1]] = s.to(save_dtype)
+            mask_all[ptr:ptr + n, :m.shape[1]] = m
+            ptr += n
+
         save_feature_cache_atomic(
             args.cache_root,
             video_id=video_id,
             compressed_features=compressed,
+            spatial_features=spatial_all,
+            spatial_mask=mask_all,
             metadata=metadata,
         )
         n_done += 1

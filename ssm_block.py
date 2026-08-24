@@ -321,6 +321,7 @@ class SSMBlock(nn.Module):
         self,
         x: torch.Tensor,
         state: Optional[Dict[int, SSMState]] = None,
+        return_internal: bool = False,
     ) -> Tuple[torch.Tensor, Dict[int, SSMState]]:
         """Differentiable chunk forward with SSM state carry.
 
@@ -328,10 +329,15 @@ class SSMBlock(nn.Module):
             x: ``[B, T, d_input]``  — one chunk of window vectors.
             state: ``{layer_idx: SSMState}``  from previous chunk,
                   or ``None`` for the first chunk of a video.
+            return_internal: also return the per-window internal temporal
+                  representation (out_norm output, pre-out_proj),
+                  ``[B, T, d_model]``.  Backward-compatible: defaults to
+                  False.
 
         Returns:
             output: ``[B, T, llm_hidden]``
             new_state: ``{layer_idx: SSMState}``  for next chunk.
+            internal: ``[B, T, d_model]``  (only when return_internal=True)
         """
         h = self.in_proj(x)                                        # [B, T, d_model]
 
@@ -359,7 +365,11 @@ class SSMBlock(nn.Module):
             h = h + residual
 
         h = self.out_norm(h)
-        return self.out_proj(h), new_state
+        internal = h                                            # [B, T, d_model]
+        output = self.out_proj(h)                               # [B, T, llm_hidden]
+        if return_internal:
+            return output, new_state, internal
+        return output, new_state
 
     # ------------------------------------------------------------------
     # Streaming inference (step-by-step, cache-driven, no grad)

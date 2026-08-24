@@ -71,6 +71,7 @@ from ibq_utils import (
     load_codebook,
     load_ibq_cache,
 )
+from world_model import WorldModelBranch
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +520,14 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
-        # world-model auxiliary predictor:
-        #   projected causal SSM representation [llm_hidden]  (ssm_out from
-        #   SSMBlock.out_proj, which maps the internal Mamba dim to the LLM
-        #   hidden size)
-        #   -> compact latent [d_ssm]
-        #   -> IBQ codebook embedding [IBQ_CODE_EMBED_DIM]
-        # Logits are computed as a dot product against the FROZEN IBQ
-        # codebook (a non-persistent buffer loaded from the IBQ cache at
-        # startup); no trainable [V, H] output layer is needed.
-        # Training-only; discarded at inference.
-        self.world_predictor = nn.Sequential(
-            nn.Linear(llm_hidden, d_ssm),
-            nn.GELU(),
-            nn.LayerNorm(d_ssm),
-            nn.Linear(d_ssm, IBQ_CODE_EMBED_DIM),
+        # world-model auxiliary branch (training-only): SSM internal
+        # temporal hidden -> predicted delta; current spatial tokens +
+        # delta token -> autoregressive IBQ visual decoder.  The frozen
+        # IBQ codebook is a non-persistent buffer loaded from the IBQ
+        # cache at startup; logits are per-position dot products against
+        # it, so no trainable [V, H] output layer exists.
+        self.world_branch = WorldModelBranch(
+            llm_hidden=llm_hidden, d_ssm=d_ssm,
         )
         self.register_buffer(
             "ibq_codebook",
@@ -548,24 +542,6 @@ class StreamingVADGenerationModel(nn.Module):
         # Full Qwen model with LoRA
         self.qwen = qwen
 
-    def world_logits(self, h: torch.Tensor) -> torch.Tensor:
-        """Codebook logits via dot product with the frozen IBQ embedding."""
-        expected_dim = self.world_predictor[0].in_features
-        if h.shape[-1] != expected_dim:
-            raise RuntimeError(
-                f"world_predictor input dim mismatch: "
-                f"got {h.shape[-1]}, expected {expected_dim}, "
-                f"shape={tuple(h.shape)}"
-            )
-        z = self.world_predictor(h)                     # [..., E]
-        if z.shape[-1] != self.ibq_codebook.shape[-1]:
-            raise RuntimeError(
-                f"IBQ embedding dim mismatch: "
-                f"predictor={z.shape[-1]}, "
-                f"codebook={self.ibq_codebook.shape[-1]}"
-            )
-        return F.linear(z, self.ibq_codebook)           # [..., V]
-
     def encode_window_features(
         self,
         window_batch: torch.Tensor,
@@ -573,6 +549,7 @@ class StreamingVADGenerationModel(nn.Module):
         chunk_video_ids: List[str],
         ssm_state_cache: dict,
         training: bool = True,
+        return_internal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """SSM + gated residual over precomputed per-window visual vectors."""
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
@@ -583,6 +560,13 @@ class StreamingVADGenerationModel(nn.Module):
             device=ssm_param.device,
             dtype=ssm_param.dtype,
         )
+        h_internal = None
+        if return_internal:
+            h_internal = torch.zeros(
+                window_batch.shape[0], window_batch.shape[1],
+                self.ssm.in_proj[0].out_features,
+                device=ssm_param.device, dtype=ssm_param.dtype,
+            )
         for b in range(window_batch.shape[0]):
             vid = chunk_video_ids[b]
             bw = valid_w[valid_b == b]
@@ -598,7 +582,15 @@ class StreamingVADGenerationModel(nn.Module):
                     f"SSM_STATE video_id={vid} valid_windows={len(bw)} "
                     f"reuse_prev={had_prev} detached={bool(training and had_prev)}"
                 )
-            out, new_st = self.ssm.forward_chunk(wv, state=prev)
+            if return_internal:
+                out, new_st, internal = self.ssm.forward_chunk(
+                    wv, state=prev, return_internal=True,
+                )
+                h_internal[b, bw] = internal.squeeze(0).to(
+                    device=h_internal.device, dtype=h_internal.dtype,
+                )
+            else:
+                out, new_st = self.ssm.forward_chunk(wv, state=prev)
             ssm_out[b, bw] = out.squeeze(0).to(device=ssm_out.device, dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
@@ -607,6 +599,8 @@ class StreamingVADGenerationModel(nn.Module):
         alpha = torch.sigmoid(self.alpha_logit).to(device=delta.device, dtype=delta.dtype)
         base = window_batch.to(device=delta.device, dtype=delta.dtype)
         state_embeddings = base + alpha * delta
+        if return_internal:
+            return state_embeddings, window_batch, ssm_out, h_internal, ssm_state_cache
         return state_embeddings, window_batch, ssm_out, ssm_state_cache
 
     def extract_window_features(
@@ -615,8 +609,15 @@ class StreamingVADGenerationModel(nn.Module):
         video_grid_thw: torch.Tensor,
         valid_mask: torch.Tensor,
         return_stats: bool = False,
+        return_spatial: bool = False,
     ):
-        """Frozen ViT + temporal/spatial compression to per-window vectors."""
+        """Frozen ViT + temporal/spatial compression to per-window vectors.
+
+        With ``return_spatial=True``, also returns the pre-pooling spatial
+        compression tokens per window, padded to the batch's R_max:
+        ``spatial_features [B, max_w, R_max, llm_hidden]`` and
+        ``spatial_mask [B, max_w, R_max]`` (True = real token).
+        """
         B, max_w = valid_mask.shape
         device = valid_mask.device
         n_valid = video_grid_thw.shape[0]
@@ -645,9 +646,15 @@ class StreamingVADGenerationModel(nn.Module):
             clip_token_counts.append(count)
             ptr += tg
         clip_tokens = torch.split(tokens, clip_token_counts, dim=0)
-        window_vecs = torch.stack(
-            [self.spatial(ct)[0].mean(dim=0) for ct in clip_tokens], dim=0
-        )
+
+        spatial_list: List[torch.Tensor] = []
+        window_vecs_list: List[torch.Tensor] = []
+        for ct in clip_tokens:
+            merged, _ = self.spatial(ct)               # [R, C]
+            window_vecs_list.append(merged.mean(dim=0))
+            if return_spatial:
+                spatial_list.append(merged)
+        window_vecs = torch.stack(window_vecs_list, dim=0)
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
         window_batch = torch.zeros(
             B, max_w, self.llm_hidden,
@@ -655,9 +662,29 @@ class StreamingVADGenerationModel(nn.Module):
         )
         window_batch[valid_b, valid_w] = window_vecs
 
+        spatial_features = None
+        spatial_mask = None
+        if return_spatial:
+            R_max = max(s.shape[0] for s in spatial_list)
+            C = window_vecs.shape[-1]
+            spatial_features = torch.zeros(
+                B, max_w, R_max, C, device=device, dtype=window_vecs.dtype,
+            )
+            spatial_mask = torch.zeros(
+                B, max_w, R_max, device=device, dtype=torch.bool,
+            )
+            for i, s in enumerate(spatial_list):
+                b_i = int(valid_b[i].item())
+                w_i = int(valid_w[i].item())
+                spatial_features[b_i, w_i, :s.shape[0]] = s
+                spatial_mask[b_i, w_i, :s.shape[0]] = True
+
+        result = (window_batch,)
+        if return_spatial:
+            result = result + (spatial_features, spatial_mask)
         if return_stats:
-            return window_batch, stats
-        return window_batch
+            return result + (stats,)
+        return result if len(result) > 1 else result[0]
 
     def encode_stream(
         self,
@@ -766,57 +793,150 @@ def _world_model_loss(
     batch: dict,
     valid_mask_cpu: torch.Tensor,
     valid_mask: torch.Tensor,
-    ssm_out: torch.Tensor,
+    h_internal: torch.Tensor,          # [B, max_w, d_ssm]
+    spatial_features: torch.Tensor,    # [B, max_w, R_max, llm_hidden]
+    spatial_mask: torch.Tensor,        # [B, max_w, R_max] bool
     horizon: int,
-    frame_idx: int,
+    frames_per_clip: int,
+    lambda_delta: float,
+    logit_chunk_size: int,
+    run_baseline: bool,
     detach_states: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
-    """Bag-of-tokens IBQ prediction CE from the projected SSM representation.
+    """Autoregressive IBQ prediction + temporal-delta objective.
 
-    For each valid window ``w`` of batch item ``b``: the predictor maps
-    ``ssm_out[b, w]`` (the causal SSM state after window ``w``) to a single
-    shared distribution over the IBQ codebook, and the loss is the mean CE
-    over the tokens of a randomly sampled frame of window
-    ``chunk_start + w + horizon``.  Windows without a future target are
-    skipped.
+    For each valid window ``w`` of batch item ``b`` with an existing
+    future window ``chunk_start + w + horizon`` in the IBQ cache:
 
-    ``detach_states=True`` is used during predictor warmup so no gradient
-    flows into the SSM.
+    - one randomly sampled frame (independent per window pair) of the
+      future window is the autoregressive decoder target;
+    - the decoder memory is the window's spatial compression tokens
+      plus the predicted temporal delta of the SSM internal hidden;
+    - within-chunk future windows additionally supervise the delta
+      predictor via SmoothL1 against ``(h_{w+horizon} - h_w).detach()``.
+
+    ``run_baseline`` additionally evaluates the zero-delta shortcut
+    baseline under no_grad (delta token replaced by zeros) to quantify
+    how much the predicted dynamics contribute.
+
+    ``detach_states=True`` is used during predictor warmup so no
+    gradient flows into the SSM.
     """
-    states = ssm_out.detach() if detach_states else ssm_out
-    world_logits = model.world_logits(states)                       # [B, max_w, V]
-    log_probs = F.log_softmax(world_logits, dim=-1)                 # [B, max_w, V]
-
+    branch = model.world_branch
+    h_int = h_internal.detach() if detach_states else h_internal
+    codebook = model.ibq_codebook
     chunk_starts = batch["chunk_start"]
     video_ids = batch["video_id"]
-    losses: List[torch.Tensor] = []
+
+    ibq_ce_list: List[torch.Tensor] = []
+    delta_loss_list: List[torch.Tensor] = []
+    delta_zero_list: List[torch.Tensor] = []
+    baseline_pred_list: List[torch.Tensor] = []
+    baseline_zero_list: List[torch.Tensor] = []
     n_windows = 0
     n_tokens = 0
-    for b in range(states.shape[0]):
+
+    for b in range(h_internal.shape[0]):
         vid = video_ids[b]
         cs = int(chunk_starts[b])
         for w in range(valid_mask_cpu.shape[1]):
             if not bool(valid_mask_cpu[b, w]):
                 continue
+            # per-window-pair independent random frame
             try:
-                tgt = ibq_cache.get(vid, cs + w + horizon, frame_idx).long()
+                tgt = ibq_cache.get(
+                    vid, cs + w + horizon,
+                    random.randint(0, frames_per_clip - 1),
+                ).long()
             except IndexError:
-                continue                                     # no future window
-            tgt = tgt.to(device=log_probs.device)
-            per_window = -log_probs[b, w].gather(0, tgt).mean()
-            losses.append(per_window)
+                continue                                    # no future window
+            tgt = tgt.to(device=h_internal.device)
+
+            # within-chunk delta supervision (chunk tail: skip)
+            delta_target = None
+            if w + horizon < valid_mask_cpu.shape[1] and bool(
+                valid_mask_cpu[b, w + horizon]
+            ):
+                delta_target = (h_int[b, w + horizon] - h_int[b, w]).detach()
+
+            C_t = spatial_features[b, w].to(device=h_internal.device)
+            m_t = spatial_mask[b, w].to(device=h_internal.device)
+
+            ibq_ce, loss_delta = branch.forward_once(
+                C_t, m_t, h_int[b, w], codebook, tgt,
+                delta_target=delta_target,
+                logit_chunk_size=logit_chunk_size,
+            )
+            ibq_ce_list.append(ibq_ce)
+            if delta_target is not None:
+                delta_loss_list.append(loss_delta)
+                delta_zero_list.append(
+                    F.smooth_l1_loss(
+                        torch.zeros_like(delta_target), delta_target,
+                    ).detach()
+                )
             n_windows += 1
             n_tokens += int(tgt.numel())
-    if not losses:
-        # no future window has an IBQ target in this batch: return a zero
+
+            if run_baseline:
+                with torch.no_grad():
+                    ce_zero, _ = branch.forward_once(
+                        C_t, m_t, h_int[b, w], codebook, tgt,
+                        delta_target=None,
+                        logit_chunk_size=logit_chunk_size,
+                        zero_delta=True,
+                    )
+                    baseline_pred_list.append(ibq_ce.detach())
+                    baseline_zero_list.append(ce_zero.detach())
+
+    if not ibq_ce_list:
+        # no future window had an IBQ target in this batch: return a zero
         # loss that is still connected to the autograd graph so
         # .backward() works when the warmup phase targets loss_world alone
-        zero_loss = world_logits.sum() * 0.0
-        return zero_loss, {"num_world_windows": 0, "num_world_tokens": 0}
-    return torch.stack(losses).mean(), {
+        z = branch.delta_forward(h_internal.sum(dim=(0, 1)))
+        zero_loss = z.sum() * 0.0
+        return zero_loss, {
+            "num_world_windows": 0,
+            "num_world_tokens": 0,
+            "loss_world_ibq": 0.0,
+            "loss_world_delta": 0.0,
+            "delta_zero_baseline": None,
+            "delta_gain": None,
+            "ibq_ce_pred_delta": None,
+            "ibq_ce_zero_delta": None,
+            "ibq_delta_gain": None,
+        }
+
+    loss_ibq = torch.stack(ibq_ce_list).mean()
+    if delta_loss_list:
+        loss_delta_avg = torch.stack(delta_loss_list).mean()
+        loss_world = loss_ibq + lambda_delta * loss_delta_avg
+    else:
+        # keep the term graph-connected but zero
+        loss_delta_avg = loss_ibq * 0.0
+        loss_world = loss_ibq
+
+    def _mean(vals):
+        return float(torch.stack(vals).mean().item()) if vals else None
+
+    info = {
         "num_world_windows": n_windows,
         "num_world_tokens": n_tokens,
+        "loss_world_ibq": float(loss_ibq.detach().item()),
+        "loss_world_delta": float(loss_delta_avg.detach().item()),
+        "delta_zero_baseline": _mean(delta_zero_list),
+        "delta_gain": (
+            _mean(delta_zero_list) - float(loss_delta_avg.detach().item())
+            if delta_zero_list else None
+        ),
+        "ibq_ce_pred_delta": _mean(baseline_pred_list),
+        "ibq_ce_zero_delta": _mean(baseline_zero_list),
+        "ibq_delta_gain": (
+            _mean(baseline_zero_list) - _mean(baseline_pred_list)
+            if baseline_zero_list else None
+        ),
     }
+    return loss_world, info
 
 
 def _verify_attention_backend(model: nn.Module, requested: str) -> None:
@@ -1631,9 +1751,15 @@ def main():
     parser.add_argument("--world-horizon", type=int, default=1,
                        help="predict the IBQ tokens of window t+horizon")
     parser.add_argument("--world-warmup-steps", type=int, default=0,
-                       help="first N optimizer steps train ONLY the world predictor (h_t detached)")
+                       help="first N optimizer steps train ONLY the world branch (h_t detached)")
     parser.add_argument("--ibq-cache-root", default="",
                        help="IBQ token cache root for the world-model loss")
+    parser.add_argument("--lambda-delta", type=float, default=1.0,
+                       help="weight of the temporal-delta SmoothL1 term inside the world loss")
+    parser.add_argument("--world-logit-chunk-size", type=int, default=32,
+                       help="IBQ positions per logits chunk (memory bound)")
+    parser.add_argument("--world-baseline-every", type=int, default=100,
+                       help="run the zero-delta shortcut baseline every N optimizer steps (0 disables)")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -1723,18 +1849,14 @@ def main():
     model.ssm.debug_device = bool(args.debug_device)
 
     # one-time world-model shape sanity checks (not per batch)
-    assert model.world_predictor[0].in_features == model.llm_hidden, (
-        f"world_predictor expects {model.llm_hidden}-dim input, "
-        f"got {model.world_predictor[0].in_features}"
-    )
-    assert model.world_predictor[-1].out_features == IBQ_CODE_EMBED_DIM
+    assert model.world_branch.visual_proj.in_features == model.llm_hidden
+    assert model.world_branch.delta_predictor[-1].out_features == args.d_ssm
     assert model.ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
 
     if args.lambda_world <= 0:
-        # world model disabled: freeze the predictor so it costs no
-        # optimizer memory and receives no gradients (the output layer
-        # alone has ~67M parameters)
-        for p in model.world_predictor.parameters():
+        # world model disabled: freeze the branch so it costs no
+        # optimizer memory and receives no gradients
+        for p in model.world_branch.parameters():
             p.requires_grad = False
 
     # ---- param counts ----
@@ -1760,6 +1882,7 @@ def main():
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
         anomaly_video_root=args.anomaly_video_root or None,
+        require_spatial=(args.lambda_world > 0),
     )
     from hivau_dataset import hivau_collate
     from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
@@ -1793,6 +1916,7 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             anomaly_video_root=args.anomaly_video_root or None,
+        require_spatial=(args.lambda_world > 0),
         )
         if args.objective in ("answer_ce", "score_token"):
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
@@ -1894,36 +2018,44 @@ def main():
         model.ssm.load_state_dict(ckpt["ssm"])
         model.adapter.load_state_dict(ckpt["adapter"])
         world_predictor_compatible = True
-        if "world_predictor" in ckpt:
+        if "world_branch" in ckpt:
             if _state_dict_shapes_match(
-                model.world_predictor, ckpt["world_predictor"],
+                model.world_branch, ckpt["world_branch"],
             ):
-                model.world_predictor.load_state_dict(ckpt["world_predictor"])
+                model.world_branch.load_state_dict(ckpt["world_branch"])
             else:
-                # keep the freshly initialized predictor; never partially
+                # keep the freshly initialized branch; never partially
                 # load an incompatible state dict
                 world_predictor_compatible = False
                 print(
-                    "WARNING: world_predictor checkpoint is incompatible "
+                    "WARNING: world_branch checkpoint is incompatible "
                     "with the current architecture; keeping the newly "
-                    "initialized world_predictor."
+                    "initialized world branch."
                 )
                 if args.lambda_world > 0:
                     print(
-                        "WARNING: world_predictor is newly initialized and "
+                        "WARNING: the world branch is newly initialized and "
                         "will be trained from scratch while the other "
                         "compatible modules are resumed."
                     )
+        elif "world_predictor" in ckpt:
+            # legacy bag-of-tokens checkpoint: never load into the new
+            # autoregressive branch
+            world_predictor_compatible = False
+            print(
+                "WARNING: checkpoint contains the legacy world_predictor; "
+                "the new world branch is freshly initialized."
+            )
         else:
-            # checkpoint predates the world predictor; the predictor stays
-            # fresh.  If it is trainable (lambda_world > 0) the saved
-            # optimizer state also lacks its slots.
+            # checkpoint predates the world model; the branch stays fresh.
+            # If it is trainable (lambda_world > 0) the saved optimizer
+            # state also lacks its slots.
             if args.lambda_world > 0:
                 world_predictor_compatible = False
                 print(
-                    "WARNING: checkpoint predates world_predictor; the "
-                    "predictor is newly initialized and the optimizer state "
-                    "will be reset."
+                    "WARNING: checkpoint predates the world model; the "
+                    "world branch is newly initialized and the optimizer "
+                    "state will be reset."
                 )
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
@@ -1952,7 +2084,7 @@ def main():
             training_state_reset = True
             print(
                 "WARNING: optimizer state was not restored because "
-                "world_predictor architecture changed. Model weights for "
+                "the world branch architecture changed. Model weights for "
                 "compatible modules were restored, but optimizer moments "
                 "are reinitialized."
             )
@@ -1962,7 +2094,7 @@ def main():
         if training_state_reset:
             print(
                 "WARNING: optimizer and scheduler states were reset because "
-                "world_predictor architecture changed."
+                "the world branch architecture changed."
             )
 
         start_epoch = int(ckpt.get("epoch", 0)) + 1
@@ -1989,7 +2121,7 @@ def main():
         )
         if training_state_reset:
             print(
-                "Optimizer/scheduler were reset due to world_predictor "
+                "Optimizer/scheduler were reset due to the world branch "
                 "architecture change. Training continues from epoch "
                 f"{start_epoch} with fresh optimizer state."
             )
@@ -2001,7 +2133,7 @@ def main():
             "ssm": model.ssm.state_dict(),
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
-            "world_predictor": model.world_predictor.state_dict(),
+            "world_branch": model.world_branch.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -2059,6 +2191,13 @@ def main():
         train_score_losses: List[float] = []
         train_summary_losses: List[float] = []
         train_world_losses: List[float] = []
+        train_world_ibq_losses: List[float] = []
+        train_world_delta_losses: List[float] = []
+        world_delta_zero_list: List[float] = []
+        world_delta_gain_list: List[float] = []
+        world_ibq_pred_list: List[float] = []
+        world_ibq_zero_list: List[float] = []
+        world_ibq_gain_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2090,12 +2229,13 @@ def main():
 
                 # --- encode ---
                 ssm_out = None
+                h_internal = None
                 if "features" in batch:
                     window_batch = batch["features"].to(device=device, dtype=dtype)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, visual_windows, ssm_out, ssm_cache = model.encode_window_features(
+                        state_emb, visual_windows, ssm_out, h_internal, ssm_cache = model.encode_window_features(
                             window_batch, valid_mask, batch["video_id"], ssm_cache,
-                            training=True,
+                            training=True, return_internal=True,
                         )
                 else:
                     frames_list = batch["frames"]
@@ -2161,20 +2301,38 @@ def main():
                     use_world = (
                         args.lambda_world > 0
                         and ibq_cache is not None
-                        and ssm_out is not None
+                        and h_internal is not None
+                        and batch.get("spatial_features") is not None
                     )
-                    world_info = {"num_world_windows": 0, "num_world_tokens": 0}
+                    world_info = {
+                        "num_world_windows": 0,
+                        "num_world_tokens": 0,
+                        "loss_world_ibq": 0.0,
+                        "loss_world_delta": 0.0,
+                        "delta_zero_baseline": None,
+                        "delta_gain": None,
+                        "ibq_ce_pred_delta": None,
+                        "ibq_ce_zero_delta": None,
+                        "ibq_delta_gain": None,
+                    }
                     warmup_phase = False
                     if use_world:
                         warmup_phase = (
                             args.world_warmup_steps > 0
                             and global_step < args.world_warmup_steps
                         )
-                        frame_idx = random.randint(0, args.frames_per_clip - 1)
+                        run_baseline = (
+                            args.world_baseline_every > 0
+                            and global_step % args.world_baseline_every == 0
+                        )
                         loss_world, world_info = _world_model_loss(
                             model, ibq_cache, batch, valid_mask_cpu, valid_mask,
-                            ssm_out, args.world_horizon, frame_idx,
-                            detach_states=warmup_phase,
+                            h_internal,
+                            batch["spatial_features"].to(device=device),
+                            batch["spatial_mask"].to(device=device),
+                            args.world_horizon, args.frames_per_clip,
+                            args.lambda_delta, args.world_logit_chunk_size,
+                            run_baseline, detach_states=warmup_phase,
                         )
                     else:
                         loss_world = state_emb.new_zeros(())
@@ -2207,11 +2365,31 @@ def main():
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    if global_step % 500 == 0 and train_world_ibq_losses:
+                        writer.add_scalar("train/loss_world", finite_mean(train_world_losses[-500:]), global_step)
+                        writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses[-500:]), global_step)
+                        writer.add_scalar("train/loss_world_delta", finite_mean(train_world_delta_losses[-500:]), global_step)
+                        if world_delta_gain_list:
+                            writer.add_scalar("world/delta_gain", finite_mean(world_delta_gain_list[-500:]), global_step)
+                        if world_ibq_gain_list:
+                            writer.add_scalar("world/ibq_delta_gain", finite_mean(world_ibq_gain_list[-500:]), global_step)
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
                 train_world_losses.append(float(loss_world.detach().item()))
+                train_world_ibq_losses.append(float(world_info["loss_world_ibq"]))
+                train_world_delta_losses.append(float(world_info["loss_world_delta"]))
+                if world_info["delta_zero_baseline"] is not None:
+                    world_delta_zero_list.append(world_info["delta_zero_baseline"])
+                if world_info["delta_gain"] is not None:
+                    world_delta_gain_list.append(world_info["delta_gain"])
+                if world_info["ibq_ce_pred_delta"] is not None:
+                    world_ibq_pred_list.append(world_info["ibq_ce_pred_delta"])
+                if world_info["ibq_ce_zero_delta"] is not None:
+                    world_ibq_zero_list.append(world_info["ibq_ce_zero_delta"])
+                if world_info["ibq_delta_gain"] is not None:
+                    world_ibq_gain_list.append(world_info["ibq_delta_gain"])
                 num_valid_windows = float(valid.sum().item())
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
@@ -2443,6 +2621,18 @@ def main():
             writer.add_scalar("train/loss_summary", finite_mean(train_summary_losses), epoch)
             if train_world_losses:
                 writer.add_scalar("train/loss_world", finite_mean(train_world_losses), epoch)
+                writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses), epoch)
+                writer.add_scalar("train/loss_world_delta", finite_mean(train_world_delta_losses), epoch)
+            if world_delta_zero_list:
+                writer.add_scalar("world/delta_zero_baseline", finite_mean(world_delta_zero_list), epoch)
+            if world_delta_gain_list:
+                writer.add_scalar("world/delta_gain", finite_mean(world_delta_gain_list), epoch)
+            if world_ibq_pred_list:
+                writer.add_scalar("world/ibq_ce_pred_delta", finite_mean(world_ibq_pred_list), epoch)
+            if world_ibq_zero_list:
+                writer.add_scalar("world/ibq_ce_zero_delta", finite_mean(world_ibq_zero_list), epoch)
+            if world_ibq_gain_list:
+                writer.add_scalar("world/ibq_delta_gain", finite_mean(world_ibq_gain_list), epoch)
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
             writer.add_scalar("train/score_prob_min", score_prob_min_epoch, epoch)
             writer.add_scalar("train/score_prob_max", score_prob_max_epoch, epoch)
