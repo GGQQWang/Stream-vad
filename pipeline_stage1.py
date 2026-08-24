@@ -1786,9 +1786,16 @@ def main():
     parser.add_argument("--resume", default="",
                        help="path to a saved checkpoint dir (contains train_state.pt and lora_adapter/); "
                             "training continues from the next epoch with restored optimizer/scheduler")
+    parser.add_argument("--init-checkpoint", default="",
+                       help="path to a saved checkpoint dir for cross-stage initialization: "
+                            "restores model weights only (SSM/adapter/heads/queries/alpha/LoRA/"
+                            "world_branch); optimizer/scheduler stay fresh and training starts "
+                            "from epoch 0. Mutually exclusive with --resume.")
     args = parser.parse_args()
     if args.save_every < 1:
         raise ValueError("--save-every must be >= 1")
+    if args.resume and args.init_checkpoint:
+        raise ValueError("--resume and --init-checkpoint are mutually exclusive")
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -1992,12 +1999,15 @@ def main():
         print(f"World-model loss enabled: lambda_world={args.lambda_world}, "
               f"horizon={args.world_horizon}, ibq_cache={args.ibq_cache_root}")
 
-    # ---- resume ----
+    # ---- resume / init-checkpoint ----
     start_epoch = 0
     global_step = 0
     best_metric = 0.0
-    if args.resume:
-        resume_path = Path(args.resume)
+    init_only = bool(args.init_checkpoint) and not args.resume
+    ckpt_source = args.resume or args.init_checkpoint
+    if ckpt_source:
+        mode = "resume" if args.resume else "init-checkpoint"
+        resume_path = Path(ckpt_source)
         if resume_path.is_dir():
             state_path = resume_path / "train_state.pt"
             lora_dir = resume_path / "lora_adapter"
@@ -2005,9 +2015,9 @@ def main():
             state_path = resume_path
             lora_dir = resume_path.parent / "lora_adapter"
         if not state_path.is_file():
-            raise FileNotFoundError(f"resume checkpoint not found: {state_path}")
+            raise FileNotFoundError(f"{mode} checkpoint not found: {state_path}")
         if not lora_dir.is_dir():
-            raise FileNotFoundError(f"resume LoRA adapter not found: {lora_dir}")
+            raise FileNotFoundError(f"{mode} LoRA adapter not found: {lora_dir}")
 
         ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
 
@@ -2018,17 +2028,17 @@ def main():
                     "lora_r", "lora_alpha"):
             if key in ckpt and int(ckpt[key]) != int(getattr(args, key)):
                 raise ValueError(
-                    f"resume config mismatch: {key}={ckpt[key]!r}, "
+                    f"{mode} config mismatch: {key}={ckpt[key]!r}, "
                     f"expected {getattr(args, key)!r}"
                 )
         if "objective" in ckpt and ckpt["objective"] != args.objective:
             raise ValueError(
-                f"resume objective mismatch: checkpoint={ckpt['objective']!r}, "
+                f"{mode} objective mismatch: checkpoint={ckpt['objective']!r}, "
                 f"requested {args.objective!r}"
             )
         if "feature_cache_model_id" in ckpt and str(ckpt["feature_cache_model_id"]) != str(args.model_path):
             raise ValueError(
-                f"resume model mismatch: checkpoint feature_cache_model_id="
+                f"{mode} model mismatch: checkpoint feature_cache_model_id="
                 f"{ckpt['feature_cache_model_id']!r}, expected {args.model_path!r}"
             )
 
@@ -2089,59 +2099,71 @@ def main():
         # LoRA adapter (must stay trainable, otherwise training is a no-op)
         qwen.load_adapter(str(lora_dir), adapter_name="default", is_trainable=True)
 
-        # optimizer / scheduler state: restore only when the trainable
-        # parameter set matches the checkpoint, otherwise keep the fresh
-        # optimizer/scheduler created above
-        optimizer_restored = False
-        scheduler_restored = False
-        training_state_reset = False
-        if "optimizer" in ckpt and world_predictor_compatible:
-            optimizer.load_state_dict(ckpt["optimizer"])
-            optimizer_restored = True
-        elif "optimizer" in ckpt:
-            training_state_reset = True
-            print(
-                "WARNING: optimizer state was not restored because "
-                "the world branch architecture changed. Model weights for "
-                "compatible modules were restored, but optimizer moments "
-                "are reinitialized."
-            )
-        if "scheduler" in ckpt and optimizer_restored:
-            scheduler.load_state_dict(ckpt["scheduler"])
-            scheduler_restored = True
-        if training_state_reset:
-            print(
-                "WARNING: optimizer and scheduler states were reset because "
-                "the world branch architecture changed."
-            )
-
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        if start_epoch >= args.epochs:
-            raise ValueError(
-                f"resume checkpoint is at epoch {ckpt.get('epoch')} but "
-                f"--epochs={args.epochs}; pass --epochs greater than the "
-                "resumed epoch (total epochs of the whole run)"
-            )
-        if optimizer_restored:
-            global_step = int(ckpt.get("global_step", 0))
-        else:
-            global_step = 0
+        if args.resume:
+            # ---- same-stage continuation: restore training state too ----
+            # optimizer / scheduler state: restore only when the trainable
+            # parameter set matches the checkpoint, otherwise keep the fresh
+            # optimizer/scheduler created above
+            optimizer_restored = False
+            scheduler_restored = False
+            training_state_reset = False
+            if "optimizer" in ckpt and world_predictor_compatible:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                optimizer_restored = True
+            elif "optimizer" in ckpt:
+                training_state_reset = True
+                print(
+                    "WARNING: optimizer state was not restored because "
+                    "the world branch architecture changed. Model weights for "
+                    "compatible modules were restored, but optimizer moments "
+                    "are reinitialized."
+                )
+            if "scheduler" in ckpt and optimizer_restored:
+                scheduler.load_state_dict(ckpt["scheduler"])
+                scheduler_restored = True
             if training_state_reset:
                 print(
-                    "WARNING: global_step reset to 0 because "
-                    "optimizer/scheduler were reinitialized."
+                    "WARNING: optimizer and scheduler states were reset because "
+                    "the world branch architecture changed."
                 )
-        best_metric = float(ckpt.get("best_metric", 0.0))
-        print(
-            f"Resumed from epoch {start_epoch - 1}: global_step={global_step}, "
-            f"best_metric={best_metric:.4f}, "
-            f"training epochs {start_epoch}..{args.epochs - 1}"
-        )
-        if training_state_reset:
+
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            if start_epoch >= args.epochs:
+                raise ValueError(
+                    f"resume checkpoint is at epoch {ckpt.get('epoch')} but "
+                    f"--epochs={args.epochs}; pass --epochs greater than the "
+                    "resumed epoch (total epochs of the whole run)"
+                )
+            if optimizer_restored:
+                global_step = int(ckpt.get("global_step", 0))
+            else:
+                global_step = 0
+                if training_state_reset:
+                    print(
+                        "WARNING: global_step reset to 0 because "
+                        "optimizer/scheduler were reinitialized."
+                    )
+            best_metric = float(ckpt.get("best_metric", 0.0))
             print(
-                "Optimizer/scheduler were reset due to the world branch "
-                "architecture change. Training continues from epoch "
-                f"{start_epoch} with fresh optimizer state."
+                f"Resumed from epoch {start_epoch - 1}: global_step={global_step}, "
+                f"best_metric={best_metric:.4f}, "
+                f"training epochs {start_epoch}..{args.epochs - 1}"
+            )
+            if training_state_reset:
+                print(
+                    "Optimizer/scheduler were reset due to the world branch "
+                    "architecture change. Training continues from epoch "
+                    f"{start_epoch} with fresh optimizer state."
+                )
+        else:
+            # ---- init-checkpoint: weights only, fresh training state ----
+            start_epoch = 0
+            global_step = 0
+            best_metric = 0.0
+            print(
+                "Initialized model weights from checkpoint "
+                f"{ckpt.get('epoch', '?')}; optimizer/scheduler/global_step "
+                "kept fresh. Training starts from epoch 0 as a new stage."
             )
 
     def save_stage1_checkpoint(ckpt_dir: Path, epoch: int) -> None:
