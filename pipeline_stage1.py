@@ -879,15 +879,28 @@ def _world_model_loss(
             n_tokens += int(tgt.numel())
 
             if run_baseline:
-                with torch.no_grad():
-                    ce_zero, _ = branch.forward_once(
-                        C_t, m_t, h_int[b, w], codebook, tgt,
-                        delta_target=None,
-                        logit_chunk_size=logit_chunk_size,
-                        zero_delta=True,
-                    )
-                    baseline_pred_list.append(ibq_ce.detach())
-                    baseline_zero_list.append(ce_zero.detach())
+                # eval-mode recompute of BOTH terms so the gain is not
+                # polluted by different dropout masks between two
+                # train-mode forwards
+                was_training = branch.training
+                branch.eval()
+                try:
+                    with torch.no_grad():
+                        ce_pred_eval, _ = branch.forward_once(
+                            C_t, m_t, h_int[b, w], codebook, tgt,
+                            delta_target=None,
+                            logit_chunk_size=logit_chunk_size,
+                        )
+                        ce_zero_eval, _ = branch.forward_once(
+                            C_t, m_t, h_int[b, w], codebook, tgt,
+                            delta_target=None,
+                            logit_chunk_size=logit_chunk_size,
+                            zero_delta=True,
+                        )
+                        baseline_pred_list.append(ce_pred_eval.detach())
+                        baseline_zero_list.append(ce_zero_eval.detach())
+                finally:
+                    branch.train(was_training)
 
     if not ibq_ce_list:
         # no future window had an IBQ target in this batch: return a zero
@@ -1942,6 +1955,11 @@ def main():
     # ---- world-model IBQ cache (optional) ----
     ibq_cache = None
     if args.lambda_world > 0:
+        if not args.feature_cache_root:
+            raise ValueError(
+                "new world model requires v3 feature cache with "
+                "spatial features"
+            )
         if not args.ibq_cache_root:
             raise ValueError("--lambda-world > 0 requires --ibq-cache-root")
         probe_video = train_ds.samples[0]["video_id"]

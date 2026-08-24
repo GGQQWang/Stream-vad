@@ -761,13 +761,13 @@ def hivau_collate(batch: List[dict]) -> dict:
     }
     if "features" in batch[0]:
         out["features"] = torch.stack([b["features"] for b in batch], dim=0)
-    if batch[0].get("spatial_features") is not None:
-        out["spatial_features"] = torch.stack(
-            [b["spatial_features"] for b in batch], dim=0,
-        )
-        out["spatial_mask"] = torch.stack(
-            [b["spatial_mask"] for b in batch], dim=0,
-        )
+        if batch[0].get("spatial_features") is not None:
+            out["spatial_features"] = torch.stack(
+                [b["spatial_features"] for b in batch], dim=0,
+            )
+            out["spatial_mask"] = torch.stack(
+                [b["spatial_mask"] for b in batch], dim=0,
+            )
     else:
         out["frames"] = [b["frames"] for b in batch]     # list of [max_w, F, C, H, W]
     return out

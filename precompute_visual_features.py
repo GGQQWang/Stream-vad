@@ -154,10 +154,14 @@ def main() -> None:
                 max_pixels=args.max_pixels,
                 model_id=args.model_path,
                 map_location="cpu",
+                require_spatial=True,
             )
+            # cache already has valid spatial_features: skip
             n_skip += 1
             continue
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
+            # no cache entry, or a v2 cache without spatial fields:
+            # recompute and overwrite with a v3 cache
             pass
 
         parts: List[torch.Tensor] = []
