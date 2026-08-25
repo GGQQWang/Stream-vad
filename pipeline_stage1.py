@@ -2296,75 +2296,43 @@ def main():
                             pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
                         )
 
-                # --- score all valid windows exactly once ---
-                valid = valid_mask & (labels >= 0)
-                valid_b, valid_w = valid.nonzero(as_tuple=True)
-                if len(valid_b) == 0:
-                    raise RuntimeError("score_token batch has no valid windows")
-                all_state = state_emb[valid_b, valid_w]
-                score_logits_flat = model.forward_score_token(
-                    all_state, embed_fn, tokenizer, args.status_prompt,
+                # --- early world warmup determination (before any VAD work) ---
+                use_world = (
+                    args.lambda_world > 0
+                    and ibq_cache is not None
+                    and h_internal is not None
+                    and batch.get("spatial_features") is not None
                 )
-                score_logits = torch.zeros(
-                    (B, max_w),
-                    device=score_logits_flat.device,
-                    dtype=score_logits_flat.dtype,
-                )
-                score_logits[valid_b, valid_w] = score_logits_flat
+                warmup_phase = False
+                if use_world:
+                    warmup_phase = (
+                        args.world_warmup_steps > 0
+                        and global_step < args.world_warmup_steps
+                    )
 
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
 
-                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    loss_score = score_bce_loss(
-                        score_logits,
-                        labels,
-                        valid_mask,
-                        normalizer=valid_mask.numel(),
-                    )
+                world_info = {
+                    "num_world_windows": 0,
+                    "num_world_tokens": 0,
+                    "loss_world_ibq": 0.0,
+                    "loss_world_delta": 0.0,
+                    "delta_zero_baseline": None,
+                    "delta_gain": None,
+                    "ibq_ce_pred_delta": None,
+                    "ibq_ce_zero_delta": None,
+                    "ibq_delta_gain": None,
+                }
 
-                    triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
-                    if triggers:
-                        trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
-                        trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
-                        trigger_states = state_emb[trigger_b, trigger_w]
-                        summary_texts = [str(t[2]["text"]) for t in triggers]
-                        loss_summary, summary_info = summary_ce_loss(
-                            model.qwen, embed_fn, tokenizer,
-                            trigger_states, model.summary_query, summary_texts,
-                        )
-                    else:
-                        loss_summary = state_emb.new_zeros(())
-                        summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
-
-                    # --- world-model auxiliary loss (training-only, needs cache mode) ---
-                    use_world = (
-                        args.lambda_world > 0
-                        and ibq_cache is not None
-                        and h_internal is not None
-                        and batch.get("spatial_features") is not None
+                if warmup_phase:
+                    # pure world warmup: skip the Qwen score forward, the
+                    # score loss, and the summary loss entirely
+                    run_baseline = (
+                        args.world_baseline_every > 0
+                        and global_step % args.world_baseline_every == 0
                     )
-                    world_info = {
-                        "num_world_windows": 0,
-                        "num_world_tokens": 0,
-                        "loss_world_ibq": 0.0,
-                        "loss_world_delta": 0.0,
-                        "delta_zero_baseline": None,
-                        "delta_gain": None,
-                        "ibq_ce_pred_delta": None,
-                        "ibq_ce_zero_delta": None,
-                        "ibq_delta_gain": None,
-                    }
-                    warmup_phase = False
-                    if use_world:
-                        warmup_phase = (
-                            args.world_warmup_steps > 0
-                            and global_step < args.world_warmup_steps
-                        )
-                        run_baseline = (
-                            args.world_baseline_every > 0
-                            and global_step % args.world_baseline_every == 0
-                        )
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                         loss_world, world_info = _world_model_loss(
                             model, ibq_cache, batch, valid_mask_cpu, valid_mask,
                             h_internal,
@@ -2372,21 +2340,79 @@ def main():
                             batch["spatial_mask"].to(device=device),
                             args.world_horizon, args.frames_per_clip,
                             args.lambda_delta, args.world_logit_chunk_size,
-                            run_baseline, detach_states=warmup_phase,
+                            run_baseline, detach_states=True,
                         )
-                    else:
-                        loss_world = state_emb.new_zeros(())
-
-                    if use_world and warmup_phase:
-                        # predictor warmup: only the world predictor trains
                         raw_total_loss = loss_world
-                    else:
+                        total_loss = raw_total_loss / group_size
+                    # placeholders for logging / the defensive grad check
+                    loss_score = state_emb.new_zeros(())
+                    loss_summary = state_emb.new_zeros(())
+                    score_logits = None
+                    summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
+                    skipped_summary = 0
+                else:
+                    # --- score all valid windows exactly once ---
+                    valid = valid_mask & (labels >= 0)
+                    valid_b, valid_w = valid.nonzero(as_tuple=True)
+                    if len(valid_b) == 0:
+                        raise RuntimeError("score_token batch has no valid windows")
+                    all_state = state_emb[valid_b, valid_w]
+                    score_logits_flat = model.forward_score_token(
+                        all_state, embed_fn, tokenizer, args.status_prompt,
+                    )
+                    score_logits = torch.zeros(
+                        (B, max_w),
+                        device=score_logits_flat.device,
+                        dtype=score_logits_flat.dtype,
+                    )
+                    score_logits[valid_b, valid_w] = score_logits_flat
+
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                        loss_score = score_bce_loss(
+                            score_logits,
+                            labels,
+                            valid_mask,
+                            normalizer=valid_mask.numel(),
+                        )
+
+                        triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
+                        if triggers:
+                            trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
+                            trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
+                            trigger_states = state_emb[trigger_b, trigger_w]
+                            summary_texts = [str(t[2]["text"]) for t in triggers]
+                            loss_summary, summary_info = summary_ce_loss(
+                                model.qwen, embed_fn, tokenizer,
+                                trigger_states, model.summary_query, summary_texts,
+                            )
+                        else:
+                            loss_summary = state_emb.new_zeros(())
+                            summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
+
+                        # --- world-model auxiliary loss (joint phase) ---
+                        if use_world:
+                            run_baseline = (
+                                args.world_baseline_every > 0
+                                and global_step % args.world_baseline_every == 0
+                            )
+                            loss_world, world_info = _world_model_loss(
+                                model, ibq_cache, batch, valid_mask_cpu, valid_mask,
+                                h_internal,
+                                batch["spatial_features"].to(device=device),
+                                batch["spatial_mask"].to(device=device),
+                                args.world_horizon, args.frames_per_clip,
+                                args.lambda_delta, args.world_logit_chunk_size,
+                                run_baseline, detach_states=False,
+                            )
+                        else:
+                            loss_world = state_emb.new_zeros(())
+
                         raw_total_loss = (
                             args.lambda_score * loss_score
                             + args.lambda_sum * loss_summary
                             + args.lambda_world * loss_world
                         )
-                    total_loss = raw_total_loss / group_size
+                        total_loss = raw_total_loss / group_size
 
                 if not total_loss.requires_grad:
                     raise RuntimeError(
@@ -2430,7 +2456,7 @@ def main():
                     world_ibq_zero_list.append(world_info["ibq_ce_zero_delta"])
                 if world_info["ibq_delta_gain"] is not None:
                     world_ibq_gain_list.append(world_info["ibq_delta_gain"])
-                num_valid_windows = float(valid.sum().item())
+                num_valid_windows = float(valid.sum().item()) if not warmup_phase else 0.0
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
                 train_summary_triggers.append(num_summary_triggers)
@@ -2438,23 +2464,24 @@ def main():
                 train_valid_windows_total += num_valid_windows
                 train_summary_triggers_total += num_summary_triggers
                 train_skipped_summary_total += float(skipped_summary)
-                with torch.no_grad():
-                    valid_probs = torch.sigmoid(score_logits[valid]).detach().float()
-                    valid_targets = labels[valid].detach().float()
-                    train_score_prob_mean.append(float(valid_probs.mean().item()))
-                    train_score_prob_min.append(float(valid_probs.min().item()))
-                    train_score_prob_max.append(float(valid_probs.max().item()))
-                    train_soft_target_mean.append(float(valid_targets.mean().item()))
-                    train_score_prob_sum += float(valid_probs.sum().item())
-                    train_soft_target_sum += float(valid_targets.sum().item())
-                    train_score_prob_min_global = min(
-                        train_score_prob_min_global,
-                        float(valid_probs.min().item()),
-                    )
-                    train_score_prob_max_global = max(
-                        train_score_prob_max_global,
-                        float(valid_probs.max().item()),
-                    )
+                if not warmup_phase:
+                    with torch.no_grad():
+                        valid_probs = torch.sigmoid(score_logits[valid]).detach().float()
+                        valid_targets = labels[valid].detach().float()
+                        train_score_prob_mean.append(float(valid_probs.mean().item()))
+                        train_score_prob_min.append(float(valid_probs.min().item()))
+                        train_score_prob_max.append(float(valid_probs.max().item()))
+                        train_soft_target_mean.append(float(valid_targets.mean().item()))
+                        train_score_prob_sum += float(valid_probs.sum().item())
+                        train_soft_target_sum += float(valid_targets.sum().item())
+                        train_score_prob_min_global = min(
+                            train_score_prob_min_global,
+                            float(valid_probs.min().item()),
+                        )
+                        train_score_prob_max_global = max(
+                            train_score_prob_max_global,
+                            float(valid_probs.max().item()),
+                        )
 
                 _clear_finished_states(model, batch, ssm_cache)
 

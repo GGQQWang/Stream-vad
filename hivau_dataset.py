@@ -433,6 +433,10 @@ class HIVAUDataset(Dataset):
         self.feature_cache_root = Path(feature_cache_root) if feature_cache_root else None
         self.feature_cache_model_id = feature_cache_model_id
         self.require_spatial = bool(require_spatial)
+        # single-video cache: the sampler yields chunks of the same video
+        # consecutively, so one torch.load per video is enough
+        self._cached_video_id = None
+        self._cached_cache = None
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.use_abnormal_video_ids = anomaly_video_root is not None and str(anomaly_video_root) != ""
@@ -601,20 +605,23 @@ class HIVAUDataset(Dataset):
         n_actual = ci_end - ci_start
 
         if self.feature_cache_root is not None:
-            cache = load_feature_cache(
-                self.feature_cache_root,
-                video_id=meta["video_id"],
-                n_windows=meta["n_total_windows"],
-                n_frames=meta["n_frames"],
-                fps=meta["fps"],
-                frames_per_clip=self.total_frames,
-                sample_interval=self.sample_interval,
-                min_pixels=self.min_pixels,
-                max_pixels=self.max_pixels,
-                model_id=self.feature_cache_model_id,
-                map_location="cpu",
-            )
-            features = cache["compressed_features"][ci_start:ci_end].to(torch.float32)
+            if self._cached_video_id != meta["video_id"]:
+                self._cached_video_id = meta["video_id"]
+                self._cached_cache = load_feature_cache(
+                    self.feature_cache_root,
+                    video_id=meta["video_id"],
+                    n_windows=meta["n_total_windows"],
+                    n_frames=meta["n_frames"],
+                    fps=meta["fps"],
+                    frames_per_clip=self.total_frames,
+                    sample_interval=self.sample_interval,
+                    min_pixels=self.min_pixels,
+                    max_pixels=self.max_pixels,
+                    model_id=self.feature_cache_model_id,
+                    map_location="cpu",
+                )
+            cache = self._cached_cache
+            features = cache["compressed_features"][ci_start:ci_end]
             if n_actual < self.max_windows:
                 pad = torch.zeros(
                     self.max_windows - n_actual, features.shape[-1],
@@ -625,7 +632,9 @@ class HIVAUDataset(Dataset):
             spatial_features = None
             spatial_mask = None
             if self.require_spatial:
-                sf = cache["spatial_features"][ci_start:ci_end].to(torch.float32)
+                # keep the cache's original dtype (bf16); training casts
+                # on the device as needed
+                sf = cache["spatial_features"][ci_start:ci_end]
                 sm = cache["spatial_mask"][ci_start:ci_end].bool()
                 R_max = sf.shape[1]
                 if n_actual < self.max_windows:
