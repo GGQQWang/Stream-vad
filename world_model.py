@@ -8,27 +8,26 @@ Architecture:
     pre-out_proj; exposed via SSMBlock.forward_chunk(return_internal=True))
 
         C_t --visual_proj--> [R, D]
-        h_t --delta_predictor--> delta_pred [d_ssm]
-                                 (supervised by (h_{t+k} - h_t).detach(),
-                                  SmoothL1)
-        delta_pred --delta_proj--> [1, D]
+        h_t is used DIRECTLY as the temporal token (no MLP / Linear /
+        LayerNorm; d_ssm must equal decoder_dim)
 
-        memory = concat([visual_tokens; delta_token])  -> [R+1, D]
+        memory = concat([visual_tokens; temporal_token]) -> [R+1, D]
 
     An autoregressive TransformerDecoder (teacher forcing, causal mask,
     2D positional embeddings) predicts the future frame's IBQ token
     sequence; each of the 392 positions gets its OWN [131072] logits
     via a dot product with the frozen IBQ codebook.
 
-    A zero-delta baseline forward (delta_token replaced by zeros,
-    no_grad) quantifies how much the predicted dynamics contribute.
+    A zero-temporal baseline forward (temporal token replaced by zeros,
+    no_grad) quantifies how much the SSM temporal representation
+    contributes: ibq_temporal_gain = CE_zero - CE_temporal.
 
 Only the module definition and the per-window forward live here; the
 training loop in pipeline_stage1.py owns data plumbing and loss
 accumulation.
 """
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -51,7 +50,7 @@ assert IBQ_GRID_ROWS * IBQ_GRID_COLS == IBQ_TOKENS_PER_FRAME, (
 
 
 class WorldModelBranch(nn.Module):
-    """Delta predictor + autoregressive IBQ visual decoder.
+    """Autoregressive IBQ visual decoder with a direct temporal token.
 
     Training-only; discarded at inference.  All tensors flow per
     window, never as a shared batch over windows.
@@ -71,23 +70,15 @@ class WorldModelBranch(nn.Module):
             f"IBQ_CODE_EMBED_DIM={IBQ_CODE_EMBED_DIM} must equal "
             f"decoder_dim={decoder_dim}"
         )
+        assert d_ssm == decoder_dim, (
+            f"h_internal dim {d_ssm} must equal decoder_dim {decoder_dim}: "
+            "the temporal token is used directly without projection"
+        )
         self.d_ssm = d_ssm
         self.decoder_dim = decoder_dim
 
-        # --- temporal delta predictor: h_t -> predicted h_{t+k} - h_t ---
-        self.delta_predictor = nn.Sequential(
-            nn.Linear(d_ssm, d_ssm),
-            nn.GELU(),
-            nn.LayerNorm(d_ssm),
-            nn.Linear(d_ssm, d_ssm),
-        )
-
-        # --- projections into the decoder space ---
+        # --- current visual context projection ---
         self.visual_proj = nn.Linear(llm_hidden, decoder_dim)
-        self.delta_proj = nn.Sequential(
-            nn.Linear(d_ssm, decoder_dim),
-            nn.LayerNorm(decoder_dim),
-        )
 
         # --- decoder input tokens ---
         self.world_bos = nn.Parameter(torch.randn(1, decoder_dim) * 0.02)
@@ -117,22 +108,12 @@ class WorldModelBranch(nn.Module):
         cols = torch.arange(IBQ_GRID_COLS, device=device).repeat(IBQ_GRID_ROWS)
         return self.row_pos[rows] + self.col_pos[cols]          # [392, D]
 
-    def delta_forward(
-        self,
-        h_t: torch.Tensor,
-    ) -> torch.Tensor:
-        """Predicted temporal delta from the SSM internal hidden."""
-        assert h_t.shape[-1] == self.d_ssm, (
-            f"h_t dim mismatch: got {h_t.shape[-1]}, expected {self.d_ssm}"
-        )
-        return self.delta_predictor(h_t)                        # [..., d_ssm]
-
     # ------------------------------------------------------------------
     def decode_ce(
         self,
         spatial_tokens: torch.Tensor,       # [R, 3584]
         spatial_mask: torch.Tensor,         # [R] bool
-        delta_pred: torch.Tensor,           # [d_ssm]
+        temporal_token: torch.Tensor,       # [d_ssm] used directly
         ibq_codebook: torch.Tensor,         # [V, E] frozen
         tgt: torch.Tensor,                  # [392] long
         logit_chunk_size: int = 32,
@@ -141,20 +122,24 @@ class WorldModelBranch(nn.Module):
 
         Returns the mean per-token CE over all 392 positions.  Logits
         are computed in chunks of ``logit_chunk_size`` positions to
-        bound peak memory (a full [392, 131072] tensor is ~205MB fp32).
+        bound peak memory.
         """
         T = IBQ_TOKENS_PER_FRAME
         assert tgt.numel() == T, f"target has {tgt.numel()} tokens, expected {T}"
         assert ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, self.decoder_dim), (
             f"codebook shape {tuple(ibq_codebook.shape)}"
         )
+        assert temporal_token.shape[-1] == self.decoder_dim, (
+            f"temporal token dim {temporal_token.shape[-1]}, "
+            f"expected {self.decoder_dim}"
+        )
         device = spatial_tokens.device
 
-        # --- memory: current visual tokens + delta token ---
+        # --- memory: current visual tokens + direct temporal token ---
         vis = self.visual_proj(spatial_tokens)                 # [R, D]
         vis = vis[spatial_mask.bool()]                          # [R_real, D]
-        delta_token = self.delta_proj(delta_pred).unsqueeze(0)  # [1, D]
-        memory = torch.cat([vis, delta_token], dim=0)           # [R_real+1, D]
+        temporal = temporal_token.reshape(1, self.decoder_dim)  # [1, D]
+        memory = torch.cat([vis, temporal], dim=0)              # [R_real+1, D]
 
         # --- teacher-forced decoder input: [BOS, emb(y0) ... emb(y_390)] ---
         emb = ibq_codebook[tgt[:-1]]                            # [T-1, D]
@@ -191,26 +176,12 @@ class WorldModelBranch(nn.Module):
         h_t: torch.Tensor,
         ibq_codebook: torch.Tensor,
         tgt: torch.Tensor,
-        delta_target: Optional[torch.Tensor] = None,
         logit_chunk_size: int = 32,
-        zero_delta: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """One window's world forward.
-
-        Returns ``(ibq_ce, loss_delta)``.  With ``zero_delta=True`` the
-        delta token is replaced by zeros (shortcut baseline, always
-        run under no_grad by the caller).
-        """
-        delta_pred = self.delta_forward(h_t)
-        if zero_delta:
-            delta_pred = torch.zeros_like(delta_pred)
-
-        ibq_ce = self.decode_ce(
-            spatial_tokens, spatial_mask, delta_pred,
+        zero_temporal: bool = False,
+    ) -> torch.Tensor:
+        """One window's world forward.  Returns the mean IBQ CE."""
+        temporal = torch.zeros_like(h_t) if zero_temporal else h_t
+        return self.decode_ce(
+            spatial_tokens, spatial_mask, temporal,
             ibq_codebook, tgt, logit_chunk_size,
         )
-        if delta_target is None:
-            loss_delta = ibq_ce.new_zeros(())
-        else:
-            loss_delta = F.smooth_l1_loss(delta_pred, delta_target)
-        return ibq_ce, loss_delta

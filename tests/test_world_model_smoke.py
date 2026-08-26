@@ -1,7 +1,7 @@
-"""GPU smoke tests for the new world-model branch.
+"""GPU smoke tests for the world-model branch (direct temporal token).
 
 Run on the server:
-    python tests/test_world_model_smoke.py
+    PYTHONPATH=. python tests/test_world_model_smoke.py
 """
 
 import torch
@@ -22,18 +22,16 @@ def test_decoder_produces_per_position_ce():
     R = 12
     C_t = torch.randn(R, 3584)
     mask = torch.ones(R, dtype=torch.bool)
-    h_t = torch.randn(256)
+    h_t = torch.randn(256)                                  # direct temporal token
     tgt = torch.randint(0, IBQ_CODEBOOK_SIZE, (IBQ_TOKENS_PER_FRAME,))
-    delta_target = torch.randn(256)
 
-    ce, loss_delta = branch.forward_once(
-        C_t, mask, h_t, codebook, tgt,
-        delta_target=delta_target, logit_chunk_size=32,
+    ce = branch.forward_once(
+        C_t, mask, h_t, codebook, tgt, logit_chunk_size=32,
     )
-    assert ce.ndim == 0 and loss_delta.ndim == 0
+    assert ce.ndim == 0
     ce.backward()
     assert branch.visual_proj.weight.grad is not None
-    assert branch.delta_predictor[0].weight.grad is not None
+    assert branch.decoder.layers[0].linear1.weight.grad is not None
     print("test 1 OK: per-position 392-way CE, gradients flow into branch")
 
 
@@ -57,7 +55,7 @@ def test_chunked_ce_equals_full_ce():
     print("test 3 OK: chunked CE equals full CE")
 
 
-def test_zero_delta_baseline_runs_no_grad():
+def test_zero_temporal_baseline_runs_no_grad():
     branch = WorldModelBranch(llm_hidden=3584, d_ssm=256)
     codebook = torch.randn(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
     C_t = torch.randn(12, 3584)
@@ -65,21 +63,21 @@ def test_zero_delta_baseline_runs_no_grad():
     h_t = torch.randn(256)
     tgt = torch.randint(0, IBQ_CODEBOOK_SIZE, (IBQ_TOKENS_PER_FRAME,))
     with torch.no_grad():
-        ce_zero, _ = branch.forward_once(
-            C_t, mask, h_t, codebook, tgt, zero_delta=True,
-            logit_chunk_size=32,
+        ce_zero = branch.forward_once(
+            C_t, mask, h_t, codebook, tgt,
+            logit_chunk_size=32, zero_temporal=True,
         )
     assert ce_zero.ndim == 0 and torch.isfinite(ce_zero)
-    print("test 4 OK: zero-delta shortcut baseline runs")
+    print("test 4 OK: zero-temporal shortcut baseline runs")
 
 
-def test_zero_loss_graph_connectivity():
+def test_temporal_token_used_directly():
+    # no delta_predictor / delta_proj modules exist anymore
     branch = WorldModelBranch(llm_hidden=3584, d_ssm=256)
-    z = branch.delta_forward(torch.randn(256))
-    zero = z.sum() * 0.0
-    assert zero.requires_grad and zero.grad_fn is not None
-    zero.backward()
-    print("test 5 OK: empty-target zero loss stays graph-connected")
+    for name, _ in branch.named_modules():
+        assert "delta" not in name, f"unexpected legacy module: {name}"
+    assert branch.d_ssm == branch.decoder_dim
+    print("test 5 OK: h_internal is used directly, no delta modules")
 
 
 def test_grid_shape_assert():
@@ -91,7 +89,7 @@ if __name__ == "__main__":
     test_decoder_produces_per_position_ce()
     test_causal_mask_is_upper_triangular()
     test_chunked_ce_equals_full_ce()
-    test_zero_delta_baseline_runs_no_grad()
-    test_zero_loss_graph_connectivity()
+    test_zero_temporal_baseline_runs_no_grad()
+    test_temporal_token_used_directly()
     test_grid_shape_assert()
     print("ALL WORLD-MODEL SMOKE TESTS PASSED")
