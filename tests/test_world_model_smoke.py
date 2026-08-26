@@ -85,6 +85,22 @@ def test_grid_shape_assert():
     print("test 6 OK: grid shape consistent")
 
 
+def test_joint_gradient_reaches_h_internal():
+    """IBQ CE must backprop through the temporal token into h_internal."""
+    branch = WorldModelBranch(llm_hidden=3584, d_ssm=256)
+    codebook = torch.randn(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+    C_t = torch.randn(12, 3584)
+    mask = torch.ones(12, dtype=torch.bool)
+    h_t = torch.randn(256, requires_grad=True)              # like h_internal
+    tgt = torch.randint(0, IBQ_CODEBOOK_SIZE, (IBQ_TOKENS_PER_FRAME,))
+
+    ce = branch.forward_once(C_t, mask, h_t, codebook, tgt, logit_chunk_size=32)
+    ce.backward()
+    assert h_t.grad is not None, "h_t received no gradient"
+    assert h_t.grad.abs().sum() > 0, "h_t gradient is zero"
+    print("test 7 OK: IBQ CE -> temporal token -> h_internal gradient path exists")
+
+
 if __name__ == "__main__":
     test_decoder_produces_per_position_ce()
     test_causal_mask_is_upper_triangular()
@@ -92,4 +108,5 @@ if __name__ == "__main__":
     test_zero_temporal_baseline_runs_no_grad()
     test_temporal_token_used_directly()
     test_grid_shape_assert()
+    test_joint_gradient_reaches_h_internal()
     print("ALL WORLD-MODEL SMOKE TESTS PASSED")

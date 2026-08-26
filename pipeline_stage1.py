@@ -1735,7 +1735,7 @@ def main():
     parser.add_argument("--world-logit-chunk-size", type=int, default=32,
                        help="IBQ positions per logits chunk (memory bound)")
     parser.add_argument("--world-baseline-every", type=int, default=100,
-                       help="run the zero-delta shortcut baseline every N optimizer steps (0 disables)")
+                       help="run the zero-temporal shortcut baseline every N optimizer steps (0 disables)")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -2649,12 +2649,8 @@ def main():
             if train_world_losses:
                 writer.add_scalar("train/loss_world", finite_mean(train_world_losses), epoch)
                 writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses), epoch)
-            if world_ibq_temporal_list:
-                writer.add_scalar("step/ibq_ce_temporal", finite_mean(world_ibq_temporal_list), epoch)
-            if world_ibq_zero_temporal_list:
-                writer.add_scalar("step/ibq_ce_zero_temporal", finite_mean(world_ibq_zero_temporal_list), epoch)
-            if world_ibq_temporal_gain_list:
-                writer.add_scalar("step/ibq_temporal_gain", finite_mean(world_ibq_temporal_gain_list), epoch)
+            # step/* tags are written at the 500-step boundary with
+            # global_step only; no epoch-scalar duplicates here
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
             writer.add_scalar("train/score_prob_min", score_prob_min_epoch, epoch)
             writer.add_scalar("train/score_prob_max", score_prob_max_epoch, epoch)
