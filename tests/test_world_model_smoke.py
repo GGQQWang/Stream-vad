@@ -32,7 +32,8 @@ def test_decoder_produces_per_position_ce():
     ce.backward()
     assert branch.visual_proj.weight.grad is not None
     assert branch.change_proj.weight.grad is not None
-    print("test 1 OK: per-position 392-way CE, gradients flow")
+    assert branch.change_proj.bias is None, "change_proj must have no bias"
+    print("test 1 OK: per-position 392-way CE, gradients flow, change_proj bias-free")
 
 
 def test_causal_mask_is_upper_triangular():
@@ -116,6 +117,18 @@ def test_joint_gradient_reaches_h_through_change_token():
     print("test 6 OK: IBQ CE -> change token -> h_t / h_prev gradient path")
 
 
+def test_zero_delta_gives_exactly_zero_change_token():
+    """With h_prev=None (delta_h = 0) and no bias, the change token
+    must be exactly zero."""
+    branch = WorldModelBranch(llm_hidden=3584, d_ssm=256)
+    assert branch.change_proj.bias is None
+    h_t = torch.randn(256)
+    delta = torch.zeros_like(h_t)
+    token = branch.change_proj(delta)
+    assert token.abs().max().item() == 0.0, "change_proj(0) must be exactly 0"
+    print("test 5b OK: delta_h=0 -> change token exactly zero")
+
+
 def test_cross_chunk_prev_h_and_video_end_clear():
     from pipeline_stage1 import _clear_finished_states, _world_model_loss
 
@@ -143,20 +156,24 @@ def test_cross_chunk_prev_h_and_video_end_clear():
     valid = torch.ones(B, W, dtype=torch.bool)
     prev_cache: dict = {}
 
-    h1 = torch.randn(B, W, 256)
+    h1 = torch.randn(B, W, 256, requires_grad=True)
     batch1 = {"chunk_start": [0], "video_id": ["v1"],
               "spatial_features": sf, "spatial_mask": sm}
     _world_model_loss(model, ibq, batch1, valid, valid, h1, sf, sm,
-                      prev_cache, 1, 16, 32, False, detach_states=True)
+                      prev_cache, 1, 16, 32, False, detach_states=False)
     assert "v1" in prev_cache, "prev_h not cached after chunk 1"
     assert torch.allclose(prev_cache["v1"], h1[0, -1])
+    assert prev_cache["v1"].requires_grad is False, (
+        "cross-chunk prev_h must be detached (TBPTT)"
+    )
 
-    h2 = torch.randn(B, W, 256)
+    h2 = torch.randn(B, W, 256, requires_grad=True)
     batch2 = {"chunk_start": [4], "video_id": ["v1"],
               "spatial_features": sf, "spatial_mask": sm}
     _world_model_loss(model, ibq, batch2, valid, valid, h2, sf, sm,
-                      prev_cache, 1, 16, 32, False, detach_states=True)
+                      prev_cache, 1, 16, 32, False, detach_states=False)
     assert torch.allclose(prev_cache["v1"], h2[0, -1]), "prev_h not updated to chunk 2"
+    assert prev_cache["v1"].requires_grad is False
 
     ssm_cache = {"v1": object()}
     _clear_finished_states(
@@ -179,6 +196,7 @@ if __name__ == "__main__":
     test_chunked_ce_equals_full_ce()
     test_condition_is_the_state_change()
     test_zero_change_token_is_truly_zero()
+    test_zero_delta_gives_exactly_zero_change_token()
     test_joint_gradient_reaches_h_through_change_token()
     test_cross_chunk_prev_h_and_video_end_clear()
     test_grid_shape_assert()

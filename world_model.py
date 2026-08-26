@@ -78,7 +78,9 @@ class WorldModelBranch(nn.Module):
         self.visual_proj = nn.Linear(llm_hidden, decoder_dim)
 
         # --- state-change projection: delta_h = h_t - h_{t-1} ---
-        self.change_proj = nn.Linear(d_ssm, decoder_dim)
+        # no bias: the first window of a video has delta_h = 0 and its
+        # change token must be exactly zero
+        self.change_proj = nn.Linear(d_ssm, decoder_dim, bias=False)
 
         # --- decoder input tokens ---
         self.world_bos = nn.Parameter(torch.randn(1, decoder_dim) * 0.02)

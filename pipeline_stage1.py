@@ -896,7 +896,10 @@ def _world_model_loss(
                     branch.train(was_training)
 
         if last_valid_w is not None:
-            prev_h_cache[vid] = h_int[b, last_valid_w]
+            # cross-chunk reference only: detach so the previous batch's
+            # graph is not kept alive (TBPTT semantics); within-chunk
+            # h_t - h_{t-1} gradients are unaffected
+            prev_h_cache[vid] = h_int[b, last_valid_w].detach()
 
     if not ibq_ce_list:
         # no future window had an IBQ target in this batch: return a zero
