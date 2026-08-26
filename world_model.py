@@ -8,23 +8,24 @@ Architecture:
     pre-out_proj; exposed via SSMBlock.forward_chunk(return_internal=True))
 
         C_t --visual_proj--> [R, D]
-        h_t is used DIRECTLY as the temporal token (no MLP / Linear /
-        LayerNorm; d_ssm must equal decoder_dim)
+        delta_h = h_t - h_{t-1}  (state CHANGE, historical — not a
+        future prediction)
+        change_token = change_proj(delta_h)  [D]
 
-        memory = concat([visual_tokens; temporal_token]) -> [R+1, D]
+        memory = concat([visual_tokens; change_token]) -> [R+1, D]
 
     An autoregressive TransformerDecoder (teacher forcing, causal mask,
     2D positional embeddings) predicts the future frame's IBQ token
     sequence; each of the 392 positions gets its OWN [131072] logits
     via a dot product with the frozen IBQ codebook.
 
-    A zero-temporal baseline forward (temporal token replaced by zeros,
-    no_grad) quantifies how much the SSM temporal representation
-    contributes: ibq_temporal_gain = CE_zero - CE_temporal.
+    A zero-change baseline forward (change token replaced by an
+    all-zero decoder token, no_grad) quantifies how much the state
+    change contributes: ibq_change_gain = CE_zero - CE_change.
 
 Only the module definition and the per-window forward live here; the
-training loop in pipeline_stage1.py owns data plumbing and loss
-accumulation.
+training loop in pipeline_stage1.py owns data plumbing (including the
+cross-chunk h_{t-1} cache) and loss accumulation.
 """
 
 from typing import Optional
@@ -50,7 +51,7 @@ assert IBQ_GRID_ROWS * IBQ_GRID_COLS == IBQ_TOKENS_PER_FRAME, (
 
 
 class WorldModelBranch(nn.Module):
-    """Autoregressive IBQ visual decoder with a direct temporal token.
+    """Autoregressive IBQ visual decoder conditioned on SSM state change.
 
     Training-only; discarded at inference.  All tensors flow per
     window, never as a shared batch over windows.
@@ -70,15 +71,14 @@ class WorldModelBranch(nn.Module):
             f"IBQ_CODE_EMBED_DIM={IBQ_CODE_EMBED_DIM} must equal "
             f"decoder_dim={decoder_dim}"
         )
-        assert d_ssm == decoder_dim, (
-            f"h_internal dim {d_ssm} must equal decoder_dim {decoder_dim}: "
-            "the temporal token is used directly without projection"
-        )
         self.d_ssm = d_ssm
         self.decoder_dim = decoder_dim
 
         # --- current visual context projection ---
         self.visual_proj = nn.Linear(llm_hidden, decoder_dim)
+
+        # --- state-change projection: delta_h = h_t - h_{t-1} ---
+        self.change_proj = nn.Linear(d_ssm, decoder_dim)
 
         # --- decoder input tokens ---
         self.world_bos = nn.Parameter(torch.randn(1, decoder_dim) * 0.02)
@@ -113,7 +113,7 @@ class WorldModelBranch(nn.Module):
         self,
         spatial_tokens: torch.Tensor,       # [R, 3584]
         spatial_mask: torch.Tensor,         # [R] bool
-        temporal_token: torch.Tensor,       # [d_ssm] used directly
+        change_token: torch.Tensor,         # [D] decoder-space token
         ibq_codebook: torch.Tensor,         # [V, E] frozen
         tgt: torch.Tensor,                  # [392] long
         logit_chunk_size: int = 32,
@@ -129,17 +129,17 @@ class WorldModelBranch(nn.Module):
         assert ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, self.decoder_dim), (
             f"codebook shape {tuple(ibq_codebook.shape)}"
         )
-        assert temporal_token.shape[-1] == self.decoder_dim, (
-            f"temporal token dim {temporal_token.shape[-1]}, "
+        assert change_token.shape[-1] == self.decoder_dim, (
+            f"change token dim {change_token.shape[-1]}, "
             f"expected {self.decoder_dim}"
         )
         device = spatial_tokens.device
 
-        # --- memory: current visual tokens + direct temporal token ---
+        # --- memory: current visual tokens + state-change token ---
         vis = self.visual_proj(spatial_tokens)                 # [R, D]
         vis = vis[spatial_mask.bool()]                          # [R_real, D]
-        temporal = temporal_token.reshape(1, self.decoder_dim)  # [1, D]
-        memory = torch.cat([vis, temporal], dim=0)              # [R_real+1, D]
+        change = change_token.reshape(1, self.decoder_dim)      # [1, D]
+        memory = torch.cat([vis, change], dim=0)                # [R_real+1, D]
 
         # --- teacher-forced decoder input: [BOS, emb(y0) ... emb(y_390)] ---
         emb = ibq_codebook[tgt[:-1]]                            # [T-1, D]
@@ -173,15 +173,34 @@ class WorldModelBranch(nn.Module):
         self,
         spatial_tokens: torch.Tensor,
         spatial_mask: torch.Tensor,
-        h_t: torch.Tensor,
+        h_t: torch.Tensor,                  # [d_ssm]
+        h_prev: Optional[torch.Tensor],     # [d_ssm] or None (first window)
         ibq_codebook: torch.Tensor,
         tgt: torch.Tensor,
         logit_chunk_size: int = 32,
-        zero_temporal: bool = False,
+        zero_change: bool = False,
     ) -> torch.Tensor:
-        """One window's world forward.  Returns the mean IBQ CE."""
-        temporal = torch.zeros_like(h_t) if zero_temporal else h_t
+        """One window's world forward.  Returns the mean IBQ CE.
+
+        The decoder condition is the historical state CHANGE
+        ``h_t - h_{t-1}`` projected through ``change_proj`` — not a
+        future prediction.  With ``zero_change=True`` the decoder
+        token is replaced by an all-zero token (bypassing
+        ``change_proj`` entirely, so its bias does not leak in).
+        """
+        if h_prev is None:
+            delta_h = torch.zeros_like(h_t)
+        else:
+            delta_h = h_t - h_prev
+        if zero_change:
+            # genuinely all-zero decoder token; change_proj is bypassed
+            # entirely so its bias cannot leak into the baseline
+            change_token = torch.zeros(
+                1, self.decoder_dim, device=h_t.device, dtype=h_t.dtype,
+            )
+        else:
+            change_token = self.change_proj(delta_h)            # [D]
         return self.decode_ce(
-            spatial_tokens, spatial_mask, temporal,
+            spatial_tokens, spatial_mask, change_token,
             ibq_codebook, tgt, logit_chunk_size,
         )
