@@ -887,7 +887,10 @@ def _world_model_loss(
         # no future window had an IBQ target in this batch: return a zero
         # loss that is still connected to the autograd graph so
         # .backward() works when the warmup phase targets loss_world alone
-        z = branch.temporal_proj(h_internal.sum(dim=(0, 1)))
+        # (use h_int, not h_internal, so warmup detach also cuts the SSM
+        # graph here — otherwise AdamW weight decay would still update
+        # SSM params through the zero grad)
+        z = branch.temporal_proj(h_int.sum(dim=(0, 1)))
         zero_loss = z.sum() * 0.0
         return zero_loss, {
             "num_world_windows": 0,

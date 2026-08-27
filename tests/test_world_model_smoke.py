@@ -150,6 +150,48 @@ def test_grid_shape_assert():
     print("test 8 OK: grid shape consistent")
 
 
+def test_zero_target_batch_respects_warmup_detach():
+    """When NO window has a future IBQ target, the fallback zero loss
+    must still cut the SSM graph under detach_states=True (h_internal
+    gets no grad) while keeping temporal_proj trainable."""
+    from pipeline_stage1 import _world_model_loss
+
+    class _FakeModel:
+        def __init__(self):
+            self.world_branch = WorldModelBranch(llm_hidden=3584, d_ssm=256)
+            self.ibq_codebook = torch.randn(
+                IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+
+    class _FakeIBQNoFuture:
+        def get(self, vid, window_idx, frame_idx):
+            raise IndexError  # no future window anywhere
+
+    model = _FakeModel()
+    ibq = _FakeIBQNoFuture()
+    B, W, R = 1, 4, 8
+    h = torch.randn(B, W, 256, requires_grad=True)
+    sf = torch.randn(B, W, R, 3584)
+    sm = torch.ones(B, W, R, dtype=torch.bool)
+    valid = torch.ones(B, W, dtype=torch.bool)
+    batch = {"chunk_start": [0], "video_id": ["v1"],
+             "spatial_features": sf, "spatial_mask": sm}
+
+    loss, info = _world_model_loss(
+        model, ibq, batch, valid, valid, h, sf, sm,
+        1, 16, 32, False, detach_states=True,
+    )
+    assert info["num_world_windows"] == 0
+    assert loss.requires_grad, "zero loss must stay graph-connected"
+    loss.backward()
+    assert h.grad is None or h.grad.abs().sum() == 0, (
+        "zero-target warmup batch must not propagate grad into h_internal"
+    )
+    assert model.world_branch.temporal_proj[0].weight.grad is not None, (
+        "temporal_proj must still receive grad so backward is valid"
+    )
+    print("test 9 OK: zero-target fallback respects warmup detach")
+
+
 if __name__ == "__main__":
     test_decoder_produces_per_position_ce()
     test_temporal_proj_structure()
@@ -159,4 +201,5 @@ if __name__ == "__main__":
     test_joint_gradient_reaches_h_through_temporal_proj()
     test_warmup_detach_blocks_gradient()
     test_grid_shape_assert()
+    test_zero_target_batch_respects_warmup_detach()
     print("ALL WORLD-MODEL SMOKE TESTS PASSED")
