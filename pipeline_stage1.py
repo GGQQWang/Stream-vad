@@ -796,30 +796,26 @@ def _world_model_loss(
     h_internal: torch.Tensor,          # [B, max_w, d_ssm]
     spatial_features: torch.Tensor,    # [B, max_w, R_max, llm_hidden]
     spatial_mask: torch.Tensor,        # [B, max_w, R_max] bool
-    prev_h_cache: dict,                # video_id -> last chunk's final h_internal
     horizon: int,
     frames_per_clip: int,
     logit_chunk_size: int,
     run_baseline: bool,
     detach_states: bool = False,
 ) -> Tuple[torch.Tensor, dict]:
-    """Autoregressive IBQ prediction conditioned on SSM state change.
+    """Autoregressive IBQ prediction with a temporal dynamics token.
 
     For each valid window ``w`` of batch item ``b`` with an existing
     future window ``chunk_start + w + horizon`` in the IBQ cache:
 
     - one randomly sampled frame (independent per window pair) of the
       future window is the autoregressive decoder target;
-    - the decoder condition is the historical state change
-      ``h_t - h_{t-1}`` projected through ``change_proj`` (not a
-      future prediction).  ``h_{t-1}`` is the previous window's
-      h_internal, or ``prev_h_cache[video_id]`` (the previous chunk's
-      final window) for the first window of a chunk, or zeros for the
-      very first window of a video.
+    - the decoder condition is the Temporal Dynamics Token
+      ``temporal_proj(h_t)`` — a nonlinear mapping of the SSM state
+      (NOT a future delta prediction).
 
-    ``run_baseline`` additionally evaluates the zero-change shortcut
+    ``run_baseline`` additionally evaluates the zero-temporal shortcut
     baseline (all-zero decoder token) in eval mode under no_grad;
-    ibq_change_gain = CE_zero - CE_change.
+    ibq_temporal_gain = CE_zero - CE_temporal.
 
     ``detach_states=True`` is used during world warmup so no gradient
     flows into the SSM.
@@ -831,7 +827,7 @@ def _world_model_loss(
     video_ids = batch["video_id"]
 
     ibq_ce_list: List[torch.Tensor] = []
-    baseline_change_list: List[torch.Tensor] = []
+    baseline_temporal_list: List[torch.Tensor] = []
     baseline_zero_list: List[torch.Tensor] = []
     n_windows = 0
     n_tokens = 0
@@ -839,18 +835,10 @@ def _world_model_loss(
     for b in range(h_internal.shape[0]):
         vid = video_ids[b]
         cs = int(chunk_starts[b])
-        prev_h = prev_h_cache.get(vid)          # last chunk's final h
-        last_valid_w = None
         for w in range(valid_mask_cpu.shape[1]):
             if not bool(valid_mask_cpu[b, w]):
                 continue
             h_t = h_int[b, w]
-            if w > 0:
-                h_prev = h_int[b, w - 1]
-            else:
-                h_prev = prev_h                 # may be None (first window)
-            last_valid_w = w
-            prev_h = h_t
 
             # per-window-pair independent random frame
             try:
@@ -866,7 +854,7 @@ def _world_model_loss(
             m_t = spatial_mask[b, w].to(device=h_internal.device)
 
             ibq_ce = branch.forward_once(
-                C_t, m_t, h_t, h_prev, codebook, tgt,
+                C_t, m_t, h_t, codebook, tgt,
                 logit_chunk_size=logit_chunk_size,
             )
             ibq_ce_list.append(ibq_ce)
@@ -881,39 +869,33 @@ def _world_model_loss(
                 branch.eval()
                 try:
                     with torch.no_grad():
-                        ce_change_eval = branch.forward_once(
-                            C_t, m_t, h_t, h_prev, codebook, tgt,
+                        ce_temporal_eval = branch.forward_once(
+                            C_t, m_t, h_t, codebook, tgt,
                             logit_chunk_size=logit_chunk_size,
                         )
                         ce_zero_eval = branch.forward_once(
-                            C_t, m_t, h_t, h_prev, codebook, tgt,
+                            C_t, m_t, h_t, codebook, tgt,
                             logit_chunk_size=logit_chunk_size,
-                            zero_change=True,
+                            zero_temporal=True,
                         )
-                        baseline_change_list.append(ce_change_eval.detach())
+                        baseline_temporal_list.append(ce_temporal_eval.detach())
                         baseline_zero_list.append(ce_zero_eval.detach())
                 finally:
                     branch.train(was_training)
-
-        if last_valid_w is not None:
-            # cross-chunk reference only: detach so the previous batch's
-            # graph is not kept alive (TBPTT semantics); within-chunk
-            # h_t - h_{t-1} gradients are unaffected
-            prev_h_cache[vid] = h_int[b, last_valid_w].detach()
 
     if not ibq_ce_list:
         # no future window had an IBQ target in this batch: return a zero
         # loss that is still connected to the autograd graph so
         # .backward() works when the warmup phase targets loss_world alone
-        z = branch.change_proj(h_internal.sum(dim=(0, 1)))
+        z = branch.temporal_proj(h_internal.sum(dim=(0, 1)))
         zero_loss = z.sum() * 0.0
         return zero_loss, {
             "num_world_windows": 0,
             "num_world_tokens": 0,
             "loss_world_ibq": 0.0,
-            "ibq_ce_change": None,
-            "ibq_ce_zero_change": None,
-            "ibq_change_gain": None,
+            "ibq_ce_temporal": None,
+            "ibq_ce_zero_temporal": None,
+            "ibq_temporal_gain": None,
         }
 
     loss_ibq = torch.stack(ibq_ce_list).mean()
@@ -925,10 +907,10 @@ def _world_model_loss(
         "num_world_windows": n_windows,
         "num_world_tokens": n_tokens,
         "loss_world_ibq": float(loss_ibq.detach().item()),
-        "ibq_ce_change": _mean(baseline_change_list),
-        "ibq_ce_zero_change": _mean(baseline_zero_list),
-        "ibq_change_gain": (
-            _mean(baseline_zero_list) - _mean(baseline_change_list)
+        "ibq_ce_temporal": _mean(baseline_temporal_list),
+        "ibq_ce_zero_temporal": _mean(baseline_zero_list),
+        "ibq_temporal_gain": (
+            _mean(baseline_zero_list) - _mean(baseline_temporal_list)
             if baseline_zero_list else None
         ),
     }
@@ -1155,18 +1137,11 @@ def _single_chunk_batch(dataset: HIVAUDataset, sample_idx: int) -> dict:
     return hivau_collate([dataset[sample_idx]])
 
 
-def _clear_finished_states(
-    model: StreamingVADGenerationModel,
-    batch: dict,
-    ssm_cache: dict,
-    prev_h_cache: dict | None = None,
-) -> None:
+def _clear_finished_states(model: StreamingVADGenerationModel, batch: dict, ssm_cache: dict) -> None:
     for vid, is_last in zip(batch["video_id"], batch["is_last_chunk"]):
         if is_last:
             existed = vid in ssm_cache
             ssm_cache.pop(vid, None)
-            if prev_h_cache is not None:
-                prev_h_cache.pop(vid, None)
             if getattr(model, "debug_state", False):
                 print(f"SSM_STATE_CLEAR video_id={vid} existed={existed}")
 
@@ -2038,7 +2013,7 @@ def main():
             # drop legacy delta_predictor / delta_proj params; the rest
             # of the decoder weights still load
             saved_wb = dict(ckpt["world_branch"])
-            for legacy_prefix in ("delta_predictor.", "delta_proj."):
+            for legacy_prefix in ("delta_predictor.", "delta_proj.", "change_proj."):
                 saved_wb = {
                     k: v for k, v in saved_wb.items()
                     if not k.startswith(legacy_prefix)
@@ -2226,9 +2201,9 @@ def main():
         train_summary_losses: List[float] = []
         train_world_losses: List[float] = []
         train_world_ibq_losses: List[float] = []
-        world_ibq_change_list: List[float] = []
-        world_ibq_zero_change_list: List[float] = []
-        world_ibq_change_gain_list: List[float] = []
+        world_ibq_temporal_list: List[float] = []
+        world_ibq_zero_temporal_list: List[float] = []
+        world_ibq_temporal_gain_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2247,7 +2222,6 @@ def main():
         if args.objective == "score_token":
             # ---- fully-supervised score token ----
             ssm_cache: dict = {}
-            prev_h_cache: dict = {}
             pbar = tqdm(train_loader, desc=f"Epoch {epoch} score_token")
 
             for step, batch in enumerate(pbar):
@@ -2309,9 +2283,9 @@ def main():
                     "num_world_windows": 0,
                     "num_world_tokens": 0,
                     "loss_world_ibq": 0.0,
-                    "ibq_ce_change": None,
-                    "ibq_ce_zero_change": None,
-                    "ibq_change_gain": None,
+                    "ibq_ce_temporal": None,
+                    "ibq_ce_zero_temporal": None,
+                    "ibq_temporal_gain": None,
                 }
 
                 if warmup_phase:
@@ -2327,7 +2301,6 @@ def main():
                             h_internal,
                             batch["spatial_features"].to(device=device),
                             batch["spatial_mask"].to(device=device),
-                            prev_h_cache,
                             args.world_horizon, args.frames_per_clip,
                             args.world_logit_chunk_size,
                             run_baseline, detach_states=True,
@@ -2390,7 +2363,6 @@ def main():
                                 h_internal,
                                 batch["spatial_features"].to(device=device),
                                 batch["spatial_mask"].to(device=device),
-                                prev_h_cache,
                                 args.world_horizon, args.frames_per_clip,
                                 args.world_logit_chunk_size,
                                 run_baseline, detach_states=False,
@@ -2426,24 +2398,24 @@ def main():
                         writer.add_scalar("train/loss_world", finite_mean(train_world_losses[-500:]), global_step)
                         writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses[-500:]), global_step)
                         writer.add_scalar("step/loss_world_ibq", finite_mean(train_world_ibq_losses[-500:]), global_step)
-                        if world_ibq_change_list:
-                            writer.add_scalar("step/ibq_ce_change", finite_mean(world_ibq_change_list[-500:]), global_step)
-                        if world_ibq_zero_change_list:
-                            writer.add_scalar("step/ibq_ce_zero_change", finite_mean(world_ibq_zero_change_list[-500:]), global_step)
-                        if world_ibq_change_gain_list:
-                            writer.add_scalar("step/ibq_change_gain", finite_mean(world_ibq_change_gain_list[-500:]), global_step)
+                        if world_ibq_temporal_list:
+                            writer.add_scalar("step/ibq_ce_temporal", finite_mean(world_ibq_temporal_list[-500:]), global_step)
+                        if world_ibq_zero_temporal_list:
+                            writer.add_scalar("step/ibq_ce_zero_temporal", finite_mean(world_ibq_zero_temporal_list[-500:]), global_step)
+                        if world_ibq_temporal_gain_list:
+                            writer.add_scalar("step/ibq_temporal_gain", finite_mean(world_ibq_temporal_gain_list[-500:]), global_step)
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
                 train_world_losses.append(float(loss_world.detach().item()))
                 train_world_ibq_losses.append(float(world_info["loss_world_ibq"]))
-                if world_info["ibq_ce_change"] is not None:
-                    world_ibq_change_list.append(world_info["ibq_ce_change"])
-                if world_info["ibq_ce_zero_change"] is not None:
-                    world_ibq_zero_change_list.append(world_info["ibq_ce_zero_change"])
-                if world_info["ibq_change_gain"] is not None:
-                    world_ibq_change_gain_list.append(world_info["ibq_change_gain"])
+                if world_info["ibq_ce_temporal"] is not None:
+                    world_ibq_temporal_list.append(world_info["ibq_ce_temporal"])
+                if world_info["ibq_ce_zero_temporal"] is not None:
+                    world_ibq_zero_temporal_list.append(world_info["ibq_ce_zero_temporal"])
+                if world_info["ibq_temporal_gain"] is not None:
+                    world_ibq_temporal_gain_list.append(world_info["ibq_temporal_gain"])
                 num_valid_windows = float(valid.sum().item()) if not warmup_phase else 0.0
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
@@ -2471,7 +2443,7 @@ def main():
                             float(valid_probs.max().item()),
                         )
 
-                _clear_finished_states(model, batch, ssm_cache, prev_h_cache)
+                _clear_finished_states(model, batch, ssm_cache)
 
                 pbar.set_postfix(
                     loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
