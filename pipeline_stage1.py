@@ -787,6 +787,60 @@ def _state_dict_shapes_match(module: nn.Module, saved: dict) -> bool:
     return True
 
 
+def grad_conflict_stats(loss_a, loss_b, params) -> dict:
+    """Diagnose gradient-direction conflict between two losses on
+    shared parameters.
+
+    Pure observation: uses ``torch.autograd.grad`` with
+    ``retain_graph=True``, never writes ``param.grad``, never touches
+    the optimizer.  Gradients are summed per parameter WITHOUT
+    flattening into one big tensor (memory-friendly).
+    """
+    params = [p for p in params if p.requires_grad]
+
+    g_a = torch.autograd.grad(
+        loss_a,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    g_b = torch.autograd.grad(
+        loss_b,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    dot = torch.zeros((), device=loss_a.device, dtype=torch.float32)
+    norm_a_sq = torch.zeros_like(dot)
+    norm_b_sq = torch.zeros_like(dot)
+
+    for ga, gb in zip(g_a, g_b):
+        if ga is None or gb is None:
+            continue
+
+        ga = ga.detach().float()
+        gb = gb.detach().float()
+
+        dot += (ga * gb).sum()
+        norm_a_sq += (ga * ga).sum()
+        norm_b_sq += (gb * gb).sum()
+
+    norm_a = norm_a_sq.sqrt()
+    norm_b = norm_b_sq.sqrt()
+
+    cosine = dot / (norm_a * norm_b + 1e-12)
+    ratio = norm_b / (norm_a + 1e-12)
+
+    return {
+        "cosine": float(cosine.item()),
+        "dot": float(dot.item()),
+        "norm_a": float(norm_a.item()),
+        "norm_b": float(norm_b.item()),
+        "ratio": float(ratio.item()),
+    }
+
+
 def _world_model_loss(
     model: StreamingVADGenerationModel,
     ibq_cache: IBQTokenCache,
@@ -2207,6 +2261,8 @@ def main():
         world_ibq_temporal_list: List[float] = []
         world_ibq_zero_temporal_list: List[float] = []
         world_ibq_temporal_gain_list: List[float] = []
+        grad_conflict_cos_sw_list: List[float] = []
+        grad_conflict_cos_mw_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2373,12 +2429,56 @@ def main():
                         else:
                             loss_world = state_emb.new_zeros(())
 
-                        raw_total_loss = (
+                        loss_score_weighted = args.lambda_score * loss_score
+                        loss_main_weighted = (
                             args.lambda_score * loss_score
                             + args.lambda_sum * loss_summary
-                            + args.lambda_world * loss_world
+                        )
+                        loss_world_weighted = args.lambda_world * loss_world
+                        raw_total_loss = (
+                            loss_main_weighted
+                            + loss_world_weighted
                         )
                         total_loss = raw_total_loss / group_size
+
+                        # --- gradient-conflict diagnostics (Stage C only,
+                        # pure observation, every 100 optimizer steps) ---
+                        do_grad_conflict = (
+                            use_world
+                            and not warmup_phase
+                            and world_info["num_world_windows"] > 0
+                            and global_step % 100 == 0
+                        )
+                        if do_grad_conflict:
+                            ssw = grad_conflict_stats(
+                                loss_score_weighted,
+                                loss_world_weighted,
+                                model.ssm.parameters(),
+                            )
+                            smw = grad_conflict_stats(
+                                loss_main_weighted,
+                                loss_world_weighted,
+                                model.ssm.parameters(),
+                            )
+                            print(
+                                f"GRAD_CONFLICT step={global_step} "
+                                f"score_world_cos={ssw['cosine']:.4f} "
+                                f"main_world_cos={smw['cosine']:.4f} "
+                                f"score_norm={ssw['norm_a']:.4f} "
+                                f"main_norm={smw['norm_a']:.4f} "
+                                f"world_norm={ssw['norm_b']:.4f} "
+                                f"world_score_ratio={ssw['ratio']:.4f} "
+                                f"world_main_ratio={smw['ratio']:.4f}"
+                            )
+                            writer.add_scalar("grad/score_world_cosine", ssw["cosine"], global_step)
+                            writer.add_scalar("grad/main_world_cosine", smw["cosine"], global_step)
+                            writer.add_scalar("grad/score_norm", ssw["norm_a"], global_step)
+                            writer.add_scalar("grad/main_norm", smw["norm_a"], global_step)
+                            writer.add_scalar("grad/world_norm", ssw["norm_b"], global_step)
+                            writer.add_scalar("grad/world_score_ratio", ssw["ratio"], global_step)
+                            writer.add_scalar("grad/world_main_ratio", smw["ratio"], global_step)
+                            grad_conflict_cos_sw_list.append(ssw["cosine"])
+                            grad_conflict_cos_mw_list.append(smw["cosine"])
 
                 if not total_loss.requires_grad:
                     raise RuntimeError(
@@ -2654,6 +2754,16 @@ def main():
                 writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses), epoch)
             # step/* tags are written at the 500-step boundary with
             # global_step only; no epoch-scalar duplicates here
+            if grad_conflict_cos_sw_list:
+                sw = np.array(grad_conflict_cos_sw_list)
+                mw = np.array(grad_conflict_cos_mw_list)
+                print(
+                    "GRAD_CONFLICT_SUMMARY "
+                    f"score_world_mean_cos={sw.mean():.4f} "
+                    f"score_world_negative_ratio={float((sw < 0).mean()):.4f} "
+                    f"main_world_mean_cos={mw.mean():.4f} "
+                    f"main_world_negative_ratio={float((mw < 0).mean()):.4f}"
+                )
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
             writer.add_scalar("train/score_prob_min", score_prob_min_epoch, epoch)
             writer.add_scalar("train/score_prob_max", score_prob_max_epoch, epoch)

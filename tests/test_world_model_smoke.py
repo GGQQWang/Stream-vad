@@ -192,6 +192,35 @@ def test_zero_target_batch_respects_warmup_detach():
     print("test 9 OK: zero-target fallback respects warmup detach")
 
 
+def test_grad_conflict_stats():
+    """grad_conflict_stats: direction measurement, non-invasive, and a
+    subsequent backward still works."""
+    from pipeline_stage1 import grad_conflict_stats
+
+    # same-direction losses -> cosine ~ +1
+    x = torch.randn(4)
+    p = torch.nn.Parameter(torch.randn(4))
+    loss_a = (p * x).sum()
+    loss_b = (p * x).sum() * 2.0
+    stats = grad_conflict_stats(loss_a, loss_b, [p])
+    assert stats["cosine"] > 0.999, stats["cosine"]
+    assert p.grad is None, "diagnostics must not pollute param.grad"
+
+    # opposite-direction losses -> cosine ~ -1
+    y = torch.randn(4)
+    q = torch.nn.Parameter(torch.randn(4))
+    loss_c = (q * y).sum()
+    loss_d = -(q * y).sum()
+    stats2 = grad_conflict_stats(loss_c, loss_d, [q])
+    assert stats2["cosine"] < -0.999, stats2["cosine"]
+    assert q.grad is None
+
+    # a normal backward afterwards still works (graph was retained)
+    (loss_c + loss_d).backward()
+    assert q.grad is not None
+    print("test 10 OK: grad_conflict_stats direction + non-invasive + backward OK")
+
+
 if __name__ == "__main__":
     test_decoder_produces_per_position_ce()
     test_temporal_proj_structure()
@@ -202,4 +231,5 @@ if __name__ == "__main__":
     test_warmup_detach_blocks_gradient()
     test_grid_shape_assert()
     test_zero_target_batch_respects_warmup_detach()
+    test_grad_conflict_stats()
     print("ALL WORLD-MODEL SMOKE TESTS PASSED")
