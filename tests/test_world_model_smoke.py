@@ -215,9 +215,12 @@ def test_grad_conflict_stats():
     assert stats2["cosine"] < -0.999, stats2["cosine"]
     assert q.grad is None
 
-    # a normal backward afterwards still works (graph was retained)
-    (loss_c + loss_d).backward()
+    # a normal backward afterwards still works (graph was retained).
+    # 0.5 weighting avoids the exact cancellation loss_c + loss_d = 0,
+    # so a non-zero gradient must actually appear.
+    (loss_c + 0.5 * loss_d).backward()
     assert q.grad is not None
+    assert q.grad.abs().sum() > 0
     print("test 10 OK: grad_conflict_stats direction + non-invasive + backward OK")
 
 

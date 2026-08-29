@@ -2337,6 +2337,10 @@ def main():
 
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
+                # computed early so the grad-conflict diagnostic can run
+                # only on the optimizer-update micro-batch (no duplicate
+                # autograd.grad calls within one grad-accum group)
+                is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
 
                 world_info = {
                     "num_world_windows": 0,
@@ -2447,7 +2451,8 @@ def main():
                             use_world
                             and not warmup_phase
                             and world_info["num_world_windows"] > 0
-                            and global_step % 100 == 0
+                            and is_update
+                            and (global_step + 1) % 100 == 0
                         )
                         if do_grad_conflict:
                             ssw = grad_conflict_stats(
@@ -2491,7 +2496,8 @@ def main():
                     )
                 total_loss.backward()
 
-                is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(train_loader)
+                # is_update was computed before the forward for the
+                # grad-conflict diagnostic; reuse it here
                 if is_update:
                     optimizer.step()
                     scheduler.step()
