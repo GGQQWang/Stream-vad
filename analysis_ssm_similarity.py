@@ -85,19 +85,26 @@ def _pairwise_stats(S: np.ndarray, idx_a: np.ndarray, idx_b: np.ndarray,
     )
 
 
-def _classify_gt_state(start: int, end: int, onset: int, bin_gt: int) -> str:
-    """Classify a window by its GT coverage relative to the anomaly onset.
+def _classify_gt_state(start: int, end: int, onset: int,
+                       window_gt: np.ndarray) -> str:
+    """Classify a window by its frame-level GT relative to the anomaly onset.
+
+    ``pure_abnormal`` requires the ENTIRE valid window to be abnormal
+    (``np.all(window_gt == 1)``), so an abnormal->normal offset window
+    that only partially overlaps the anomaly is never pure_abnormal.
 
     Edge cases: ``end == onset`` -> pure_normal; ``start == onset`` ->
-    pure_abnormal (or other when the window has no abnormal frame); an
-    onset exactly on a window boundary never creates a transition
-    window.
+    pure_abnormal only when every frame is abnormal; an onset exactly on
+    a window boundary never creates a transition window; an empty window
+    falls through to other (never vacuous-truth pure_abnormal).
     """
+    if window_gt.size == 0:
+        return "other"
     if end <= onset:
         return "pure_normal"
     if start < onset < end:
         return "transition"
-    if start >= onset and bin_gt:
+    if start >= onset and np.all(window_gt == 1):
         return "pure_abnormal"
     return "other"
 
@@ -132,16 +139,25 @@ def _boundary_idx(win_rows: List[dict], K: int) -> Tuple[List[int], List[int]]:
 
 def _run_logic_self_check() -> None:
     """Cheap CPU-only checks of the gt_state / boundary selection logic."""
-    # Case 1: [0,48) with onset=48 -> pure_normal
-    assert _classify_gt_state(0, 48, 48, 0) == "pure_normal"
-    # Case 2: [48,96) with onset=48, GT abnormal -> pure_abnormal
-    assert _classify_gt_state(48, 96, 48, 1) == "pure_abnormal"
-    # Case 3: [32,80) with onset=48 -> transition
-    assert _classify_gt_state(32, 80, 48, 1) == "transition"
-    # Case 4: onset 之后的正常 window -> other
-    assert _classify_gt_state(96, 144, 48, 0) == "other"
+    # Case 1: [0,48) with onset=48, all-normal GT -> pure_normal
+    assert _classify_gt_state(0, 48, 48, np.zeros(48, dtype=np.int64)) == "pure_normal"
+    # Case 2: [48,96) with onset=48, all-abnormal GT -> pure_abnormal
+    assert _classify_gt_state(48, 96, 48, np.ones(48, dtype=np.int64)) == "pure_abnormal"
+    # Case 3: [32,80) with onset=48, 0 before / 1 after -> transition
+    g3 = np.zeros(48, dtype=np.int64)
+    g3[16:] = 1                     # frames 48..79 abnormal
+    assert _classify_gt_state(32, 80, 48, g3) == "transition"
+    # Case 4: onset 之后 all-normal window -> other
+    assert _classify_gt_state(96, 144, 48, np.zeros(48, dtype=np.int64)) == "other"
+    # Case 5: onset 之后 abnormal->normal offset 混合 window -> other
+    # (MUST NOT be pure_abnormal even though binary_gt would be 1)
+    g5 = np.zeros(48, dtype=np.int64)
+    g5[:18] = 1                     # frames 192..209 abnormal, 210..239 normal
+    assert _classify_gt_state(192, 240, 48, g5) == "other"
+    # Case 6: onset 之后 entire window all-abnormal -> pure_abnormal
+    assert _classify_gt_state(192, 240, 48, np.ones(48, dtype=np.int64)) == "pure_abnormal"
 
-    # Case 5: transition/other never enter the global normal/abnormal sets
+    # Case 7: transition/other never enter the global normal/abnormal sets
     rows = [
         {"window_index": 0, "gt_state": "pure_normal"},
         {"window_index": 1, "gt_state": "pure_normal"},
@@ -155,10 +171,12 @@ def _run_logic_self_check() -> None:
     normal_idx, abnormal_idx = _split_indices(rows)
     assert 3 not in normal_idx and 6 not in normal_idx
     assert 3 not in abnormal_idx and 6 not in abnormal_idx
-    # Case 6: boundary selection = last K pure_normal + first K pure_abnormal
+    # Case 8: boundary selection = last K pure_normal + first K pure_abnormal
     left, right = _boundary_idx(rows, K=2)
     assert left == [1, 2] and right == [4, 5]
-    print("logic self-check OK (6 cases)")
+    # Case 9: empty window never vacuous-truths into pure_abnormal
+    assert _classify_gt_state(0, 0, 48, np.zeros(0, dtype=np.int64)) == "other"
+    print("logic self-check OK (9 cases)")
 
 
 def _boundary_stats(S: np.ndarray, win_rows: List[dict], K: int,
@@ -304,7 +322,8 @@ def main() -> None:
                 global_idx = int(batch["chunk_start"][0]) + w
                 start = int(start_frames[0, w].item())
                 end = int(valid_end_frames[0, w].item())
-                bin_gt = int(gt[start:end].any())
+                window_gt = gt[start:end]
+                bin_gt = int(window_gt.any())
                 x_list.append(visual_windows[0, w].detach().float().cpu().numpy())
                 h_list.append(h_internal[0, w].detach().float().cpu().numpy())
                 win_rows.append({
@@ -313,7 +332,7 @@ def main() -> None:
                     "valid_end_frame": end,
                     "binary_gt": bin_gt,
                     "gt_state": _classify_gt_state(
-                        start, end, anomaly_onset_frame, bin_gt,
+                        start, end, anomaly_onset_frame, window_gt,
                     ),
                 })
         ssm_cache.clear()
