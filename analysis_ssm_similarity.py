@@ -85,14 +85,103 @@ def _pairwise_stats(S: np.ndarray, idx_a: np.ndarray, idx_b: np.ndarray,
     )
 
 
-def _boundary_stats(S: np.ndarray, onset: int, K: int) -> float:
-    left = np.arange(max(0, onset - K), onset)
-    right = np.arange(onset, min(onset + K, S.shape[0]))
-    if len(left) == 0 or len(right) == 0:
+def _classify_gt_state(start: int, end: int, onset: int, bin_gt: int) -> str:
+    """Classify a window by its GT coverage relative to the anomaly onset.
+
+    Edge cases: ``end == onset`` -> pure_normal; ``start == onset`` ->
+    pure_abnormal (or other when the window has no abnormal frame); an
+    onset exactly on a window boundary never creates a transition
+    window.
+    """
+    if end <= onset:
+        return "pure_normal"
+    if start < onset < end:
+        return "transition"
+    if start >= onset and bin_gt:
+        return "pure_abnormal"
+    return "other"
+
+
+def _split_indices(win_rows: List[dict]) -> Tuple[np.ndarray, np.ndarray]:
+    """Window indices for the global separation metrics, by gt_state.
+
+    transition and other windows are excluded from both sets.
+    """
+    normal_idx = np.array(
+        [i for i, r in enumerate(win_rows) if r["gt_state"] == "pure_normal"],
+        dtype=np.int64,
+    )
+    abnormal_idx = np.array(
+        [i for i, r in enumerate(win_rows) if r["gt_state"] == "pure_abnormal"],
+        dtype=np.int64,
+    )
+    return normal_idx, abnormal_idx
+
+
+def _boundary_idx(win_rows: List[dict], K: int) -> Tuple[List[int], List[int]]:
+    """Indices for the local boundary gap.
+
+    left  = the LAST K pure_normal windows (closest before the onset)
+    right = the FIRST K pure_abnormal windows (earliest at/after onset)
+    transition and other windows are never included.
+    """
+    left = [i for i, r in enumerate(win_rows) if r["gt_state"] == "pure_normal"][-K:]
+    right = [i for i, r in enumerate(win_rows) if r["gt_state"] == "pure_abnormal"][:K]
+    return left, right
+
+
+def _run_logic_self_check() -> None:
+    """Cheap CPU-only checks of the gt_state / boundary selection logic."""
+    # Case 1: [0,48) with onset=48 -> pure_normal
+    assert _classify_gt_state(0, 48, 48, 0) == "pure_normal"
+    # Case 2: [48,96) with onset=48, GT abnormal -> pure_abnormal
+    assert _classify_gt_state(48, 96, 48, 1) == "pure_abnormal"
+    # Case 3: [32,80) with onset=48 -> transition
+    assert _classify_gt_state(32, 80, 48, 1) == "transition"
+    # Case 4: onset 之后的正常 window -> other
+    assert _classify_gt_state(96, 144, 48, 0) == "other"
+
+    # Case 5: transition/other never enter the global normal/abnormal sets
+    rows = [
+        {"window_index": 0, "gt_state": "pure_normal"},
+        {"window_index": 1, "gt_state": "pure_normal"},
+        {"window_index": 2, "gt_state": "pure_normal"},
+        {"window_index": 3, "gt_state": "transition"},
+        {"window_index": 4, "gt_state": "pure_abnormal"},
+        {"window_index": 5, "gt_state": "pure_abnormal"},
+        {"window_index": 6, "gt_state": "other"},
+        {"window_index": 7, "gt_state": "pure_abnormal"},
+    ]
+    normal_idx, abnormal_idx = _split_indices(rows)
+    assert 3 not in normal_idx and 6 not in normal_idx
+    assert 3 not in abnormal_idx and 6 not in abnormal_idx
+    # Case 6: boundary selection = last K pure_normal + first K pure_abnormal
+    left, right = _boundary_idx(rows, K=2)
+    assert left == [1, 2] and right == [4, 5]
+    print("logic self-check OK (6 cases)")
+
+
+def _boundary_stats(S: np.ndarray, win_rows: List[dict], K: int,
+                    video_id: str) -> float:
+    """Local boundary gap over gt_state-selected windows.
+
+    left  = the LAST K pure_normal windows (before the onset)
+    right = the FIRST K pure_abnormal windows (at/after the onset)
+    transition and other windows are never included.
+    """
+    left, right = _boundary_idx(win_rows, K)
+    if len(left) < 2 or len(right) < 2:
+        print(
+            f"WARNING {video_id}: boundary_gap needs >=2 windows on each "
+            f"side (left={len(left)}, right={len(right)}); returning NaN"
+        )
         return float("nan")
-    within_left, _, _ = _pairwise_stats(S, left, left, exclude_diagonal=True)
-    within_right, _, _ = _pairwise_stats(S, right, right, exclude_diagonal=True)
-    _, _, cross = _pairwise_stats(S, left, right, exclude_diagonal=False)
+    within_left, _, _ = _pairwise_stats(S, np.array(left), np.array(left),
+                                        exclude_diagonal=True)
+    within_right, _, _ = _pairwise_stats(S, np.array(right), np.array(right),
+                                         exclude_diagonal=True)
+    _, _, cross = _pairwise_stats(S, np.array(left), np.array(right),
+                                  exclude_diagonal=False)
     if np.isnan(within_left) or np.isnan(within_right) or np.isnan(cross):
         return float("nan")
     return (within_left + within_right) / 2.0 - cross
@@ -118,11 +207,6 @@ def _draw_heatmap(S: np.ndarray, onset_window: int, title: str,
     step = max(1, T // 20)
     ax.set_xticks(np.arange(0, T, step))
     ax.set_yticks(np.arange(0, T, step))
-    # Normal / Abnormal annotations without covering the heatmap
-    ax.text(-0.10, 0.5, "Normal", rotation=90, va="center", ha="center",
-            transform=ax.transAxes, fontsize=10, color="black")
-    ax.text(1.06, 0.5, "Abnormal", rotation=-90, va="center", ha="center",
-            transform=ax.transAxes, fontsize=10, color="black")
     cbar = fig.colorbar(im, ax=ax, fraction=0.046)
     cbar.set_label("Cosine similarity")
     fig.tight_layout()
@@ -147,6 +231,8 @@ def main() -> None:
     args.device = torch.device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    _run_logic_self_check()
 
     # ---- normalize manifest (reuse the infer script's logic) ----
     normalized_manifest = normalize_manifest(
@@ -226,6 +312,9 @@ def main() -> None:
                     "start_frame": start,
                     "valid_end_frame": end,
                     "binary_gt": bin_gt,
+                    "gt_state": _classify_gt_state(
+                        start, end, anomaly_onset_frame, bin_gt,
+                    ),
                 })
         ssm_cache.clear()
 
@@ -260,19 +349,16 @@ def main() -> None:
     S_pre = Xn @ Xn.T
     S_ssm = Hn @ Hn.T
 
-    # ---- normal / abnormal window split ----
-    normal_idx = np.array(
-        [i for i, r in enumerate(win_rows)
-         if r["window_index"] < onset_window], dtype=np.int64,
-    )
-    abnormal_idx = np.array(
-        [i for i, r in enumerate(win_rows)
-         if r["window_index"] >= onset_window and r["binary_gt"] == 1],
-        dtype=np.int64,
-    )
+    # ---- normal / abnormal window split (gt_state based; transition and
+    # other windows are fully excluded from the global separation metrics) ----
+    normal_idx, abnormal_idx = _split_indices(win_rows)
+    num_pure_normal = int((np.array([r["gt_state"] for r in win_rows]) == "pure_normal").sum())
+    num_transition = int((np.array([r["gt_state"] for r in win_rows]) == "transition").sum())
+    num_pure_abnormal = int((np.array([r["gt_state"] for r in win_rows]) == "pure_abnormal").sum())
+    num_other = int((np.array([r["gt_state"] for r in win_rows]) == "other").sum())
     if len(normal_idx) == 0 or len(abnormal_idx) == 0:
         raise RuntimeError(
-            f"{video_id}: need both normal and abnormal windows "
+            f"{video_id}: need both pure_normal and pure_abnormal windows "
             f"(normal={len(normal_idx)}, abnormal={len(abnormal_idx)})"
         )
 
@@ -284,12 +370,16 @@ def main() -> None:
 
     pre_nn, pre_aa, pre_na, pre_delta = _sep(S_pre)
     ssm_nn, ssm_aa, ssm_na, ssm_delta = _sep(S_ssm)
-    pre_gap = _boundary_stats(S_pre, onset_pos, args.boundary_k)
-    ssm_gap = _boundary_stats(S_ssm, onset_pos, args.boundary_k)
+    pre_gap = _boundary_stats(S_pre, win_rows, args.boundary_k, video_id)
+    ssm_gap = _boundary_stats(S_ssm, win_rows, args.boundary_k, video_id)
 
     metrics = {
         "video_id": video_id,
         "num_windows": T,
+        "num_pure_normal_windows": num_pure_normal,
+        "num_transition_windows": num_transition,
+        "num_pure_abnormal_windows": num_pure_abnormal,
+        "num_other_windows": num_other,
         "anomaly_onset_frame": anomaly_onset_frame,
         "anomaly_onset_window": onset_window,
         "pre_ssm": {
@@ -310,17 +400,19 @@ def main() -> None:
         "boundary_gap_gain": ssm_gap - pre_gap,
     }
 
-    # ---- heatmaps (shared color scale) ----
+    # ---- heatmaps (shared color scale; boundary line at onset_pos-0.5) ----
     common_min = float(min(S_pre.min(), S_ssm.min()))
     common_max = float(max(S_pre.max(), S_ssm.max()))
     _draw_heatmap(
         S_pre, onset_pos,
-        f"{video_id} — pre-SSM window features (cosine similarity)",
+        f"{video_id} — pre-SSM window features "
+        f"(cosine similarity, onset window = {onset_window})",
         output_dir / "pre_ssm_cosine_heatmap.png", common_min, common_max,
     )
     _draw_heatmap(
         S_ssm, onset_pos,
-        f"{video_id} — SSM internal h (cosine similarity)",
+        f"{video_id} — SSM internal h "
+        f"(cosine similarity, onset window = {onset_window})",
         output_dir / "ssm_internal_cosine_heatmap.png", common_min, common_max,
     )
 
@@ -333,7 +425,7 @@ def main() -> None:
     with open(output_dir / "window_metadata.csv", "w", newline="") as f:
         writer = csv.DictWriter(
             f, fieldnames=["window_index", "start_frame",
-                           "valid_end_frame", "binary_gt"],
+                           "valid_end_frame", "binary_gt", "gt_state"],
         )
         writer.writeheader()
         for r in win_rows:
@@ -342,6 +434,23 @@ def main() -> None:
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
+    # ---- diagnostics ----
+    print(
+        f"video_id={video_id} "
+        f"anomaly_onset_frame={anomaly_onset_frame} "
+        f"anomaly_onset_window={onset_window} "
+        f"num_windows={T} "
+        f"pure_normal={num_pure_normal} transition={num_transition} "
+        f"pure_abnormal={num_pure_abnormal} other={num_other}"
+    )
+    print(
+        f"pre_delta_sep={pre_delta:.4f} ssm_delta_sep={ssm_delta:.4f} "
+        f"delta_sep_gain={ssm_delta - pre_delta:.4f}"
+    )
+    print(
+        f"pre_boundary_gap={pre_gap} ssm_boundary_gap={ssm_gap} "
+        f"boundary_gap_gain={ssm_gap - pre_gap}"
+    )
     print(json.dumps(metrics, indent=2))
 
 
