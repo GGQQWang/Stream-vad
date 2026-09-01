@@ -176,34 +176,55 @@ def _boundary_heatmap_pos(win_rows: List[dict], frame: int) -> Optional[float]:
 
 
 def _boundary_window_idx(win_rows: List[dict], frame: int, kind: str,
-                         K: int) -> Tuple[List[int], List[int]]:
-    """K nearest pure windows on each side of ONE GT boundary.
+                         K: int, left_limit: int,
+                         right_limit: int) -> Tuple[List[int], List[int]]:
+    """K nearest pure windows on each side of ONE GT boundary, restricted
+    to the interval between its ADJACENT GT boundaries.
 
-    onset  (0->1): left = pure_normal (end <= frame), right = pure_abnormal
-    offset (1->0): left = pure_abnormal (end <= frame), right = pure_normal
-    transition and other windows are never included.
+    left_limit  = previous boundary frame (0 = video start if none)
+    right_limit = next boundary frame (video end if none)
+
+    onset  (0->1): left = pure_normal, right = pure_abnormal
+    offset (1->0): left = pure_abnormal, right = pure_normal
+
+    left  windows must lie in [left_limit, frame]
+    right windows must lie in [frame, right_limit]
+    so a boundary's local statistics can never cross the neighbouring
+    anomaly segments.  transition and other windows are always skipped.
     """
     left_state, right_state = (
         ("pure_normal", "pure_abnormal") if kind == "onset"
         else ("pure_abnormal", "pure_normal")
     )
     left = [i for i, r in enumerate(win_rows)
-            if r["gt_state"] == left_state and r["valid_end_frame"] <= frame]
+            if r["gt_state"] == left_state
+            and r["start_frame"] >= left_limit
+            and r["valid_end_frame"] <= frame]
     right = [i for i, r in enumerate(win_rows)
-             if r["gt_state"] == right_state and r["start_frame"] >= frame]
+             if r["gt_state"] == right_state
+             and r["start_frame"] >= frame
+             and r["valid_end_frame"] <= right_limit]
     return left[-K:], right[:K]
 
 
 def _boundary_gap(S: np.ndarray, win_rows: List[dict], frame: int,
-                  kind: str, K: int, video_id: str) -> float:
-    """Local gap around ONE GT boundary:
-    (within_left + within_right) / 2 - cross."""
-    left, right = _boundary_window_idx(win_rows, frame, kind, K)
+                  kind: str, K: int, left_limit: int, right_limit: int,
+                  video_id: str) -> float:
+    """Local gap around ONE GT boundary, confined to its adjacent
+    boundaries: (within_left + within_right) / 2 - cross.
+
+    Returns NaN (with a warning) when either side has fewer than 2 pure
+    windows INSIDE the interval; windows are never borrowed across the
+    neighbouring boundaries.
+    """
+    left, right = _boundary_window_idx(
+        win_rows, frame, kind, K, left_limit, right_limit,
+    )
     if len(left) < 2 or len(right) < 2:
         print(
             f"WARNING {video_id}: {kind}@{frame} boundary_gap needs >=2 "
-            f"windows on each side (left={len(left)}, right={len(right)}); "
-            "returning NaN"
+            f"windows on each side within [{left_limit}, {right_limit}] "
+            f"(left={len(left)}, right={len(right)}); returning NaN"
         )
         return float("nan")
     within_left, _, _ = _pairwise_stats(S, np.array(left), np.array(left),
@@ -247,11 +268,12 @@ def _run_logic_self_check() -> None:
     normal_idx, abnormal_idx = _split_indices(rows)
     assert 1 not in normal_idx and 4 not in normal_idx
     assert 1 not in abnormal_idx and 4 not in abnormal_idx
-    # onset@48: left = nearest pure_normal, right = nearest pure_abnormal
-    left, right = _boundary_window_idx(rows, 48, "onset", K=2)
+    # onset@48 within [0, 288]: left = nearest pure_normal, right = nearest
+    # pure_abnormal (transition/other skipped)
+    left, right = _boundary_window_idx(rows, 48, "onset", 2, 0, 288)
     assert left == [0] and right == [2, 3]
-    # offset@192: left = pure_abnormal, right = pure_normal (transition/other skipped)
-    left, right = _boundary_window_idx(rows, 192, "offset", K=2)
+    # offset@192 within [48, 288]: sides swapped
+    left, right = _boundary_window_idx(rows, 192, "offset", 2, 48, 288)
     assert left == [2, 3] and right == [5]
     # fractional heatmap mapping: frame 210 inside [192,240) at row 4
     pos = _boundary_heatmap_pos(rows, 210)
@@ -259,7 +281,38 @@ def _run_logic_self_check() -> None:
     # frame exactly on a window edge maps to the cell boundary (row-0.5)
     pos_edge = _boundary_heatmap_pos(rows, 96)
     assert pos_edge is not None and abs(pos_edge - (2 - 0.5)) < 1e-9
-    print("logic self-check OK (8 cases)")
+
+    # multi-boundary video: N -> onset1@48 -> A -> offset1@192 -> N ->
+    # onset2@288 -> A.  Each boundary's windows must stay inside its own
+    # adjacent-boundary interval and never reach the other segment.
+    multi = [
+        {"window_index": i, "start_frame": i * 48,
+         "valid_end_frame": (i + 1) * 48, "binary_gt": 1, "gt_state": s}
+        for i, s in enumerate([
+            "pure_normal",           # [0,48)
+            "transition",            # [48,96)    contains onset1@48
+            "pure_abnormal",         # [96,144)
+            "pure_abnormal",         # [144,192)
+            "transition",            # [192,240)  contains offset1@192
+            "pure_normal",           # [240,288)
+            "transition",            # [288,336)  contains onset2@288
+            "pure_abnormal",         # [336,384)
+            "pure_abnormal",         # [384,432)
+        ])
+    ]
+    # onset1@48 (limits 0..192): right may NOT reach onset2's abnormals
+    left, right = _boundary_window_idx(multi, 48, "onset", 2, 0, 192)
+    assert left == [0] and right == [2, 3]
+    assert 7 not in right and 8 not in right
+    # offset1@192 (limits 48..288): both sides confined to segment 1
+    left, right = _boundary_window_idx(multi, 192, "offset", 2, 48, 288)
+    assert left == [2, 3] and right == [5]
+    assert 7 not in left and 8 not in left and 7 not in right and 8 not in right
+    # onset2@288 (limits 192..432): left may NOT reach onset1's normals
+    left, right = _boundary_window_idx(multi, 288, "onset", 2, 192, 432)
+    assert left == [5] and right == [7, 8]
+    assert 0 not in left
+    print("logic self-check OK (12 cases)")
 
 
 def _draw_heatmap(S: np.ndarray, boundaries: List[Tuple[float, str]],
@@ -466,11 +519,19 @@ def main() -> None:
     gaps_no: List[float] = []
     for bi, spec in enumerate(boundary_specs):
         frame, kind = spec["frame"], spec["kind"]
+        # local interval: between the ADJACENT GT boundaries only, so a
+        # boundary's gap can never borrow windows from another segment
+        left_limit = boundaries[bi - 1][0] if bi > 0 else 0
+        right_limit = boundaries[bi + 1][0] if bi < len(boundaries) - 1 else n_frames
         gap_full = _boundary_gap(S_full, win_rows, frame, kind,
-                                 args.boundary_k, video_id)
+                                 args.boundary_k, left_limit, right_limit,
+                                 video_id)
         gap_no = _boundary_gap(S_no, win_rows, frame, kind,
-                               args.boundary_k, video_id)
-        left, right = _boundary_window_idx(win_rows, frame, kind, args.boundary_k)
+                               args.boundary_k, left_limit, right_limit,
+                               video_id)
+        left, right = _boundary_window_idx(
+            win_rows, frame, kind, args.boundary_k, left_limit, right_limit,
+        )
         both_valid = not (np.isnan(gap_full) or np.isnan(gap_no))
         if not np.isnan(gap_full):
             gaps_full.append(gap_full)
