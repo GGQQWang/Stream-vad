@@ -31,6 +31,7 @@ unaffected.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from typing import Dict, List, Tuple
 
@@ -169,6 +170,13 @@ def clear_rep_finished_states(batch: dict, rep_caches: Dict[str, dict]) -> None:
 # losses
 # ---------------------------------------------------------------------------
 
+def _disabled_autocast(device_type: str):
+    try:
+        return torch.autocast(device_type=device_type, enabled=False)
+    except (RuntimeError, TypeError):
+        return contextlib.nullcontext()
+
+
 def future_loss(
     P: FuturePredictor,
     h_views: List[torch.Tensor],      # [B, T, d] for (global, local1, local2)
@@ -274,40 +282,41 @@ def sigreg_epps_pulley(
     when there are too few samples.
     """
     V, N, d = q_views.shape
-    if N < 2:
-        return q_views.mean() * 0.0
-    x = q_views.float()
-    device = x.device
-    if projections is None:
-        A = torch.randn(d, num_proj, device=device, dtype=torch.float32)
-    else:
-        A = projections.to(device=device, dtype=torch.float32)
-        if A.shape == (num_proj, d):
-            A = A.t()
-        if A.shape != (d, num_proj):
-            raise ValueError(
-                f"projections must have shape ({d}, {num_proj}) or ({num_proj}, {d}), "
-                f"got {tuple(A.shape)}"
-            )
-    A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)  # [d, P]
-    y = x @ A                                                  # [V, N, P]
+    with _disabled_autocast(q_views.device.type):
+        if N < 2:
+            return q_views.float().mean() * 0.0
+        x = q_views.float()
+        device = x.device
+        if projections is None:
+            A = torch.randn(d, num_proj, device=device, dtype=torch.float32)
+        else:
+            A = projections.to(device=device, dtype=torch.float32)
+            if A.shape == (num_proj, d):
+                A = A.t()
+            if A.shape != (d, num_proj):
+                raise ValueError(
+                    f"projections must have shape ({d}, {num_proj}) or ({num_proj}, {d}), "
+                    f"got {tuple(A.shape)}"
+                )
+        A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)  # [d, P]
+        y = x @ A                                                  # [V, N, P]
 
-    t_max = 3.0
-    ts = torch.linspace(0.0, t_max, knots, device=device, dtype=torch.float32)
-    dt = t_max / (knots - 1)
-    weights = torch.full((knots,), 2.0 * dt, device=device, dtype=torch.float32)
-    weights[[0, -1]] = dt
-    phi = torch.exp(-0.5 * ts.square())                        # [K]
-    weights = weights * phi                                    # Gaussian window
+        t_max = 3.0
+        ts = torch.linspace(0.0, t_max, knots, device=device, dtype=torch.float32)
+        dt = t_max / (knots - 1)
+        weights = torch.full((knots,), 2.0 * dt, device=device, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        phi = torch.exp(-0.5 * ts.square())                        # [K]
+        weights = weights * phi                                    # Gaussian window
 
-    arg = y.unsqueeze(-1) * ts                                 # [V, N, P, K]
-    phi_real = arg.cos().mean(dim=1)                           # [V, P, K]
-    phi_imag = arg.sin().mean(dim=1)
-    err = (phi_real - phi.view(1, 1, knots)).square() + phi_imag.square()
-    stats = err @ weights                                      # [V, P]
-    if not normalize_by_n:
-        stats = stats * N
-    return stats.mean()
+        arg = y.unsqueeze(-1) * ts                                 # [V, N, P, K]
+        phi_real = arg.cos().mean(dim=1)                           # [V, P, K]
+        phi_imag = arg.sin().mean(dim=1)
+        err = (phi_real - phi.view(1, 1, knots)).square() + phi_imag.square()
+        stats = err @ weights                                      # [V, P]
+        if not normalize_by_n:
+            stats = stats * N
+        return stats.mean()
 
 
 # ---------------------------------------------------------------------------

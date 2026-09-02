@@ -238,6 +238,26 @@ def test_sigreg_lejepa_parity_and_no_internal_normalization():
     print("test 6b OK: SIGReg matches LeVJEPA formula and is shift/scale sensitive")
 
 
+def test_sigreg_cuda_autocast_forces_fp32_and_keeps_grad():
+    if not torch.cuda.is_available():
+        print("test 6cuda SKIP: CUDA not available")
+        return
+    torch.manual_seed(0)
+    q = torch.randn(
+        3, 8, 256,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loss = sigreg_epps_pulley(q, num_proj=64, knots=17)
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert q.grad is not None and q.grad.abs().sum() > 0
+    print("test 6cuda OK: SIGReg disables CUDA autocast, returns fp32, keeps grad")
+
+
 class _IdentityPredictor(nn.Module):
     def forward(self, h):
         return h, h
@@ -490,6 +510,7 @@ if __name__ == "__main__":
     test_formal_future_and_inv_losses_reach_ssm()
     test_sigreg_finite_and_zero_fallback()
     test_sigreg_lejepa_parity_and_no_internal_normalization()
+    test_sigreg_cuda_autocast_forces_fp32_and_keeps_grad()
     test_future_loss_batch2_uses_per_sample_view_weights()
     test_ema_frozen_not_in_optimizer_updates_on_step()
     test_baseline_lambda_rep_zero_freezes_rep_modules()
