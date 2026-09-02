@@ -7,6 +7,7 @@ Run on the server:
 
 import torch
 import torch.nn as nn
+import math
 
 from rep_learning import (
     FuturePredictor,
@@ -24,14 +25,42 @@ from rep_learning import (
 from spatial import SpatialTokenCompressor
 
 
+def _reference_sigreg(q_views, projections, knots=17, normalize_by_n=False):
+    V, N, d = q_views.shape
+    if N < 2:
+        return q_views.mean() * 0.0
+    x = q_views.float()
+    A = projections.float()
+    if A.shape == (A.shape[0], d) and A.shape != (d, A.shape[0]):
+        A = A.t()
+    A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)
+    y = x @ A
+    t_max = 3.0
+    t = torch.linspace(0.0, t_max, knots, dtype=torch.float32, device=x.device)
+    dt = t_max / (knots - 1)
+    weights = torch.full((knots,), 2.0 * dt, dtype=torch.float32, device=x.device)
+    weights[[0, -1]] = dt
+    phi = torch.exp(-0.5 * t.square())
+    weights = weights * phi
+    arg = y.unsqueeze(-1) * t
+    cos_mean = torch.cos(arg).mean(dim=1)
+    sin_mean = torch.sin(arg).mean(dim=1)
+    err = (cos_mean - phi.view(1, 1, knots)).square() + sin_mean.square()
+    stat = err @ weights
+    if not normalize_by_n:
+        stat = stat * N
+    return stat.mean()
+
+
 class _FakeSSM(nn.Module):
     """Linear stand-in for SSMBlock.forward_chunk (CPU smoke tests only)."""
 
-    def __init__(self, d_input, d_model):
+    def __init__(self, d_input, d_model, n_layers=1, llm_hidden=None):
         super().__init__()
+        out_dim = d_input if llm_hidden is None else llm_hidden
         self.in_proj = nn.Linear(d_input, d_model)
         self.out_norm = nn.LayerNorm(d_model)
-        self.out_proj = nn.Linear(d_model, d_input)
+        self.out_proj = nn.Linear(d_model, out_dim)
 
     def forward_chunk(self, x, state=None, return_internal=False):
         h = self.in_proj(x)
@@ -171,11 +200,80 @@ def test_sigreg_finite_and_zero_fallback():
     print("test 6 OK: SIGReg finite; small-sample fallback is graph-connected zero")
 
 
+def test_sigreg_lejepa_parity_and_no_internal_normalization():
+    torch.manual_seed(0)
+    q = torch.randn(3, 128, 8, requires_grad=True)
+    projections = torch.randn(8, 64)
+    got = sigreg_epps_pulley(q, num_proj=64, knots=17, projections=projections)
+    ref = _reference_sigreg(q, projections, knots=17)
+    assert torch.allclose(got, ref, rtol=1e-6, atol=1e-6), (got.item(), ref.item())
+
+    collapsed = torch.full((3, 128, 8), 2.0)
+    gaussian = torch.randn(3, 128, 8)
+    loss_collapsed = sigreg_epps_pulley(
+        collapsed, num_proj=64, knots=17, projections=projections,
+    )
+    loss_gaussian = sigreg_epps_pulley(
+        gaussian, num_proj=64, knots=17, projections=projections,
+    )
+    assert loss_collapsed > loss_gaussian * 2.0, (
+        loss_collapsed.item(), loss_gaussian.item()
+    )
+
+    q_shift = gaussian + 5.0
+    q_scale = gaussian * 5.0
+    loss_base = sigreg_epps_pulley(
+        gaussian, num_proj=64, knots=17, projections=projections,
+    )
+    loss_shift = sigreg_epps_pulley(
+        q_shift, num_proj=64, knots=17, projections=projections,
+    )
+    loss_scale = sigreg_epps_pulley(
+        q_scale, num_proj=64, knots=17, projections=projections,
+    )
+    assert not torch.allclose(loss_base, loss_shift, rtol=0.05, atol=0.05)
+    assert not torch.allclose(loss_base, loss_scale, rtol=0.05, atol=0.05)
+    got.backward()
+    assert q.grad is not None and q.grad.abs().sum() > 0
+    print("test 6b OK: SIGReg matches LeVJEPA formula and is shift/scale sensitive")
+
+
+class _IdentityPredictor(nn.Module):
+    def forward(self, h):
+        return h, h
+
+
+def test_future_loss_batch2_uses_per_sample_view_weights():
+    h_bar = torch.zeros(2, 3, 1)
+    valid = torch.ones(2, 3, dtype=torch.bool)
+    h_g = torch.zeros(2, 3, 1)
+    h_l1 = torch.zeros_like(h_g)
+    h_l2 = torch.zeros_like(h_g)
+    h_g[:, 0, 0] = torch.tensor([1.0, 2.0])
+    h_l1[:, 0, 0] = torch.tensor([2.0, 3.0])
+    h_l2[:, 0, 0] = torch.tensor([3.0, 4.0])
+    w = torch.tensor([[1.0, 0.5, 0.25], [1.0, 2.0, 4.0]])
+
+    loss, info = future_loss(
+        _IdentityPredictor(), [h_g, h_l1, h_l2], h_bar, valid, w,
+        horizon2_weight=0.0, detach_inputs=False,
+    )
+    expected_b0 = (1.0 * 1.0 + 0.5 * 4.0 + 0.25 * 9.0) / 1.75
+    expected_b1 = (1.0 * 4.0 + 2.0 * 9.0 + 4.0 * 16.0) / 7.0
+    expected = torch.tensor((expected_b0 + expected_b1) / 2.0)
+    assert torch.allclose(loss, expected, atol=1e-6), (loss.item(), expected.item())
+    assert info["n_anchors"] == 2
+    print("test 6c OK: future loss weights each batch sample with its own rho")
+
+
 def test_ema_frozen_not_in_optimizer_updates_on_step():
     torch.manual_seed(0)
     online = _FakeSSM(4, 8)
     ema = _FakeSSM(4, 8)
     init_ema(ema, online)
+    for p in ema.parameters():
+        p.requires_grad = False
+    ema.eval()
     for pe, po in zip(ema.parameters(), online.parameters()):
         assert torch.equal(pe.data, po.data), "init_ema must copy the online SSM"
     opt = torch.optim.AdamW(online.parameters())
@@ -215,7 +313,73 @@ def test_baseline_lambda_rep_zero_freezes_rep_modules():
     assert all(not p.requires_grad for p in model.ema_ssm.parameters()), (
         "EMA must stay frozen even when the rep branch is active"
     )
+    model.train()
+    assert model.ema_ssm.training, "plain nn.Module.train() would recurse into EMA"
+    configure_rep_modules(model, 0.1)
+    assert not model.ema_ssm.training
     print("test 8 OK: baseline freeze + EMA always frozen")
+
+
+def test_streaming_model_constructor_smoke_and_ema_eval_helper():
+    import sys
+    import types
+
+    tb_mod = types.ModuleType("torch.utils.tensorboard")
+    tb_mod.SummaryWriter = object
+    sys.modules.setdefault("torch.utils.tensorboard", tb_mod)
+
+    tr_mod = types.ModuleType("transformers")
+    tr_mod.AutoTokenizer = object
+    tr_mod.Qwen2VLForConditionalGeneration = nn.Module
+    tr_mod.Qwen2VLProcessor = object
+    tr_mod.get_linear_schedule_with_warmup = lambda *args, **kwargs: None
+    tr_mod.set_seed = lambda *args, **kwargs: None
+    sys.modules.setdefault("transformers", tr_mod)
+
+    peft_mod = types.ModuleType("peft")
+    peft_mod.LoraConfig = object
+    peft_mod.get_peft_model = lambda model, *args, **kwargs: model
+    sys.modules.setdefault("peft", peft_mod)
+
+    import pipeline_stage1 as pipe
+
+    class FakeQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Identity()
+
+    class FakeViTForwarder(nn.Module):
+        def __init__(self, visual, reducer):
+            super().__init__()
+            self.visual = visual
+            self.reducer = reducer
+
+    old_ssm = pipe.SSMBlock
+    old_vit = pipe.ViTForwarder
+    try:
+        pipe.SSMBlock = _FakeSSM
+        pipe.ViTForwarder = FakeViTForwarder
+        model = pipe.StreamingVADGenerationModel(
+            FakeQwen(), d_ssm=8, n_ssm=1, llm_hidden=16,
+        )
+    finally:
+        pipe.SSMBlock = old_ssm
+        pipe.ViTForwarder = old_vit
+
+    assert isinstance(model.future_predictor, FuturePredictor)
+    assert isinstance(model.sig_projector, SIGProjector)
+    assert model.future_predictor.mlp[0].in_features == 8
+    assert model.future_predictor.mlp[0].out_features == 512
+    assert model.future_predictor.mlp[2].out_features == 8
+    assert model.sig_projector.mlp[0].in_features == 8
+    assert model.sig_projector.mlp[0].out_features == 512
+    assert model.sig_projector.mlp[2].out_features == 8
+    configure_rep_modules(model, 0.1)
+    model.train()
+    assert model.ema_ssm.training
+    pipe._set_train_keep_ema_eval(model)
+    assert model.training and not model.ema_ssm.training
+    print("test 8b OK: real StreamingVADGenerationModel constructor and EMA eval helper")
 
 
 def test_rep_mode_has_no_ibq_dependency():
@@ -282,7 +446,7 @@ def test_rep_loss_forward_integration():
     )
     assert info["rho_local1"] == rho_warmup, "same video+epoch must reuse the same rho"
     assert info["n_anchors"] == 4                     # T=6 -> t=0..3
-    assert torch.isfinite(info["loss_sigreg"]) and info["loss_sigreg"] >= 0
+    assert math.isfinite(info["loss_sigreg"]) and info["loss_sigreg"] >= 0
     loss.backward()
     assert model.ssm.in_proj.weight.grad is not None and model.ssm.in_proj.weight.grad.abs().sum() > 0
     assert model.future_predictor.mlp[0].weight.grad is not None
@@ -325,8 +489,11 @@ if __name__ == "__main__":
     test_warmup_future_loss_trains_only_predictor()
     test_formal_future_and_inv_losses_reach_ssm()
     test_sigreg_finite_and_zero_fallback()
+    test_sigreg_lejepa_parity_and_no_internal_normalization()
+    test_future_loss_batch2_uses_per_sample_view_weights()
     test_ema_frozen_not_in_optimizer_updates_on_step()
     test_baseline_lambda_rep_zero_freezes_rep_modules()
+    test_streaming_model_constructor_smoke_and_ema_eval_helper()
     test_rep_mode_has_no_ibq_dependency()
     test_rep_loss_forward_integration()
     print("ALL REP-LEARNING SMOKE TESTS PASSED")

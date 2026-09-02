@@ -114,6 +114,12 @@ def _compute_warmup_steps(total_steps: int) -> int:
     return min(total_steps - 1, max(1, int(0.03 * total_steps)))
 
 
+def _set_train_keep_ema_eval(model: nn.Module, mode: bool = True) -> None:
+    model.train(mode)
+    if hasattr(model, "ema_ssm"):
+        model.ema_ssm.eval()
+
+
 def _add_special_tokens(tokenizer, model) -> Tuple[int, int]:
     """Add ``<SCORE>`` and ``<SUM>`` special tokens and resize embeddings.
 
@@ -542,8 +548,8 @@ class StreamingVADGenerationModel(nn.Module):
         # (training-only): shared-SSM progressive local views, an EMA
         # future teacher, a shared future predictor and a LeVJEPA-style
         # SIG projector.  Nothing here is used at inference.
-        self.future_predictor = FuturePredictor(d_model=d_ssm)
-        self.sig_projector = SIGProjector(d_model=d_ssm)
+        self.future_predictor = FuturePredictor(d=d_ssm)
+        self.sig_projector = SIGProjector(d=d_ssm)
         self.ema_ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
                                 n_layers=n_ssm, llm_hidden=llm_hidden)
         self.register_buffer(
@@ -1108,7 +1114,7 @@ def validate_generative(
         all_scores.extend(score.cpu().tolist())
         all_labels.extend(all_target.cpu().tolist())
 
-    model.train()
+    _set_train_keep_ema_eval(model)
 
     scores_arr = np.array(all_scores)
     labels_arr = np.array(all_labels)
@@ -1595,7 +1601,7 @@ def validate_mil_rank(
     metrics["total_loss"] = metrics["total_loss"] + lambda_rank * metrics["ranking_loss"]
     pred = (scores_arr > 0).astype(int)
     metrics["accuracy"] = float((pred == labels_arr).mean()) if len(labels_arr) else 0.0
-    model.train(was_training)
+    _set_train_keep_ema_eval(model, was_training)
     return metrics
 
 
@@ -1698,7 +1704,7 @@ def validate_score_token(
                     binary_threshold=binary_threshold,
                 ))
 
-    model.train()
+    _set_train_keep_ema_eval(model)
 
     if all_logits:
         logits_all = torch.cat(all_logits, dim=0)
@@ -2329,7 +2335,7 @@ def main():
         tokenizer.save_pretrained(str(ckpt_dir))
 
     # ---- loop ----
-    model.train()
+    _set_train_keep_ema_eval(model)
     qwen.train()
 
     for epoch in range(start_epoch, args.epochs):
@@ -2917,7 +2923,7 @@ def main():
                     normal_metrics["max_score"] = normal_max_score
                     abnormal_metrics["max_score"] = abnormal_max_score
                 finally:
-                    model.train(was_training)
+                    _set_train_keep_ema_eval(model, was_training)
 
                 is_update = (step + 1) % args.grad_accum == 0 or step + 1 == len(pairs)
                 if is_update:

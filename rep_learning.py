@@ -212,21 +212,22 @@ def future_loss(
         mse2 = (p2[:, :-2] - tgt2).pow(2).mean(dim=-1)
         mse1_m = (mse1 * anchor).sum() / anchor.sum().clamp_min(1)
         mse2_m = (mse2 * anchor).sum() / anchor.sum().clamp_min(1)
-        per_view.append(mse1_m + horizon2_weight * mse2_m)     # Lf_v
+        per_view.append(mse1 + horizon2_weight * mse2)         # [B, T-2]
         mse_t1_views.append(mse1_m.detach())
         mse_t2_views.append(mse2_m.detach())
 
     w = view_weights.to(h_bar.device)                          # [B, 3]
-    w_sum = w.sum().clamp_min(1e-8)
-    loss = sum(w[:, v].sum() * per_view[v] for v in range(3)) / w_sum
+    denom_b = w.sum(dim=1).clamp_min(1e-8)                      # [B]
+    per_anchor = sum(w[:, v:v + 1] * per_view[v] for v in range(3)) / denom_b[:, None]
+    loss = (per_anchor * anchor).sum() / anchor.sum().clamp_min(1)
 
     info = {
         "loss_future": float(loss.detach().item()),
         "loss_t1": float(sum(mse_t1_views).item() / len(mse_t1_views)),
         "loss_t2": float(sum(mse_t2_views).item() / len(mse_t2_views)),
-        "future_global": float(per_view[0].detach().item()),
-        "future_local1": float(per_view[1].detach().item()),
-        "future_local2": float(per_view[2].detach().item()),
+        "future_global": float(((per_view[0] * anchor).sum() / anchor.sum().clamp_min(1)).detach().item()),
+        "future_local1": float(((per_view[1] * anchor).sum() / anchor.sum().clamp_min(1)).detach().item()),
+        "future_local2": float(((per_view[2] * anchor).sum() / anchor.sum().clamp_min(1)).detach().item()),
         "n_anchors": int(anchor.sum().item()),
     }
     return loss, info
@@ -256,6 +257,8 @@ def sigreg_epps_pulley(
     q_views: torch.Tensor,           # [V, N, d] stacked projections
     num_proj: int = 1024,
     knots: int = 17,
+    normalize_by_n: bool = False,
+    projections: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sliced Epps-Pulley Gaussianity statistic (SIGReg).
 
@@ -264,29 +267,47 @@ def sigreg_epps_pulley(
     projection with the standard Gaussian characteristic function
     ``exp(-t^2/2)`` on a fixed knot grid (real AND imaginary parts).
 
-    Forced to float32 internally; ``normalize_by_n=False`` (the raw
-    statistic, no sample-size scaling).  Returns a graph-connected zero
+    Forced to float32 internally.  The view dimension is preserved as a
+    batch dimension, matching LeVJEPA's sliced univariate test over
+    ``(*, N, D)`` inputs.  ``normalize_by_n=False`` keeps the LeVJEPA
+    Epps-Pulley sample-count multiplier.  Returns a graph-connected zero
     when there are too few samples.
     """
     V, N, d = q_views.shape
-    if V * N < 2:
+    if N < 2:
         return q_views.mean() * 0.0
     x = q_views.float()
     device = x.device
-    g = torch.randn(num_proj, d, device=device, dtype=torch.float32)
-    g = F.normalize(g, dim=-1)                                 # [P, d]
-    y = torch.einsum("vnd,pd->vnp", x, g)                      # [V, N, P]
-    y_flat = y.reshape(-1, num_proj)                           # [V*N, P]
-    mu = y_flat.mean(dim=0, keepdim=True)
-    std = y_flat.std(dim=0, keepdim=True).clamp_min(1e-4)
-    z = (y_flat - mu) / std                                    # [V*N, P]
-    ts = torch.linspace(-2.0, 2.0, knots, device=device, dtype=torch.float32)
-    arg = ts.view(knots, 1, 1) * z.t().view(1, num_proj, -1)   # [knots, P, V*N]
-    phi_real = arg.cos().mean(dim=-1)                          # [knots, P]
-    phi_imag = arg.sin().mean(dim=-1)
-    target = torch.exp(-0.5 * ts * ts).view(knots, 1)          # [knots, 1]
-    err = (phi_real - target).square() + phi_imag.square()     # [knots, P]
-    return err.mean()
+    if projections is None:
+        A = torch.randn(d, num_proj, device=device, dtype=torch.float32)
+    else:
+        A = projections.to(device=device, dtype=torch.float32)
+        if A.shape == (num_proj, d):
+            A = A.t()
+        if A.shape != (d, num_proj):
+            raise ValueError(
+                f"projections must have shape ({d}, {num_proj}) or ({num_proj}, {d}), "
+                f"got {tuple(A.shape)}"
+            )
+    A = A / A.norm(p=2, dim=0, keepdim=True).clamp_min(1e-12)  # [d, P]
+    y = x @ A                                                  # [V, N, P]
+
+    t_max = 3.0
+    ts = torch.linspace(0.0, t_max, knots, device=device, dtype=torch.float32)
+    dt = t_max / (knots - 1)
+    weights = torch.full((knots,), 2.0 * dt, device=device, dtype=torch.float32)
+    weights[[0, -1]] = dt
+    phi = torch.exp(-0.5 * ts.square())                        # [K]
+    weights = weights * phi                                    # Gaussian window
+
+    arg = y.unsqueeze(-1) * ts                                 # [V, N, P, K]
+    phi_real = arg.cos().mean(dim=1)                           # [V, P, K]
+    phi_imag = arg.sin().mean(dim=1)
+    err = (phi_real - phi.view(1, 1, knots)).square() + phi_imag.square()
+    stats = err @ weights                                      # [V, P]
+    if not normalize_by_n:
+        stats = stats * N
+    return stats.mean()
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +339,11 @@ def rep_loss_forward(
     d_ssm = h_internal.shape[-1]
     ssm_param = next(model.ssm.parameters())
     dev, ssm_dtype = ssm_param.device, ssm_param.dtype
-    valid_b, valid_w = valid_mask_cpu.nonzero(as_tuple=True)
+    window_batch = window_batch.to(device=dev, dtype=ssm_dtype)
+    spatial_features = spatial_features.to(device=dev, dtype=ssm_dtype)
+    spatial_mask_dev = spatial_mask.to(device=dev, dtype=torch.bool)
+    valid_mask_dev = valid_mask_cpu.to(device=dev, dtype=torch.bool)
+    valid_b, valid_w = valid_mask_dev.nonzero(as_tuple=True)
 
     # ---- per-(epoch, video) progressive ratios (fixed within a video) ----
     rho_map: Dict[str, Tuple[float, float]] = {}
@@ -333,13 +358,13 @@ def rep_loss_forward(
 
     # ---- secondary LOF over the v3 spatial cache (no ViT re-run) ----
     x_l1 = torch.zeros(B, T, model.llm_hidden,
-                       device=window_batch.device, dtype=window_batch.dtype)
+                       device=dev, dtype=ssm_dtype)
     x_l2 = torch.zeros_like(x_l1)
     for i in range(len(valid_b)):
         b = int(valid_b[i].item())
         w = int(valid_w[i].item())
         r1, r2 = rho_map[batch["video_id"][b]]
-        C = spatial_features[b, w][spatial_mask[b, w].bool()]  # [R, C]
+        C = spatial_features[b, w][spatial_mask_dev[b, w]]     # [R, C]
         c_l1, _ = model.spatial(C, r1)
         c_l2, _ = model.spatial(C, r2)
         x_l1[b, w] = c_l1.mean(dim=0)
@@ -366,26 +391,22 @@ def rep_loss_forward(
 
     # ---- EMA future teacher: global compressed features only, no grad ----
     h_bar = torch.zeros(B, T, d_ssm, device=dev, dtype=ssm_dtype)
-    was_training = model.ema_ssm.training
     model.ema_ssm.eval()
-    try:
-        with torch.no_grad():
-            for b in range(B):
-                vid = batch["video_id"][b]
-                bw = valid_w[valid_b == b]
-                if len(bw) == 0:
-                    continue
-                xb = window_batch[b:b + 1, bw].to(device=dev, dtype=ssm_dtype)
-                prev = rep_caches["ema"].get(vid)
-                if prev is not None:
-                    prev = {i: s.detach() for i, s in prev.items()}
-                _, new_st, internal = model.ema_ssm.forward_chunk(
-                    xb, state=prev, return_internal=True,
-                )
-                h_bar[b, bw] = internal.squeeze(0)
-                rep_caches["ema"][vid] = new_st
-    finally:
-        model.ema_ssm.train(was_training)
+    with torch.no_grad():
+        for b in range(B):
+            vid = batch["video_id"][b]
+            bw = valid_w[valid_b == b]
+            if len(bw) == 0:
+                continue
+            xb = window_batch[b:b + 1, bw]
+            prev = rep_caches["ema"].get(vid)
+            if prev is not None:
+                prev = {i: s.detach() for i, s in prev.items()}
+            _, new_st, internal = model.ema_ssm.forward_chunk(
+                xb, state=prev, return_internal=True,
+            )
+            h_bar[b, bw] = internal.squeeze(0)
+            rep_caches["ema"][vid] = new_st
 
     # ---- losses ----
     h_g = h_internal.to(device=dev, dtype=ssm_dtype)
@@ -397,7 +418,7 @@ def rep_loss_forward(
 
     loss_future, f_info = future_loss(
         model.future_predictor, [h_g, h_l1, h_l2], h_bar,
-        valid_mask_cpu, view_weights, horizon2_weight,
+        valid_mask_dev, view_weights, horizon2_weight,
         detach_inputs=detach_inputs,
     )
 
@@ -411,17 +432,17 @@ def rep_loss_forward(
         q_g = model.sig_projector(h_g)
         q_l1 = model.sig_projector(h_l1)
         q_l2 = model.sig_projector(h_l2)
-        loss_inv = invariance_loss_from_q(q_g, q_l1, q_l2, valid_mask_cpu)
+        loss_inv = invariance_loss_from_q(q_g, q_l1, q_l2, valid_mask_dev)
         q_stack = torch.stack([q_g, q_l1, q_l2], dim=0)        # [3, B, T, d]
         loss_sig = sigreg_epps_pulley(
-            q_stack[:, valid_mask_cpu.bool()],                 # [3, N, d]
+            q_stack[:, valid_mask_dev],                        # [3, N, d]
             num_proj=sig_num_proj, knots=sig_knots,
         )
 
     loss_rep = loss_future + loss_inv + sig_weight * loss_sig
 
     with torch.no_grad():
-        v = valid_mask_cpu.bool()
+        v = valid_mask_dev
         if bool(v.any()):
             norm_h_global = float(h_g[v].float().norm(dim=-1).mean().item())
             norm_h_local1 = float(h_l1[v].float().norm(dim=-1).mean().item())
