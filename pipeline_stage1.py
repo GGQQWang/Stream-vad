@@ -72,6 +72,15 @@ from ibq_utils import (
     load_ibq_cache,
 )
 from world_model import WorldModelBranch
+from rep_learning import (
+    FuturePredictor,
+    SIGProjector,
+    clear_rep_finished_states,
+    configure_rep_modules,
+    init_ema,
+    rep_loss_forward,
+    update_ema,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +538,14 @@ class StreamingVADGenerationModel(nn.Module):
         self.world_branch = WorldModelBranch(
             llm_hidden=llm_hidden, d_ssm=d_ssm,
         )
+        # Progressive Compression Predictive Representation branch
+        # (training-only): shared-SSM progressive local views, an EMA
+        # future teacher, a shared future predictor and a LeVJEPA-style
+        # SIG projector.  Nothing here is used at inference.
+        self.future_predictor = FuturePredictor(d_model=d_ssm)
+        self.sig_projector = SIGProjector(d_model=d_ssm)
+        self.ema_ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
+                                n_layers=n_ssm, llm_hidden=llm_hidden)
         self.register_buffer(
             "ibq_codebook",
             torch.empty(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM),
@@ -1793,6 +1810,22 @@ def main():
                        help="IBQ positions per logits chunk (memory bound)")
     parser.add_argument("--world-baseline-every", type=int, default=100,
                        help="run the zero-temporal shortcut baseline every N optimizer steps (0 disables)")
+    parser.add_argument("--lambda-rep", type=float, default=0.0,
+                       help="weight for the Progressive Compression Predictive Representation loss "
+                            "(0 disables it; mutually exclusive with --lambda-world)")
+    parser.add_argument("--rep-warmup-steps", type=int, default=500,
+                       help="first N optimizer updates train ONLY the future predictor (h detached; "
+                            "invariance/SIGReg zeroed)")
+    parser.add_argument("--rep-ema-momentum", type=float, default=0.996,
+                       help="EMA momentum for the future-teacher SSM")
+    parser.add_argument("--rep-local1-min", type=float, default=0.75)
+    parser.add_argument("--rep-local1-max", type=float, default=0.95)
+    parser.add_argument("--rep-local2-min", type=float, default=0.50)
+    parser.add_argument("--rep-local2-max", type=float, default=0.75)
+    parser.add_argument("--rep-horizon2-weight", type=float, default=0.5)
+    parser.add_argument("--rep-sig-weight", type=float, default=0.02)
+    parser.add_argument("--rep-sig-num-proj", type=int, default=1024)
+    parser.add_argument("--rep-sig-knots", type=int, default=17)
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -1816,6 +1849,15 @@ def main():
         raise ValueError("--save-every must be >= 1")
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
+    if args.lambda_rep > 0 and args.lambda_world > 0:
+        raise ValueError("--lambda-rep and --lambda-world are mutually exclusive")
+    if args.lambda_rep > 0 and args.objective != "score_token":
+        raise ValueError("--lambda-rep > 0 currently requires --objective score_token")
+    if args.lambda_rep > 0 and not args.feature_cache_root:
+        raise ValueError(
+            "--lambda-rep > 0 requires the v3 feature cache with "
+            "spatial_features; pass --feature-cache-root"
+        )
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -1899,6 +1941,12 @@ def main():
         for p in model.world_branch.parameters():
             p.requires_grad = False
 
+    # rep branch: freeze its trainable modules when disabled so the
+    # baseline optimizer set is unchanged; the EMA SSM is always frozen.
+    # Fresh-training EMA starts as a copy of the freshly-initialized SSM.
+    rep_active = configure_rep_modules(model, args.lambda_rep)
+    init_ema(model.ema_ssm, model.ssm)
+
     # ---- param counts ----
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1922,7 +1970,7 @@ def main():
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
         anomaly_video_root=args.anomaly_video_root or None,
-        require_spatial=(args.lambda_world > 0),
+        require_spatial=(args.lambda_world > 0 or args.lambda_rep > 0),
     )
     from hivau_dataset import hivau_collate
     from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
@@ -1956,7 +2004,7 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             anomaly_video_root=args.anomaly_video_root or None,
-        require_spatial=(args.lambda_world > 0),
+            require_spatial=(args.lambda_world > 0 or args.lambda_rep > 0),
         )
         if args.objective in ("answer_ce", "score_token"):
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
@@ -2122,6 +2170,29 @@ def main():
                 ckpt["alpha_logit"].to(model.alpha_logit.device, model.alpha_logit.dtype)
             )
 
+        # ---- rep-learning modules (training-only) ----
+        rep_compatible = True
+        if "future_predictor" in ckpt and "sig_projector" in ckpt:
+            model.future_predictor.load_state_dict(ckpt["future_predictor"])
+            model.sig_projector.load_state_dict(ckpt["sig_projector"])
+            if not init_only and "ema_ssm" in ckpt:
+                # resume must never overwrite an already-trained EMA
+                model.ema_ssm.load_state_dict(ckpt["ema_ssm"])
+            else:
+                # init-checkpoint (or a resume checkpoint without EMA):
+                # EMA starts from the loaded online SSM
+                init_ema(model.ema_ssm, model.ssm)
+        else:
+            # checkpoint predates the rep branch: predictor/projector stay
+            # freshly initialized, EMA starts from the loaded online SSM
+            rep_compatible = False
+            init_ema(model.ema_ssm, model.ssm)
+            print(
+                "WARNING: checkpoint predates the rep-learning branch; "
+                "future_predictor/sig_projector are freshly initialized and "
+                "ema_ssm was initialized from the loaded online SSM."
+            )
+
         # LoRA adapter (must stay trainable, otherwise training is a no-op)
         qwen.load_adapter(str(lora_dir), adapter_name="default", is_trainable=True)
 
@@ -2133,16 +2204,18 @@ def main():
             optimizer_restored = False
             scheduler_restored = False
             training_state_reset = False
-            if "optimizer" in ckpt and world_predictor_compatible:
+            if "optimizer" in ckpt and world_predictor_compatible and (
+                rep_compatible or args.lambda_rep <= 0
+            ):
                 optimizer.load_state_dict(ckpt["optimizer"])
                 optimizer_restored = True
             elif "optimizer" in ckpt:
                 training_state_reset = True
                 print(
                     "WARNING: optimizer state was not restored because "
-                    "the world branch architecture changed. Model weights for "
-                    "compatible modules were restored, but optimizer moments "
-                    "are reinitialized."
+                    "the world/rep branch architecture changed. Model weights "
+                    "for compatible modules were restored, but optimizer "
+                    "moments are reinitialized."
                 )
             if "scheduler" in ckpt and optimizer_restored:
                 scheduler.load_state_dict(ckpt["scheduler"])
@@ -2200,6 +2273,9 @@ def main():
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
             "world_branch": model.world_branch.state_dict(),
+            "future_predictor": model.future_predictor.state_dict(),
+            "sig_projector": model.sig_projector.state_dict(),
+            "ema_ssm": model.ema_ssm.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -2231,6 +2307,17 @@ def main():
             "world_horizon": args.world_horizon,
             "world_warmup_steps": args.world_warmup_steps,
             "ibq_cache_root": args.ibq_cache_root,
+            "lambda_rep": args.lambda_rep,
+            "rep_warmup_steps": args.rep_warmup_steps,
+            "rep_ema_momentum": args.rep_ema_momentum,
+            "rep_local1_min": args.rep_local1_min,
+            "rep_local1_max": args.rep_local1_max,
+            "rep_local2_min": args.rep_local2_min,
+            "rep_local2_max": args.rep_local2_max,
+            "rep_horizon2_weight": args.rep_horizon2_weight,
+            "rep_sig_weight": args.rep_sig_weight,
+            "rep_sig_num_proj": args.rep_sig_num_proj,
+            "rep_sig_knots": args.rep_sig_knots,
             "mil_margin": args.mil_margin,
             "binary_threshold": args.binary_threshold,
             "feature_cache_root": args.feature_cache_root,
@@ -2263,6 +2350,22 @@ def main():
         world_ibq_temporal_gain_list: List[float] = []
         grad_conflict_cos_sw_list: List[float] = []
         grad_conflict_cos_mw_list: List[float] = []
+        train_rep_losses: List[float] = []
+        train_future_losses: List[float] = []
+        train_future_t1_list: List[float] = []
+        train_future_t2_list: List[float] = []
+        train_inv_losses: List[float] = []
+        train_sig_losses: List[float] = []
+        future_global_list: List[float] = []
+        future_local1_list: List[float] = []
+        future_local2_list: List[float] = []
+        rep_rho_l1_list: List[float] = []
+        rep_rho_l2_list: List[float] = []
+        rep_warmup_list: List[float] = []
+        norm_h_global_list: List[float] = []
+        norm_h_local1_list: List[float] = []
+        norm_h_local2_list: List[float] = []
+        norm_q_global_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2281,6 +2384,7 @@ def main():
         if args.objective == "score_token":
             # ---- fully-supervised score token ----
             ssm_cache: dict = {}
+            rep_caches: dict = {"local1": {}, "local2": {}, "ema": {}}
             pbar = tqdm(train_loader, desc=f"Epoch {epoch} score_token")
 
             for step, batch in enumerate(pbar):
@@ -2350,6 +2454,11 @@ def main():
                     "ibq_ce_zero_temporal": None,
                     "ibq_temporal_gain": None,
                 }
+                # rep branch runs inside the else branch below; these
+                # defaults keep the shared is_update / logging code valid
+                # when the world-warmup branch is taken instead
+                rep_can_run = False
+                rep_warmup = False
 
                 if warmup_phase:
                     # pure world warmup: skip the Qwen score forward, the
@@ -2439,11 +2548,75 @@ def main():
                             + args.lambda_sum * loss_summary
                         )
                         loss_world_weighted = args.lambda_world * loss_world
+
+                        # --- Progressive Compression Predictive Representation
+                        # branch (training-only; mutually exclusive with world) ---
+                        loss_rep = state_emb.new_zeros(())
+                        rep_info: dict = {"n_anchors": 0}
+                        rep_warmup = False
+                        rep_can_run = (
+                            rep_active
+                            and h_internal is not None
+                            and batch.get("spatial_features") is not None
+                        )
+                        if rep_can_run:
+                            rep_warmup = (
+                                args.rep_warmup_steps > 0
+                                and global_step < args.rep_warmup_steps
+                            )
+                            loss_rep, rep_info = rep_loss_forward(
+                                model,
+                                window_batch,
+                                batch["spatial_features"].to(device=device),
+                                batch["spatial_mask"],
+                                valid_mask_cpu,
+                                h_internal,
+                                batch,
+                                epoch,
+                                args.seed,
+                                (args.rep_local1_min, args.rep_local1_max),
+                                (args.rep_local2_min, args.rep_local2_max),
+                                args.rep_horizon2_weight,
+                                args.rep_sig_weight,
+                                args.rep_sig_num_proj,
+                                args.rep_sig_knots,
+                                detach_inputs=rep_warmup,
+                                rep_caches=rep_caches,
+                            )
+                        loss_rep_weighted = args.lambda_rep * loss_rep
                         raw_total_loss = (
                             loss_main_weighted
                             + loss_world_weighted
+                            + loss_rep_weighted
                         )
                         total_loss = raw_total_loss / group_size
+
+                        # --- main/rep gradient-conflict diagnostic (formal
+                        # phase only, pure observation, every 100 steps) ---
+                        do_rep_grad_conflict = (
+                            rep_can_run
+                            and not rep_warmup
+                            and rep_info.get("n_anchors", 0) > 0
+                            and is_update
+                            and (global_step + 1) % 100 == 0
+                        )
+                        if do_rep_grad_conflict:
+                            gmr = grad_conflict_stats(
+                                loss_main_weighted,
+                                loss_rep_weighted,
+                                model.ssm.parameters(),
+                            )
+                            print(
+                                f"GRAD_MAIN_REP step={global_step} "
+                                f"main_rep_cos={gmr['cosine']:.4f} "
+                                f"main_norm={gmr['norm_a']:.4f} "
+                                f"rep_norm={gmr['norm_b']:.4f} "
+                                f"rep_main_ratio={gmr['ratio']:.4f}"
+                            )
+                            writer.add_scalar("grad/main_rep_cosine", gmr["cosine"], global_step)
+                            writer.add_scalar("grad/main_norm", gmr["norm_a"], global_step)
+                            writer.add_scalar("grad/rep_norm", gmr["norm_b"], global_step)
+                            writer.add_scalar("grad/rep_main_ratio", gmr["ratio"], global_step)
 
                         # --- gradient-conflict diagnostics (Stage C only,
                         # pure observation, every 100 optimizer steps) ---
@@ -2503,6 +2676,10 @@ def main():
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
+                    if rep_can_run:
+                        # once per REAL optimizer step, never per
+                        # grad-accum micro-batch
+                        update_ema(model.ema_ssm, model.ssm, args.rep_ema_momentum)
                     if global_step % 500 == 0 and train_world_ibq_losses:
                         writer.add_scalar("train/loss_world", finite_mean(train_world_losses[-500:]), global_step)
                         writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses[-500:]), global_step)
@@ -2513,12 +2690,49 @@ def main():
                             writer.add_scalar("step/ibq_ce_zero_temporal", finite_mean(world_ibq_zero_temporal_list[-500:]), global_step)
                         if world_ibq_temporal_gain_list:
                             writer.add_scalar("step/ibq_temporal_gain", finite_mean(world_ibq_temporal_gain_list[-500:]), global_step)
+                    if global_step % 500 == 0 and train_rep_losses:
+                        for tag, vals in (
+                            ("step/loss_rep", train_rep_losses),
+                            ("step/loss_future", train_future_losses),
+                            ("step/loss_future_t1", train_future_t1_list),
+                            ("step/loss_future_t2", train_future_t2_list),
+                            ("step/loss_inv", train_inv_losses),
+                            ("step/loss_sigreg", train_sig_losses),
+                            ("step/future_global", future_global_list),
+                            ("step/future_local1", future_local1_list),
+                            ("step/future_local2", future_local2_list),
+                            ("step/rep_rho_local1", rep_rho_l1_list),
+                            ("step/rep_rho_local2", rep_rho_l2_list),
+                            ("step/rep_warmup_active", rep_warmup_list),
+                            ("norm/h_global", norm_h_global_list),
+                            ("norm/h_local1", norm_h_local1_list),
+                            ("norm/h_local2", norm_h_local2_list),
+                            ("norm/q_global", norm_q_global_list),
+                        ):
+                            writer.add_scalar(tag, finite_mean(vals[-500:]), global_step)
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
                 train_summary_losses.append(float(loss_summary.detach().item()))
                 train_world_losses.append(float(loss_world.detach().item()))
                 train_world_ibq_losses.append(float(world_info["loss_world_ibq"]))
+                if rep_can_run:
+                    train_rep_losses.append(float(loss_rep.detach().item()))
+                    train_future_losses.append(rep_info["loss_future"])
+                    train_future_t1_list.append(rep_info["loss_future_t1"])
+                    train_future_t2_list.append(rep_info["loss_future_t2"])
+                    train_inv_losses.append(rep_info["loss_inv"])
+                    train_sig_losses.append(rep_info["loss_sigreg"])
+                    future_global_list.append(rep_info["future_global"])
+                    future_local1_list.append(rep_info["future_local1"])
+                    future_local2_list.append(rep_info["future_local2"])
+                    rep_rho_l1_list.append(rep_info["rho_local1"])
+                    rep_rho_l2_list.append(rep_info["rho_local2"])
+                    rep_warmup_list.append(1.0 if rep_warmup else 0.0)
+                    norm_h_global_list.append(rep_info["norm_h_global"])
+                    norm_h_local1_list.append(rep_info["norm_h_local1"])
+                    norm_h_local2_list.append(rep_info["norm_h_local2"])
+                    norm_q_global_list.append(rep_info["norm_q_global"])
                 if world_info["ibq_ce_temporal"] is not None:
                     world_ibq_temporal_list.append(world_info["ibq_ce_temporal"])
                 if world_info["ibq_ce_zero_temporal"] is not None:
@@ -2553,6 +2767,8 @@ def main():
                         )
 
                 _clear_finished_states(model, batch, ssm_cache)
+                if rep_can_run:
+                    clear_rep_finished_states(batch, rep_caches)
 
                 pbar.set_postfix(
                     loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
@@ -2758,6 +2974,19 @@ def main():
             if train_world_losses:
                 writer.add_scalar("train/loss_world", finite_mean(train_world_losses), epoch)
                 writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses), epoch)
+            if train_rep_losses:
+                writer.add_scalar("train/loss_rep", finite_mean(train_rep_losses), epoch)
+                writer.add_scalar("train/loss_future", finite_mean(train_future_losses), epoch)
+                writer.add_scalar("train/loss_inv", finite_mean(train_inv_losses), epoch)
+                writer.add_scalar("train/loss_sigreg", finite_mean(train_sig_losses), epoch)
+                print(
+                    f"  rep={finite_mean(train_rep_losses):.4f} "
+                    f"future={finite_mean(train_future_losses):.4f} "
+                    f"inv={finite_mean(train_inv_losses):.4f} "
+                    f"sigreg={finite_mean(train_sig_losses):.4f} "
+                    f"rho_l1={finite_mean(rep_rho_l1_list):.3f} "
+                    f"rho_l2={finite_mean(rep_rho_l2_list):.3f}"
+                )
             # step/* tags are written at the 500-step boundary with
             # global_step only; no epoch-scalar duplicates here
             if grad_conflict_cos_sw_list:

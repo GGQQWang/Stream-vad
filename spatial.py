@@ -36,18 +36,23 @@ class SpatialTokenCompressor(nn.Module):
     def forward(
         self,
         visual_embeds: torch.Tensor,
+        reduction_ratio: float | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compress visual token sequence.
 
         Args:
             visual_embeds: [L, C]. Stack of visual token embeddings.
+            reduction_ratio: optional per-call override of
+                ``self.reduction_ratio`` (used for the progressive local
+                views); ``None`` keeps the original configured behaviour.
 
         Returns:
             merged_features: [R, C]. Compressed token embeddings,
-                            R = max(1, ceil(L * reduction_ratio)).
+                            R = max(1, int(L * ratio)).
             kept_indices: [R] long tensor. Indices of selected cluster centres
                          in the original sequence (sorted ascending).
         """
+        ratio = self.reduction_ratio if reduction_ratio is None else reduction_ratio
         L, C = visual_embeds.shape
         k = min(self.k, L - 1)  # can't have more neighbours than tokens
         if k < 1:
@@ -77,7 +82,7 @@ class SpatialTokenCompressor(nn.Module):
         lrd = k / (reach_nbr.sum(dim=1) + 1e-10)                # [L]
 
         # ---- select cluster centres ----
-        R = max(1, int(L * self.reduction_ratio))
+        R = max(1, int(L * ratio))
         _, topk_idx = torch.topk(lrd, k=R, dim=0, largest=True)
         centres_idx, _ = torch.sort(topk_idx)                   # [R]
         centres = embeds[centres_idx]                           # [R, C]
