@@ -1899,8 +1899,10 @@ def main():
     ).to(device)
     qwen.config.use_cache = False
     if hasattr(qwen, "gradient_checkpointing_enable"):
-        qwen.gradient_checkpointing_enable()
-        print("Enabled Qwen gradient checkpointing and disabled use_cache.")
+        qwen.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("Enabled Qwen non-reentrant gradient checkpointing and disabled use_cache.")
     else:
         print("WARNING: Qwen model does not expose gradient_checkpointing_enable(); use_cache disabled only.")
 
