@@ -64,6 +64,7 @@ class WorldModelBranch(nn.Module):
         nhead: int = 8,
         num_layers: int = 2,
         dim_feedforward: int = 1024,
+        include_decoder: bool = True,
     ):
         super().__init__()
         assert IBQ_CODE_EMBED_DIM == decoder_dim, (
@@ -72,9 +73,11 @@ class WorldModelBranch(nn.Module):
         )
         self.d_ssm = d_ssm
         self.decoder_dim = decoder_dim
+        self.include_decoder = include_decoder
 
         # --- current visual context projection ---
-        self.visual_proj = nn.Linear(llm_hidden, decoder_dim)
+        if include_decoder:
+            self.visual_proj = nn.Linear(llm_hidden, decoder_dim)
 
         # --- temporal dynamics projector: h_t -> 512 -> decoder_dim ---
         self.temporal_proj = nn.Sequential(
@@ -84,25 +87,28 @@ class WorldModelBranch(nn.Module):
         )
 
         # --- decoder input tokens ---
-        self.world_bos = nn.Parameter(torch.randn(1, decoder_dim) * 0.02)
-        self.row_pos = nn.Parameter(torch.randn(IBQ_GRID_ROWS, decoder_dim) * 0.02)
-        self.col_pos = nn.Parameter(torch.randn(IBQ_GRID_COLS, decoder_dim) * 0.02)
+        if include_decoder:
+            self.world_bos = nn.Parameter(torch.randn(1, decoder_dim) * 0.02)
+            self.row_pos = nn.Parameter(torch.randn(IBQ_GRID_ROWS, decoder_dim) * 0.02)
+            self.col_pos = nn.Parameter(torch.randn(IBQ_GRID_COLS, decoder_dim) * 0.02)
 
         # --- autoregressive decoder ---
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=decoder_dim,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        if include_decoder:
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=decoder_dim,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                batch_first=True,
+                norm_first=True,
+            )
+            self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
         # --- output projection into codebook embedding space ---
-        self.output_proj = nn.Sequential(
-            nn.LayerNorm(decoder_dim),
-            nn.Linear(decoder_dim, decoder_dim),
-        )
+        if include_decoder:
+            self.output_proj = nn.Sequential(
+                nn.LayerNorm(decoder_dim),
+                nn.Linear(decoder_dim, decoder_dim),
+            )
 
     # ------------------------------------------------------------------
     def _position_ids(self, device: torch.device) -> torch.Tensor:
@@ -127,6 +133,8 @@ class WorldModelBranch(nn.Module):
         are computed in chunks of ``logit_chunk_size`` positions to
         bound peak memory.
         """
+        if not self.include_decoder:
+            raise RuntimeError("WorldModelBranch was constructed without the IBQ decoder")
         T = IBQ_TOKENS_PER_FRAME
         assert tgt.numel() == T, f"target has {tgt.numel()} tokens, expected {T}"
         assert ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, self.decoder_dim), (
