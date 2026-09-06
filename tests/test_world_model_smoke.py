@@ -5,7 +5,10 @@ Run on the server:
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import sys
+import types
 
 from ibq_utils import (
     IBQ_CODE_EMBED_DIM,
@@ -13,6 +16,56 @@ from ibq_utils import (
     IBQ_TOKENS_PER_FRAME,
 )
 from world_model import IBQ_GRID_COLS, IBQ_GRID_ROWS, WorldModelBranch
+
+
+def _install_pipeline_import_stubs():
+    tb_mod = types.ModuleType("torch.utils.tensorboard")
+    tb_mod.SummaryWriter = object
+    sys.modules.setdefault("torch.utils.tensorboard", tb_mod)
+
+    tr_mod = types.ModuleType("transformers")
+    tr_mod.AutoTokenizer = object
+    tr_mod.Qwen2VLForConditionalGeneration = nn.Module
+    tr_mod.Qwen2VLProcessor = object
+    tr_mod.get_linear_schedule_with_warmup = lambda *args, **kwargs: None
+    tr_mod.set_seed = lambda *args, **kwargs: None
+    sys.modules.setdefault("transformers", tr_mod)
+
+    peft_mod = types.ModuleType("peft")
+    peft_mod.LoraConfig = object
+    peft_mod.get_peft_model = lambda model, *args, **kwargs: model
+    sys.modules.setdefault("peft", peft_mod)
+
+
+def _import_pipeline_stage1():
+    _install_pipeline_import_stubs()
+    import pipeline_stage1 as pipe
+    return pipe
+
+
+class _FakeSSM(nn.Module):
+    def __init__(self, d_input, d_model=256, n_layers=1, llm_hidden=None):
+        super().__init__()
+        out_dim = d_input if llm_hidden is None else llm_hidden
+        self.in_proj = nn.Sequential(
+            nn.Linear(d_input, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.out_proj = nn.Linear(d_model, out_dim)
+
+    def forward_chunk(self, x, state=None, return_internal=False):
+        h = self.in_proj(x)
+        out = self.out_proj(h)
+        new_state = {0: h[:, -1:].detach()}
+        if return_internal:
+            return out, new_state, h
+        return out, new_state
+
+
+class _FakeQwen(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.visual = nn.Identity()
 
 
 def _rand_target():
@@ -107,7 +160,7 @@ def test_joint_gradient_reaches_h_through_temporal_proj():
 def test_warmup_detach_blocks_gradient():
     """With detach_states=True in _world_model_loss, h_internal must
     receive no gradient (warmup semantics)."""
-    from pipeline_stage1 import _world_model_loss
+    _world_model_loss = _import_pipeline_stage1()._world_model_loss
 
     class _FakeModel:
         def __init__(self):
@@ -150,6 +203,125 @@ def test_grid_shape_assert():
     print("test 8 OK: grid shape consistent")
 
 
+def _make_streaming_model(world_include_decoder=True):
+    pipe = _import_pipeline_stage1()
+
+    class _FakeViTForwarder(nn.Module):
+        def __init__(self, visual, reducer):
+            super().__init__()
+            self.visual = visual
+            self.reducer = reducer
+
+    old_ssm = pipe.SSMBlock
+    old_vit = pipe.ViTForwarder
+    try:
+        pipe.SSMBlock = _FakeSSM
+        pipe.ViTForwarder = _FakeViTForwarder
+        model = pipe.StreamingVADGenerationModel(
+            _FakeQwen(),
+            d_ssm=256,
+            llm_hidden=16,
+            world_include_decoder=world_include_decoder,
+        )
+    finally:
+        pipe.SSMBlock = old_ssm
+        pipe.ViTForwarder = old_vit
+    return model
+
+
+def test_zero_init_modulation_matches_old_formula():
+    torch.manual_seed(0)
+    model = _make_streaming_model()
+    window_batch = torch.randn(1, 3, 16)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    state, _, ssm_out, h_internal, _ = model.encode_window_features(
+        window_batch, valid, ["v0"], {}, training=True, return_internal=True,
+    )
+    alpha = torch.sigmoid(model.alpha_logit)
+    old_formula = window_batch + alpha * model.adapter(ssm_out)
+    assert torch.allclose(state, old_formula, atol=1e-6)
+    gamma = torch.tanh(model.temporal_modulator(model.world_branch.temporal_proj(h_internal)))
+    assert torch.count_nonzero(gamma).item() == 0
+    print("test 9 OK: zero-init temporal modulation is exactly baseline-equivalent")
+
+
+def test_temporal_modulator_receives_anomaly_gradient():
+    torch.manual_seed(0)
+    model = _make_streaming_model()
+    window_batch = torch.randn(1, 3, 16)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    state, *_ = model.encode_window_features(
+        window_batch, valid, ["v0"], {}, training=True, return_internal=True,
+    )
+    state.sum().backward()
+    assert model.temporal_modulator[-1].weight.grad is not None
+    assert model.temporal_modulator[-1].weight.grad.abs().sum() > 0
+    print("test 10 OK: anomaly path gives temporal_modulator gradients")
+
+
+def test_stage_c_modulation_path_reaches_temporal_proj_and_ssm():
+    torch.manual_seed(0)
+    model = _make_streaming_model()
+    with torch.no_grad():
+        model.temporal_modulator[-1].weight.fill_(0.01)
+    window_batch = torch.randn(1, 3, 16)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    state, _, ssm_out, _, _ = model.encode_window_features(
+        window_batch, valid, ["v0"], {}, training=True, return_internal=True,
+    )
+    alpha = torch.sigmoid(model.alpha_logit)
+    old_formula = window_batch + alpha * model.adapter(ssm_out)
+    modulation_only = (state - old_formula.detach()).sum()
+    modulation_only.backward()
+    assert model.world_branch.temporal_proj[0].weight.grad is not None
+    assert model.world_branch.temporal_proj[0].weight.grad.abs().sum() > 0
+    assert model.ssm.in_proj[0].weight.grad is not None
+    assert model.ssm.in_proj[0].weight.grad.abs().sum() > 0
+    print("test 11 OK: Stage C modulation path reaches temporal_proj and SSM")
+
+
+def test_inference_model_runs_without_ibq_decoder():
+    torch.manual_seed(0)
+    model = _make_streaming_model(world_include_decoder=False)
+    assert not hasattr(model.world_branch, "decoder")
+    assert not hasattr(model.world_branch, "visual_proj")
+    assert model.ibq_codebook.numel() == 0
+    window_batch = torch.randn(1, 3, 16)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    state, _, _, _ = model.encode_window_features(
+        window_batch, valid, ["v0"], {}, training=False, return_internal=False,
+    )
+    assert state.shape == (1, 3, 16)
+    print("test 12 OK: inference model encodes without IBQ decoder/codebook/visual_proj")
+
+
+def test_legacy_checkpoint_missing_modulator_keeps_zero_init():
+    torch.manual_seed(0)
+    model = _make_streaming_model()
+    pipe = _import_pipeline_stage1()
+    ckpt = {"world_branch": model.world_branch.state_dict()}
+    pipe._load_temporal_conditioning(model, ckpt)
+    assert torch.count_nonzero(model.temporal_modulator[-1].weight).item() == 0
+    assert torch.count_nonzero(model.temporal_modulator[-1].bias).item() == 0
+    print("test 13 OK: legacy checkpoint without temporal_modulator stays zero-init")
+
+
+def test_stage_b_warmup_trainability():
+    model = _make_streaming_model()
+    pipe = _import_pipeline_stage1()
+    pipe._set_world_warmup_trainability(model, True)
+    assert all(not p.requires_grad for p in model.ssm.parameters())
+    assert all(not p.requires_grad for p in model.adapter.parameters())
+    assert all(not p.requires_grad for p in model.temporal_modulator.parameters())
+    assert all(p.requires_grad for p in model.world_branch.parameters())
+    assert all(p.requires_grad for p in model.world_branch.temporal_proj.parameters())
+    pipe._set_world_warmup_trainability(model, False)
+    assert all(p.requires_grad for p in model.ssm.parameters())
+    assert all(p.requires_grad for p in model.adapter.parameters())
+    assert all(p.requires_grad for p in model.temporal_modulator.parameters())
+    print("test 14 OK: Stage B warmup freezes main path and keeps world_branch trainable")
+
+
 if __name__ == "__main__":
     test_decoder_produces_per_position_ce()
     test_temporal_proj_structure()
@@ -159,4 +331,10 @@ if __name__ == "__main__":
     test_joint_gradient_reaches_h_through_temporal_proj()
     test_warmup_detach_blocks_gradient()
     test_grid_shape_assert()
+    test_zero_init_modulation_matches_old_formula()
+    test_temporal_modulator_receives_anomaly_gradient()
+    test_stage_c_modulation_path_reaches_temporal_proj_and_ssm()
+    test_inference_model_runs_without_ibq_decoder()
+    test_legacy_checkpoint_missing_modulator_keeps_zero_init()
+    test_stage_b_warmup_trainability()
     print("ALL WORLD-MODEL SMOKE TESTS PASSED")

@@ -23,6 +23,7 @@ from mil_utils import group_video_chunks
 from pipeline_stage1 import (
     StreamingVADGenerationModel,
     _find_embed,
+    _load_temporal_conditioning,
 )
 
 
@@ -143,9 +144,11 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         d_ssm=int(state.get("d_ssm", 256)),
         llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=1,
+        world_include_decoder=False,
     ).to(args.device)
     model.ssm.load_state_dict(state["ssm"])
     model.adapter.load_state_dict(state["adapter"])
+    _load_temporal_conditioning(model, state)
     model.score_head.load_state_dict(state["score_head"])
     model.score_query.data.copy_(state["score_query"].to(model.score_query.device, model.score_query.dtype))
     if "summary_query" in state:

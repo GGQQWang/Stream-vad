@@ -498,6 +498,7 @@ class StreamingVADGenerationModel(nn.Module):
         reduction_ratio: float = 0.5,
         lof_k: int = 8,
         vit_micro_batch: int = 1,
+        world_include_decoder: bool = True,
     ):
         super().__init__()
         visual = _find_visual(qwen)
@@ -528,19 +529,59 @@ class StreamingVADGenerationModel(nn.Module):
         # it, so no trainable [V, H] output layer exists.
         self.world_branch = WorldModelBranch(
             llm_hidden=llm_hidden, d_ssm=d_ssm,
+            include_decoder=world_include_decoder,
         )
-        self.register_buffer(
-            "ibq_codebook",
-            torch.empty(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM),
-            persistent=False,
+        self.temporal_modulator = nn.Sequential(
+            nn.LayerNorm(IBQ_CODE_EMBED_DIM),
+            nn.Linear(IBQ_CODE_EMBED_DIM, IBQ_CODE_EMBED_DIM),
+            nn.GELU(),
+            nn.Linear(IBQ_CODE_EMBED_DIM, llm_hidden),
         )
+        nn.init.zeros_(self.temporal_modulator[-1].weight)
+        nn.init.zeros_(self.temporal_modulator[-1].bias)
+        self.world_include_decoder = world_include_decoder
+        codebook = (
+            torch.empty(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+            if world_include_decoder else torch.empty(0)
+        )
+        self.register_buffer("ibq_codebook", codebook, persistent=False)
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
         self.llm_hidden = llm_hidden
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
+        self.last_modulation_stats: Dict[str, float] = {}
 
         # Full Qwen model with LoRA
         self.qwen = qwen
+
+    def _apply_temporal_modulation(
+        self,
+        base: torch.Tensor,
+        h_internal: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        d_t = self.world_branch.temporal_proj(h_internal)
+        gamma = torch.tanh(self.temporal_modulator(d_t))
+        modulated = (1.0 + gamma) * base
+        with torch.no_grad():
+            valid = valid_mask.bool().to(device=base.device)
+            if bool(valid.any()):
+                gamma_v = gamma[valid].detach().float()
+                base_v = base[valid].detach().float()
+                diff_v = (modulated[valid] - base[valid]).detach().float()
+                rel = diff_v.norm(dim=-1) / base_v.norm(dim=-1).clamp_min(1e-8)
+                self.last_modulation_stats = {
+                    "gamma_abs_mean": float(gamma_v.abs().mean().item()),
+                    "gamma_std": float(gamma_v.std(unbiased=False).item()),
+                    "modulation_delta_rel": float(rel.mean().item()),
+                }
+            else:
+                self.last_modulation_stats = {
+                    "gamma_abs_mean": math.nan,
+                    "gamma_std": math.nan,
+                    "modulation_delta_rel": math.nan,
+                }
+        return modulated
 
     def encode_window_features(
         self,
@@ -560,13 +601,11 @@ class StreamingVADGenerationModel(nn.Module):
             device=ssm_param.device,
             dtype=ssm_param.dtype,
         )
-        h_internal = None
-        if return_internal:
-            h_internal = torch.zeros(
-                window_batch.shape[0], window_batch.shape[1],
-                self.ssm.in_proj[0].out_features,
-                device=ssm_param.device, dtype=ssm_param.dtype,
-            )
+        h_internal = torch.zeros(
+            window_batch.shape[0], window_batch.shape[1],
+            self.ssm.in_proj[0].out_features,
+            device=ssm_param.device, dtype=ssm_param.dtype,
+        )
         for b in range(window_batch.shape[0]):
             vid = chunk_video_ids[b]
             bw = valid_w[valid_b == b]
@@ -582,15 +621,12 @@ class StreamingVADGenerationModel(nn.Module):
                     f"SSM_STATE video_id={vid} valid_windows={len(bw)} "
                     f"reuse_prev={had_prev} detached={bool(training and had_prev)}"
                 )
-            if return_internal:
-                out, new_st, internal = self.ssm.forward_chunk(
-                    wv, state=prev, return_internal=True,
-                )
-                h_internal[b, bw] = internal.squeeze(0).to(
-                    device=h_internal.device, dtype=h_internal.dtype,
-                )
-            else:
-                out, new_st = self.ssm.forward_chunk(wv, state=prev)
+            out, new_st, internal = self.ssm.forward_chunk(
+                wv, state=prev, return_internal=True,
+            )
+            h_internal[b, bw] = internal.squeeze(0).to(
+                device=h_internal.device, dtype=h_internal.dtype,
+            )
             ssm_out[b, bw] = out.squeeze(0).to(device=ssm_out.device, dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
@@ -598,7 +634,9 @@ class StreamingVADGenerationModel(nn.Module):
         delta = self.adapter(ssm_out)
         alpha = torch.sigmoid(self.alpha_logit).to(device=delta.device, dtype=delta.dtype)
         base = window_batch.to(device=delta.device, dtype=delta.dtype)
-        state_embeddings = base + alpha * delta
+        h_internal = h_internal.to(device=base.device, dtype=base.dtype)
+        modulated_base = self._apply_temporal_modulation(base, h_internal, valid_mask)
+        state_embeddings = modulated_base + alpha * delta
         if return_internal:
             return state_embeddings, window_batch, ssm_out, h_internal, ssm_state_cache
         return state_embeddings, window_batch, ssm_out, ssm_state_cache
@@ -785,6 +823,52 @@ def _state_dict_shapes_match(module: nn.Module, saved: dict) -> bool:
         if tuple(tensor.shape) != tuple(saved[key].shape):
             return False
     return True
+
+
+def _load_temporal_conditioning(model: StreamingVADGenerationModel, ckpt: dict) -> None:
+    if "temporal_proj" in ckpt:
+        model.world_branch.temporal_proj.load_state_dict(ckpt["temporal_proj"])
+    elif "world_branch" in ckpt:
+        prefix = "temporal_proj."
+        saved = {
+            k[len(prefix):]: v
+            for k, v in ckpt["world_branch"].items()
+            if k.startswith(prefix)
+        }
+        if saved and _state_dict_shapes_match(model.world_branch.temporal_proj, saved):
+            model.world_branch.temporal_proj.load_state_dict(saved)
+
+    if "temporal_modulator" in ckpt:
+        if _state_dict_shapes_match(model.temporal_modulator, ckpt["temporal_modulator"]):
+            model.temporal_modulator.load_state_dict(ckpt["temporal_modulator"])
+        else:
+            print(
+                "WARNING: temporal_modulator checkpoint is incompatible; "
+                "using the zero-initialized modulator."
+            )
+    else:
+        print("WARNING: temporal_modulator missing from checkpoint; using zero-initialized modulation.")
+
+
+def _set_world_warmup_trainability(
+    model: StreamingVADGenerationModel,
+    active: bool,
+) -> None:
+    if not hasattr(model, "_default_requires_grad"):
+        model._default_requires_grad = {
+            id(p): p.requires_grad for p in model.parameters()
+        }
+    defaults = model._default_requires_grad
+    if active:
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.world_branch.parameters():
+            p.requires_grad = True
+        for p in model.temporal_modulator.parameters():
+            p.requires_grad = False
+    else:
+        for p in model.parameters():
+            p.requires_grad = defaults.get(id(p), p.requires_grad)
 
 
 def _world_model_loss(
@@ -2054,6 +2138,7 @@ def main():
                     "world branch is newly initialized and the optimizer "
                     "state will be reset."
                 )
+        _load_temporal_conditioning(model, ckpt)
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):
@@ -2143,6 +2228,8 @@ def main():
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
             "world_branch": model.world_branch.state_dict(),
+            "temporal_proj": model.world_branch.temporal_proj.state_dict(),
+            "temporal_modulator": model.temporal_modulator.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -2204,6 +2291,9 @@ def main():
         world_ibq_temporal_list: List[float] = []
         world_ibq_zero_temporal_list: List[float] = []
         world_ibq_temporal_gain_list: List[float] = []
+        gamma_abs_mean_list: List[float] = []
+        gamma_std_list: List[float] = []
+        modulation_delta_rel_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2232,6 +2322,12 @@ def main():
                 binary = binary.to(device)
                 labels = labels.to(device)
                 B, max_w = binary.shape
+                world_warmup_active = (
+                    args.lambda_world > 0
+                    and args.world_warmup_steps > 0
+                    and global_step < args.world_warmup_steps
+                )
+                _set_world_warmup_trainability(model, world_warmup_active)
 
                 # --- encode ---
                 ssm_out = None
@@ -2271,10 +2367,7 @@ def main():
                 )
                 warmup_phase = False
                 if use_world:
-                    warmup_phase = (
-                        args.world_warmup_steps > 0
-                        and global_step < args.world_warmup_steps
-                    )
+                    warmup_phase = world_warmup_active
 
                 group_start = (step // args.grad_accum) * args.grad_accum
                 group_size = min(args.grad_accum, len(train_loader) - group_start)
@@ -2404,6 +2497,10 @@ def main():
                             writer.add_scalar("step/ibq_ce_zero_temporal", finite_mean(world_ibq_zero_temporal_list[-500:]), global_step)
                         if world_ibq_temporal_gain_list:
                             writer.add_scalar("step/ibq_temporal_gain", finite_mean(world_ibq_temporal_gain_list[-500:]), global_step)
+                        if gamma_abs_mean_list:
+                            writer.add_scalar("step/gamma_abs_mean", finite_mean(gamma_abs_mean_list[-500:]), global_step)
+                            writer.add_scalar("step/gamma_std", finite_mean(gamma_std_list[-500:]), global_step)
+                            writer.add_scalar("step/modulation_delta_rel", finite_mean(modulation_delta_rel_list[-500:]), global_step)
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
@@ -2416,6 +2513,11 @@ def main():
                     world_ibq_zero_temporal_list.append(world_info["ibq_ce_zero_temporal"])
                 if world_info["ibq_temporal_gain"] is not None:
                     world_ibq_temporal_gain_list.append(world_info["ibq_temporal_gain"])
+                mod_stats = model.last_modulation_stats
+                if mod_stats:
+                    gamma_abs_mean_list.append(float(mod_stats["gamma_abs_mean"]))
+                    gamma_std_list.append(float(mod_stats["gamma_std"]))
+                    modulation_delta_rel_list.append(float(mod_stats["modulation_delta_rel"]))
                 num_valid_windows = float(valid.sum().item()) if not warmup_phase else 0.0
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
@@ -2649,6 +2751,10 @@ def main():
             if train_world_losses:
                 writer.add_scalar("train/loss_world", finite_mean(train_world_losses), epoch)
                 writer.add_scalar("train/loss_world_ibq", finite_mean(train_world_ibq_losses), epoch)
+            if gamma_abs_mean_list:
+                writer.add_scalar("train/gamma_abs_mean", finite_mean(gamma_abs_mean_list), epoch)
+                writer.add_scalar("train/gamma_std", finite_mean(gamma_std_list), epoch)
+                writer.add_scalar("train/modulation_delta_rel", finite_mean(modulation_delta_rel_list), epoch)
             # step/* tags are written at the 500-step boundary with
             # global_step only; no epoch-scalar duplicates here
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
@@ -2664,6 +2770,9 @@ def main():
                 f"summary={finite_mean(train_summary_losses):.4f} "
                 f"score_prob={score_prob_mean_epoch:.3f} "
                 f"target_mean={soft_target_mean_epoch:.3f} "
+                f"gamma_abs={finite_mean(gamma_abs_mean_list):.4f} "
+                f"gamma_std={finite_mean(gamma_std_list):.4f} "
+                f"modulation_delta_rel={finite_mean(modulation_delta_rel_list):.4f} "
                 f"valid_windows_total={int(train_valid_windows_total)} "
                 f"summary_triggers_total={int(train_summary_triggers_total)} "
                 f"skipped_summary_total={int(train_skipped_summary_total)}"
