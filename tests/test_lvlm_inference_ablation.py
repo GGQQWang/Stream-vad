@@ -1,0 +1,119 @@
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.benchmark_lvlm_inference import (  # noqa: E402
+    aggregate_latency,
+    max_new_tokens_for_mode,
+    maybe_generate_texts,
+)
+
+
+class _Tokenizer:
+    def encode(self, text, add_special_tokens=False):
+        assert text == "Current video status:"
+        return [1, 2, 3]
+
+    def batch_decode(self, sequences, skip_special_tokens=True):
+        return [" ".join(str(int(x)) for x in row) for row in sequences]
+
+
+class _Qwen(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(32, 4)
+        self.generate_calls = []
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        n = kwargs["inputs_embeds"].shape[0]
+        max_new_tokens = kwargs["max_new_tokens"]
+        return torch.ones(n, max_new_tokens, dtype=torch.long)
+
+
+class _Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.qwen = _Qwen()
+        self.score_query = nn.Parameter(torch.randn(1, 4))
+        self.score_head = nn.Linear(4, 1)
+
+    def forward_score_token(self, states, embed_fn, tokenizer, prompt_text):
+        return states.float().sum(dim=-1)
+
+
+def test_forward_mode_does_not_call_generate_and_generation_time_is_zero():
+    model = _Model()
+    tokenizer = _Tokenizer()
+    states = torch.randn(2, 4)
+    assert max_new_tokens_for_mode("forward") is None
+    texts = maybe_generate_texts(
+        model,
+        model.qwen.get_input_embeddings(),
+        tokenizer,
+        states,
+        "Current video status:",
+        max_new_tokens_for_mode("forward"),
+    )
+    assert texts == []
+    assert model.qwen.generate_calls == []
+    metrics = aggregate_latency([
+        {"latency_ms": 4.0, "generation_time_ms": 0.0, "window_duration_sec": 1.0, "is_warmup": False}
+    ])
+    assert metrics["generation_time_ms"] == 0.0
+
+
+def test_ar16_and_ar64_generation_arguments_are_fixed():
+    for mode, expected_tokens in [("ar16", 16), ("ar64", 64)]:
+        model = _Model()
+        tokenizer = _Tokenizer()
+        states = torch.randn(3, 4)
+        texts = maybe_generate_texts(
+            model,
+            model.qwen.get_input_embeddings(),
+            tokenizer,
+            states,
+            "Current video status:",
+            max_new_tokens_for_mode(mode),
+        )
+        assert len(texts) == 3
+        call = model.qwen.generate_calls[-1]
+        assert call["max_new_tokens"] == expected_tokens
+        assert call["do_sample"] is False
+        assert call["num_beams"] == 1
+        assert call["use_cache"] is True
+
+
+def test_anomaly_score_is_identical_across_modes():
+    model = _Model()
+    tokenizer = _Tokenizer()
+    embed = model.qwen.get_input_embeddings()
+    states = torch.randn(5, 4)
+    scores = {}
+    for mode in ["forward", "ar16", "ar64"]:
+        logits = model.forward_score_token(states, embed, tokenizer, "Current video status:")
+        _ = maybe_generate_texts(model, embed, tokenizer, states, "Current video status:", max_new_tokens_for_mode(mode))
+        scores[mode] = logits.detach()
+    assert torch.equal(scores["forward"], scores["ar16"])
+    assert torch.equal(scores["forward"], scores["ar64"])
+
+
+def test_warmup_records_are_excluded_from_latency_aggregate():
+    records = [
+        {"latency_ms": 1000.0, "window_duration_sec": 1.0, "is_warmup": True, "generation_time_ms": 0.0},
+        {"latency_ms": 10.0, "window_duration_sec": 1.0, "is_warmup": False, "generation_time_ms": 2.0},
+        {"latency_ms": 20.0, "window_duration_sec": 1.0, "is_warmup": False, "generation_time_ms": 4.0},
+    ]
+    metrics = aggregate_latency(records)
+    assert metrics["latency_mean_ms"] == 15.0
+    assert metrics["measured_windows"] == 2
+    assert metrics["throughput_windows_per_sec"] == 2 / 0.03
+    assert metrics["generation_time_ms"] == 3.0
