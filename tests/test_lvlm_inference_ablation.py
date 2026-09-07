@@ -9,8 +9,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.benchmark_lvlm_inference import (  # noqa: E402
     aggregate_latency,
+    build_generation_inputs,
+    handle_video_failure,
     max_new_tokens_for_mode,
     maybe_generate_texts,
+    score_single_window,
 )
 
 
@@ -35,6 +38,7 @@ class _Qwen(nn.Module):
     def generate(self, **kwargs):
         self.generate_calls.append(kwargs)
         n = kwargs["inputs_embeds"].shape[0]
+        assert n == 1
         max_new_tokens = kwargs["max_new_tokens"]
         return torch.ones(n, max_new_tokens, dtype=torch.long)
 
@@ -45,8 +49,10 @@ class _Model(nn.Module):
         self.qwen = _Qwen()
         self.score_query = nn.Parameter(torch.randn(1, 4))
         self.score_head = nn.Linear(4, 1)
+        self.forward_batch_sizes = []
 
     def forward_score_token(self, states, embed_fn, tokenizer, prompt_text):
+        self.forward_batch_sizes.append(states.shape[0])
         return states.float().sum(dim=-1)
 
 
@@ -75,7 +81,7 @@ def test_ar16_and_ar64_generation_arguments_are_fixed():
     for mode, expected_tokens in [("ar16", 16), ("ar64", 64)]:
         model = _Model()
         tokenizer = _Tokenizer()
-        states = torch.randn(3, 4)
+        states = torch.randn(1, 4)
         texts = maybe_generate_texts(
             model,
             model.qwen.get_input_embeddings(),
@@ -84,8 +90,9 @@ def test_ar16_and_ar64_generation_arguments_are_fixed():
             "Current video status:",
             max_new_tokens_for_mode(mode),
         )
-        assert len(texts) == 3
+        assert len(texts) == 1
         call = model.qwen.generate_calls[-1]
+        assert call["inputs_embeds"].shape[0] == 1
         assert call["max_new_tokens"] == expected_tokens
         assert call["do_sample"] is False
         assert call["num_beams"] == 1
@@ -99,11 +106,23 @@ def test_anomaly_score_is_identical_across_modes():
     states = torch.randn(5, 4)
     scores = {}
     for mode in ["forward", "ar16", "ar64"]:
-        logits = model.forward_score_token(states, embed, tokenizer, "Current video status:")
-        _ = maybe_generate_texts(model, embed, tokenizer, states, "Current video status:", max_new_tokens_for_mode(mode))
-        scores[mode] = logits.detach()
+        mode_scores = []
+        for state in states:
+            one_state = state.unsqueeze(0)
+            logits = score_single_window(model, embed, tokenizer, one_state, "Current video status:")
+            _ = maybe_generate_texts(
+                model,
+                embed,
+                tokenizer,
+                one_state,
+                "Current video status:",
+                max_new_tokens_for_mode(mode),
+            )
+            mode_scores.append(logits.detach())
+        scores[mode] = torch.cat(mode_scores)
     assert torch.equal(scores["forward"], scores["ar16"])
     assert torch.equal(scores["forward"], scores["ar64"])
+    assert set(model.forward_batch_sizes) == {1}
 
 
 def test_warmup_records_are_excluded_from_latency_aggregate():
@@ -117,3 +136,45 @@ def test_warmup_records_are_excluded_from_latency_aggregate():
     assert metrics["measured_windows"] == 2
     assert metrics["throughput_windows_per_sec"] == 2 / 0.03
     assert metrics["generation_time_ms"] == 3.0
+
+
+def test_generation_inputs_do_not_include_score_query():
+    model = _Model()
+    tokenizer = _Tokenizer()
+    embed = model.qwen.get_input_embeddings()
+    model.score_query.data.fill_(float("nan"))
+    states = torch.randn(1, 4)
+    gen_inputs = build_generation_inputs(model, embed, tokenizer, states, "Current video status:")
+    assert gen_inputs["inputs_embeds"].shape == (1, 4, 4)  # state + 3 prompt tokens
+    assert torch.isfinite(gen_inputs["inputs_embeds"]).all()
+
+
+def test_generation_rejects_batched_windows():
+    model = _Model()
+    tokenizer = _Tokenizer()
+    states = torch.randn(2, 4)
+    try:
+        maybe_generate_texts(
+            model,
+            model.qwen.get_input_embeddings(),
+            tokenizer,
+            states,
+            "Current video status:",
+            16,
+        )
+    except ValueError as exc:
+        assert "batch size 1" in str(exc)
+    else:
+        raise AssertionError("batched generation should fail")
+
+
+def test_failed_video_defaults_to_fail_fast():
+    failed = []
+    exc = RuntimeError("boom")
+    try:
+        handle_video_failure("video", exc, failed, skip_failed_videos=False)
+    except RuntimeError as raised:
+        assert raised is exc
+    else:
+        raise AssertionError("failed video should raise by default")
+    assert failed == []

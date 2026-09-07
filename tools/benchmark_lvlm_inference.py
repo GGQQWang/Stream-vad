@@ -45,6 +45,7 @@ INFERENCE_MODES = {
     "ar64": 64,
 }
 LATENCY_SCOPE = "cached_visual_feature_to_prediction"
+STREAMING_PROTOCOL = "strict_single_window_sequential"
 
 
 def max_new_tokens_for_mode(mode: str) -> int | None:
@@ -102,8 +103,14 @@ def reset_peak_memory(device: torch.device) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def _require_single_window(states: torch.Tensor, *, context: str) -> None:
+    if states.ndim != 2 or states.shape[0] != 1:
+        raise ValueError(f"{context} requires batch size 1, got shape={tuple(states.shape)}")
+
+
 def build_generation_inputs(model, embed_fn, tokenizer, states: torch.Tensor, prompt_text: str) -> dict:
-    """Build the same state/prompt/query prefix used by forward_score_token."""
+    """Build the AR prefix from the current state and prompt only."""
+    _require_single_window(states, context="generation")
     llm_weight = embed_fn.weight
     llm_device = llm_weight.device
     llm_dtype = llm_weight.dtype
@@ -111,8 +118,7 @@ def build_generation_inputs(model, embed_fn, tokenizer, states: torch.Tensor, pr
     prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=llm_device)
     prompt_emb = embed_fn(prompt_ids_t).unsqueeze(0).expand(states.shape[0], -1, -1)
-    query = model.score_query.to(device=llm_device, dtype=llm_dtype).reshape(1, 1, -1).expand(states.shape[0], 1, -1)
-    inputs_embeds = torch.cat([states.unsqueeze(1), prompt_emb, query], dim=1)
+    inputs_embeds = torch.cat([states.unsqueeze(1), prompt_emb], dim=1)
     attention_mask = torch.ones(states.shape[0], inputs_embeds.shape[1], dtype=torch.bool, device=llm_device)
     return {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
 
@@ -136,6 +142,7 @@ def decode_generated(tokenizer, sequences, max_new_tokens: int) -> List[str]:
 def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, max_new_tokens: int | None) -> List[str]:
     if max_new_tokens is None:
         return []
+    _require_single_window(states, context="generation")
     gen_inputs = build_generation_inputs(model, embed_fn, tokenizer, states, prompt_text)
     sequences = model.qwen.generate(
         **gen_inputs,
@@ -145,6 +152,26 @@ def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, m
         use_cache=True,
     )
     return decode_generated(tokenizer, sequences, max_new_tokens)
+
+
+def score_single_window(model, embed_fn, tokenizer, states, prompt_text: str):
+    _require_single_window(states, context="anomaly scoring")
+    logits = model.forward_score_token(
+        states,
+        embed_fn,
+        tokenizer,
+        prompt_text=prompt_text,
+    )
+    if logits.shape[0] != 1:
+        raise RuntimeError(f"expected one score logit, got shape={tuple(logits.shape)}")
+    return logits
+
+
+def handle_video_failure(video_id: str, exc: Exception, failed_videos: List[dict[str, str]], skip_failed_videos: bool) -> None:
+    if not skip_failed_videos:
+        raise exc
+    failed_videos.append({"video_id": video_id, "error": str(exc)[:300]})
+    print(f"FAILED video={video_id}: {exc}")
 
 
 def frame_scores_from_rows(rows: List[dict], n_frames: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -205,84 +232,80 @@ def run_video_benchmark(
             valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
             if len(valid_b) == 0:
                 continue
-
-            if (
-                not warmup_state["memory_reset_done"]
-                and warmup_state["seen_windows"] >= warmup_state["warmup_windows"]
-            ):
-                synchronize(device)
-                reset_peak_memory(device)
-                warmup_state["memory_reset_done"] = True
-            chunk_is_warmup = not warmup_state["memory_reset_done"]
-
-            synchronize(device)
-            chunk_start = time.perf_counter()
-            temporal_start = time.perf_counter()
-            window_batch = batch["features"].to(device=device, dtype=dtype)
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                state_emb, _, _, ssm_cache = model.encode_window_features(
-                    window_batch,
-                    valid_mask,
-                    batch["video_id"],
-                    ssm_cache,
-                    training=False,
-                )
-            synchronize(device)
-            temporal_ms_total = (time.perf_counter() - temporal_start) * 1000.0
-
-            states = state_emb[valid_b, valid_w]
-            forward_start = time.perf_counter()
-            with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                logits = model.forward_score_token(
-                    states,
-                    embed_fn,
-                    tokenizer,
-                    prompt_text=prompt_text,
-                )
-            if not torch.isfinite(logits).all():
-                raise RuntimeError(f"{video_id}: non-finite score logits in chunk {chunk_i}")
-            synchronize(device)
-            forward_ms_total = (time.perf_counter() - forward_start) * 1000.0
-
-            generation_ms_total = 0.0
-            generated_texts: List[str] = []
-            if max_new_tokens is not None:
-                generation_start = time.perf_counter()
-                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    generated_texts = maybe_generate_texts(
-                        model,
-                        embed_fn,
-                        tokenizer,
-                        states,
-                        prompt_text,
-                        max_new_tokens,
-                    )
-                synchronize(device)
-                generation_ms_total = (time.perf_counter() - generation_start) * 1000.0
-
-            synchronize(device)
-            chunk_latency_ms = (time.perf_counter() - chunk_start) * 1000.0
-
-            probs = torch.sigmoid(logits).detach().float().cpu()
-            logits_cpu = logits.detach().float().cpu()
             start_frames = batch["window_start_frames"]
             end_frames = batch["valid_end_frames"]
-            valid_count = max(int(len(valid_b)), 1)
-            for i, (b_t, w_t) in enumerate(zip(valid_b.cpu(), valid_w.cpu())):
+            for b_t, w_t in zip(valid_b.cpu(), valid_w.cpu()):
                 b = int(b_t.item())
                 w = int(w_t.item())
+                if b != 0:
+                    raise RuntimeError(f"{video_id}: expected benchmark batch size 1, got batch index {b}")
+                if (
+                    not warmup_state["memory_reset_done"]
+                    and warmup_state["seen_windows"] >= warmup_state["warmup_windows"]
+                ):
+                    synchronize(device)
+                    reset_peak_memory(device)
+                    warmup_state["memory_reset_done"] = True
+                is_warmup = not warmup_state["memory_reset_done"]
+
+                single_mask = torch.ones(1, 1, dtype=torch.bool, device=device)
+                single_window = batch["features"][:, w:w + 1].to(device=device, dtype=dtype)
+
+                synchronize(device)
+                window_start_time = time.perf_counter()
+                temporal_start = time.perf_counter()
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                    state_emb, _, _, ssm_cache = model.encode_window_features(
+                        single_window,
+                        single_mask,
+                        batch["video_id"],
+                        ssm_cache,
+                        training=False,
+                    )
+                synchronize(device)
+                temporal_ms = (time.perf_counter() - temporal_start) * 1000.0
+
+                states = state_emb[:, 0]
+                forward_start = time.perf_counter()
+                with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                    logits = score_single_window(model, embed_fn, tokenizer, states, prompt_text)
+                if not torch.isfinite(logits).all():
+                    raise RuntimeError(f"{video_id}: non-finite score logits in chunk {chunk_i}, window {w}")
+                synchronize(device)
+                forward_ms = (time.perf_counter() - forward_start) * 1000.0
+
+                generation_ms = 0.0
+                generated_texts: List[str] = []
+                if max_new_tokens is not None:
+                    generation_start = time.perf_counter()
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                        generated_texts = maybe_generate_texts(
+                            model,
+                            embed_fn,
+                            tokenizer,
+                            states,
+                            prompt_text,
+                            max_new_tokens,
+                        )
+                    synchronize(device)
+                    generation_ms = (time.perf_counter() - generation_start) * 1000.0
+
+                synchronize(device)
+                latency_ms = (time.perf_counter() - window_start_time) * 1000.0
+
+                probs = torch.sigmoid(logits).detach().float().cpu()
+                logits_cpu = logits.detach().float().cpu()
                 start_frame = int(start_frames[b, w].item())
                 end_frame = int(end_frames[b, w].item())
                 window_idx = int(batch["chunk_start"][b]) + w
-                score = float(probs[i].item())
+                score = float(probs[0].item())
                 gt_label = int(gt[start_frame:min(end_frame, n_frames)].max()) if end_frame > start_frame else 0
-                is_warmup = chunk_is_warmup
                 row = {
                     "video_id": video_id,
                     "window_idx": window_idx,
                     "start_frame": start_frame,
                     "end_frame": end_frame,
-                    "score_logit": float(logits_cpu[i].item()),
+                    "score_logit": float(logits_cpu[0].item()),
                     "score_prob": score,
                     "score": score,
                     "gt_label": gt_label,
@@ -291,10 +314,12 @@ def run_video_benchmark(
                 latency_record = {
                     "video_id": video_id,
                     "window_idx": window_idx,
-                    "latency_ms": chunk_latency_ms / valid_count,
-                    "temporal_time_ms": temporal_ms_total / valid_count,
-                    "lvlm_forward_time_ms": forward_ms_total / valid_count,
-                    "generation_time_ms": generation_ms_total / valid_count,
+                    "latency_ms": latency_ms,
+                    "temporal_time_ms": temporal_ms,
+                    "lvlm_forward_time_ms": forward_ms,
+                    "generation_time_ms": generation_ms,
+                    "batch_size": 1,
+                    "streaming_protocol": STREAMING_PROTOCOL,
                     "is_warmup": is_warmup,
                     "latency_scope": LATENCY_SCOPE,
                     "window_duration_sec": max(0, end_frame - start_frame) / fps,
@@ -306,7 +331,7 @@ def run_video_benchmark(
                         "window_idx": window_idx,
                         "score": score,
                         "gt_label": gt_label,
-                        "generated_text": generated_texts[i] if i < len(generated_texts) else "",
+                        "generated_text": generated_texts[0] if generated_texts else "",
                         "max_new_tokens": max_new_tokens,
                     }, ensure_ascii=False) + "\n")
                 warmup_state["seen_windows"] += 1
@@ -350,6 +375,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--inference-mode", required=True, choices=sorted(INFERENCE_MODES))
     parser.add_argument("--warmup-windows", type=int, default=30)
+    parser.add_argument("--skip-failed-videos", action="store_true")
     args = parser.parse_args()
 
     args.device = torch.device(args.device)
@@ -417,8 +443,7 @@ def main() -> None:
                         warmup_state=warmup_state,
                     )
                 except Exception as exc:
-                    failed_videos.append({"video_id": video_id, "error": str(exc)[:300]})
-                    print(f"FAILED video={video_id}: {exc}")
+                    handle_video_failure(video_id, exc, failed_videos, args.skip_failed_videos)
                     continue
                 videos.append({k: v for k, v in result.items() if k not in {"gt", "standard_scores", "causal_scores", "causal_valid"}})
                 all_gt.append(result["gt"])
@@ -456,6 +481,8 @@ def main() -> None:
         "inference_mode": args.inference_mode,
         "max_new_tokens": max_new_tokens_for_mode(args.inference_mode),
         "latency_scope": LATENCY_SCOPE,
+        "streaming_protocol": STREAMING_PROTOCOL,
+        "batch_size": 1,
         "warmup_windows_requested": warmup_state["warmup_windows"],
         "warmup_windows_effective": effective_warmup_windows,
         "num_videos": len(videos),
