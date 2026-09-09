@@ -12,8 +12,10 @@ from tools.export_human_eval_texts import (  # noqa: E402
     METHODS,
     WindowSample,
     build_blind_outputs,
-    build_forward_semantic_inputs,
+    build_summary_query_ar_inputs,
+    select_random_video_ids,
     sample_balanced_windows,
+    summarize_latency,
 )
 from tools.benchmark_lvlm_inference import maybe_generate_texts  # noqa: E402
 
@@ -95,38 +97,38 @@ def test_blind_file_hides_methods_and_key_restores_mapping():
         "end_sec": 2.0,
         "gt_label": 1,
         "score_prob": 0.7,
-        "forward_semantic_text": "semantic",
-        "ar16_text": "short",
-        "ar64_text": "long",
+        "summary_query_ar_text": "semantic",
+        "prompt_ar16_text": "short",
+        "prompt_ar64_text": "long",
     }]
     blind, key = build_blind_outputs(raw, seed=42)
     dumped = json.dumps(blind)
-    assert "forward_semantic" not in dumped
-    assert "ar16" not in dumped
-    assert "ar64" not in dumped
+    assert "summary_query_ar" not in dumped
+    assert "prompt_ar16" not in dumped
+    assert "prompt_ar64" not in dumped
     mapping = key["samples"]["sample_0000"]
     assert set(mapping) == {"A", "B", "C"}
     assert set(mapping.values()) == set(METHODS)
     restored = {method: blind[0]["texts"][letter] for letter, method in mapping.items()}
     assert restored == {
-        "forward_semantic": "semantic",
-        "ar16": "short",
-        "ar64": "long",
+        "summary_query_ar": "semantic",
+        "prompt_ar16": "short",
+        "prompt_ar64": "long",
     }
 
 
 def test_three_methods_share_one_sample_record():
     raw = {
         "sample_id": "sample_0001",
-        "forward_semantic_text": "semantic",
-        "ar16_text": "short",
-        "ar64_text": "long",
+        "summary_query_ar_text": "semantic",
+        "prompt_ar16_text": "short",
+        "prompt_ar64_text": "long",
     }
     assert raw["sample_id"] == "sample_0001"
     assert {name for name in raw if name.endswith("_text")} == {
-        "forward_semantic_text",
-        "ar16_text",
-        "ar64_text",
+        "summary_query_ar_text",
+        "prompt_ar16_text",
+        "prompt_ar64_text",
     }
 
 
@@ -138,10 +140,30 @@ def test_ar_generation_batch_size_is_one():
     assert model.qwen.generate_batch_sizes == [1]
 
 
-def test_forward_semantic_uses_summary_query_not_score_query():
+def test_summary_query_ar_uses_summary_query_not_score_query():
     model = _Model()
     states = torch.zeros(1, 4)
-    inputs = build_forward_semantic_inputs(model, model.qwen.get_input_embeddings(), states)
+    inputs = build_summary_query_ar_inputs(model, model.qwen.get_input_embeddings(), states)
     assert inputs["inputs_embeds"].shape == (1, 2, 4)
     assert torch.isfinite(inputs["inputs_embeds"]).all()
     assert torch.equal(inputs["inputs_embeds"][0, 1], torch.ones(4))
+
+
+def test_random_video_selection_is_seeded_and_sized():
+    ids = ["v3", "v1", "v2", "v5", "v4"]
+    first = select_random_video_ids(ids, 3, seed=42)
+    second = select_random_video_ids(ids, 3, seed=42)
+    assert first == second
+    assert len(first) == 3
+    assert set(first).issubset(set(ids))
+
+
+def test_random_video_latency_summary():
+    records = [
+        {"summary_query_ar_ms": 1.0, "prompt_ar16_ms": 2.0, "prompt_ar64_ms": 4.0},
+        {"summary_query_ar_ms": 3.0, "prompt_ar16_ms": 4.0, "prompt_ar64_ms": 8.0},
+    ]
+    summary = summarize_latency(records)
+    assert summary["summary_query_ar_ms"]["mean"] == 2.0
+    assert summary["prompt_ar16_ms"]["p50"] == 3.0
+    assert summary["prompt_ar64_ms"]["p95"] == 7.8
