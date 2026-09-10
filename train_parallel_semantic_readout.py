@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from hivau_dataset import HIVAUDataset, hivau_collate
+from hivau_sampler import VideoChunkSampler
 from infer_stage1_ucf import (
     FRAMES_PER_CLIP,
     MAX_PIXELS,
@@ -62,6 +64,11 @@ def _print_freeze_report(report: dict) -> None:
         print(f"  {name}")
 
 
+def _sync_if_cuda(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True, help="Stage-1 output dir or train_state.pt")
@@ -73,6 +80,7 @@ def main() -> None:
     parser.add_argument("--num-semantic-queries", type=int, default=16)
     parser.add_argument("--semantic-decoder-dim", type=int, default=256)
     parser.add_argument("--semantic-num-heads", type=int, default=8)
+    parser.add_argument("--semantic-num-layers", type=int, default=2)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -80,6 +88,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--timing-log-every", type=int, default=20)
     args = parser.parse_args()
 
     _set_seed(args.seed)
@@ -98,7 +107,7 @@ def main() -> None:
         num_queries=args.num_semantic_queries,
         decoder_dim=args.semantic_decoder_dim,
         num_heads=args.semantic_num_heads,
-        num_layers=1,
+        num_layers=args.semantic_num_layers,
         use_output_projection=True,
     ).to(args.device)
     experiment = ParallelSemanticExperiment(stage1_model, readout).to(args.device)
@@ -107,6 +116,7 @@ def main() -> None:
     experiment.stage1_model.eval()
     experiment.parallel_readout.train()
 
+    dataset_start = time.perf_counter()
     dataset = HIVAUDataset(
         args.train_data,
         args.video_root,
@@ -117,11 +127,14 @@ def main() -> None:
         feature_cache_model_id=args.model_path,
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,
+        validate_feature_cache_on_init=False,
+        profile_cache_io=True,
     )
+    print(f"parallel_semantic_timing: dataset_init_seconds={time.perf_counter() - dataset_start:.3f}")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        sampler=VideoChunkSampler(dataset.samples, shuffle=True),
         num_workers=args.num_workers,
         collate_fn=hivau_collate,
     )
@@ -130,12 +143,18 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     global_step = 0
+    timing_batch_count = 0
     for epoch in range(args.epochs):
         pbar = tqdm(loader, desc=f"Parallel semantic epoch {epoch}")
+        last_step_end = time.perf_counter()
         for batch in pbar:
+            timing_batch_count += 1
+            data_wait_sec = time.perf_counter() - last_step_end
             if "features" not in batch:
                 raise RuntimeError("parallel semantic training requires feature cache")
             valid_mask = batch["valid_mask"].to(args.device)
+            _sync_if_cuda(args.device)
+            stage1_start = time.perf_counter()
             with torch.no_grad():
                 features = batch["features"].to(device=args.device, dtype=dtype)
                 state_emb, _, _, _ = experiment.stage1_model.encode_window_features(
@@ -147,6 +166,19 @@ def main() -> None:
                 )
                 triggers, _ = collect_summary_triggers(batch, batch["valid_mask"])
                 if not triggers:
+                    _sync_if_cuda(args.device)
+                    if args.timing_log_every > 0 and timing_batch_count % args.timing_log_every == 0:
+                        print(
+                            "parallel_semantic_timing: "
+                            f"step={global_step} "
+                            f"batch={timing_batch_count} "
+                            f"data_wait_cache_sec={data_wait_sec:.3f} "
+                            "frozen_stage1_forward_sec="
+                            f"{time.perf_counter() - stage1_start:.3f} "
+                            "parallel_readout_forward_backward_sec=0.000 "
+                            "skipped_no_summary_trigger=1"
+                        )
+                    last_step_end = time.perf_counter()
                     continue
                 trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=args.device)
                 trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=args.device)
@@ -155,6 +187,8 @@ def main() -> None:
                     trigger_states, embed_fn,
                 )
                 z_sem = sum_hidden.detach()
+            _sync_if_cuda(args.device)
+            stage1_sec = time.perf_counter() - stage1_start
 
             summary_texts = [str(t[2]["text"]) for t in triggers]
             targets = encode_parallel_semantic_targets(
@@ -163,6 +197,8 @@ def main() -> None:
                 max_tokens=args.num_semantic_queries,
                 device=args.device,
             )
+            _sync_if_cuda(args.device)
+            readout_start = time.perf_counter()
             logits = experiment.parallel_readout(z_sem)
             loss, info = parallel_semantic_loss(
                 logits,
@@ -172,6 +208,8 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            _sync_if_cuda(args.device)
+            readout_sec = time.perf_counter() - readout_start
             global_step += 1
 
             pred = logits.argmax(dim=-1)
@@ -184,8 +222,18 @@ def main() -> None:
             if global_step % 100 == 0:
                 print(f"GT: {summary_texts[0]}")
                 print(f"Pred: {preview[0] if preview else ''}")
+            if args.timing_log_every > 0 and timing_batch_count % args.timing_log_every == 0:
+                print(
+                    "parallel_semantic_timing: "
+                    f"step={global_step} "
+                    f"batch={timing_batch_count} "
+                    f"data_wait_cache_sec={data_wait_sec:.3f} "
+                    f"frozen_stage1_forward_sec={stage1_sec:.3f} "
+                    f"parallel_readout_forward_backward_sec={readout_sec:.3f}"
+                )
             if args.max_steps and global_step >= args.max_steps:
                 break
+            last_step_end = time.perf_counter()
         if args.max_steps and global_step >= args.max_steps:
             break
 
@@ -198,6 +246,7 @@ def main() -> None:
                 "num_semantic_queries": args.num_semantic_queries,
                 "decoder_dim": args.semantic_decoder_dim,
                 "num_heads": args.semantic_num_heads,
+                "num_layers": args.semantic_num_layers,
                 "uses_frozen_lm_head": False,
             },
             "freeze_report": freeze_report,

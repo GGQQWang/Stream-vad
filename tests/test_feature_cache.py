@@ -10,6 +10,7 @@ from feature_cache import (
     save_feature_cache_atomic,
 )
 from hivau_dataset import HIVAUDataset
+import hivau_dataset as hivau_dataset_module
 
 
 def _write_annotation(path: Path) -> None:
@@ -183,6 +184,91 @@ def test_cached_and_online_feature_values_can_match_with_fp16_tolerance(tmp_path
         model_id="fake-qwen",
     )["compressed_features"].float()
     assert torch.allclose(cached, online, atol=5e-3, rtol=5e-3)
+
+
+def test_feature_cache_loader_drops_spatial_payload_when_not_required(tmp_path):
+    cache_root = tmp_path / "cache"
+    metadata = build_feature_cache_metadata(
+        video_id="v",
+        n_windows=2,
+        n_frames=40,
+        fps=30.0,
+        frames_per_clip=20,
+        sample_interval=1,
+        min_pixels=128,
+        max_pixels=128,
+        model_id="fake-qwen",
+    )
+    save_feature_cache_atomic(
+        cache_root,
+        video_id="v",
+        compressed_features=torch.zeros(2, 4),
+        metadata=metadata,
+        spatial_features=torch.zeros(2, 3, 4),
+        spatial_mask=torch.ones(2, 3, dtype=torch.bool),
+    )
+    compressed_only = load_feature_cache(
+        cache_root,
+        video_id="v",
+        n_windows=2,
+        n_frames=40,
+        fps=30.0,
+        frames_per_clip=20,
+        sample_interval=1,
+        min_pixels=128,
+        max_pixels=128,
+        model_id="fake-qwen",
+        require_spatial=False,
+    )
+    with_spatial = load_feature_cache(
+        cache_root,
+        video_id="v",
+        n_windows=2,
+        n_frames=40,
+        fps=30.0,
+        frames_per_clip=20,
+        sample_interval=1,
+        min_pixels=128,
+        max_pixels=128,
+        model_id="fake-qwen",
+        require_spatial=True,
+    )
+    assert "spatial_features" not in compressed_only
+    assert "spatial_mask" not in compressed_only
+    assert "spatial_features" in with_spatial
+    assert "spatial_mask" in with_spatial
+
+
+def test_dataset_can_defer_feature_cache_validation_until_getitem(tmp_path, monkeypatch):
+    ann = tmp_path / "ann.json"
+    cache_root = tmp_path / "cache"
+    _write_annotation(ann)
+    _write_cache(cache_root, "normal_vid")
+    _write_cache(cache_root, "abnormal_vid")
+
+    calls = []
+    original_load = hivau_dataset_module.load_feature_cache
+
+    def counted_load(*args, **kwargs):
+        calls.append(kwargs["video_id"])
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(hivau_dataset_module, "load_feature_cache", counted_load)
+    ds = HIVAUDataset(
+        ann,
+        tmp_path / "missing_videos",
+        total_sampled_frames=20,
+        sample_interval=1,
+        max_windows=2,
+        feature_cache_root=cache_root,
+        feature_cache_model_id="fake-qwen",
+        min_pixels=128,
+        max_pixels=128,
+        validate_feature_cache_on_init=False,
+    )
+    assert calls == []
+    _ = ds[0]
+    assert calls == ["normal_vid"]
 
 
 def test_pipeline_cache_chunk_encoder_skips_processor_and_vit():

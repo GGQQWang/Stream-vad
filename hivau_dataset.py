@@ -11,6 +11,7 @@ correctly in loss, metrics, and logging.
 
 import json
 import math
+import time
 import warnings
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -19,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from feature_cache import load_feature_cache
+from feature_cache import feature_cache_path, load_feature_cache
 from stage1_streaming import build_window_infos, sampled_fps, window_span_frames
 
 
@@ -422,6 +423,8 @@ class HIVAUDataset(Dataset):
         debug_events: bool = False,
         anomaly_video_root: str | Path | None = None,
         require_spatial: bool = False,
+        validate_feature_cache_on_init: bool = True,
+        profile_cache_io: bool = False,
     ):
         super().__init__()
         self.video_root = Path(video_root)
@@ -433,6 +436,8 @@ class HIVAUDataset(Dataset):
         self.feature_cache_root = Path(feature_cache_root) if feature_cache_root else None
         self.feature_cache_model_id = feature_cache_model_id
         self.require_spatial = bool(require_spatial)
+        self.validate_feature_cache_on_init = bool(validate_feature_cache_on_init)
+        self.profile_cache_io = bool(profile_cache_io)
         # single-video cache: the sampler yields chunks of the same video
         # consecutively, so one torch.load per video is enough
         self._cached_video_id = None
@@ -514,20 +519,23 @@ class HIVAUDataset(Dataset):
 
             if self.feature_cache_root is not None:
                 try:
-                    load_feature_cache(
-                        self.feature_cache_root,
-                        video_id=video_name,
-                        n_windows=n_clips,
-                        n_frames=n,
-                        fps=video_fps,
-                        frames_per_clip=total_sampled_frames,
-                        sample_interval=sample_interval,
-                        min_pixels=min_pixels,
-                        max_pixels=max_pixels,
-                        model_id=feature_cache_model_id,
-                        map_location="cpu",
-                        require_spatial=self.require_spatial,
-                    )
+                    if self.validate_feature_cache_on_init:
+                        load_feature_cache(
+                            self.feature_cache_root,
+                            video_id=video_name,
+                            n_windows=n_clips,
+                            n_frames=n,
+                            fps=video_fps,
+                            frames_per_clip=total_sampled_frames,
+                            sample_interval=sample_interval,
+                            min_pixels=min_pixels,
+                            max_pixels=max_pixels,
+                            model_id=feature_cache_model_id,
+                            map_location="cpu",
+                            require_spatial=self.require_spatial,
+                        )
+                    elif not feature_cache_path(self.feature_cache_root, video_name).is_file():
+                        raise FileNotFoundError
                 except FileNotFoundError:
                     # annotation entry with neither a video file nor a cache
                     # entry (e.g. video missing from disk): skip it like the
@@ -607,6 +615,7 @@ class HIVAUDataset(Dataset):
         if self.feature_cache_root is not None:
             if self._cached_video_id != meta["video_id"]:
                 self._cached_video_id = meta["video_id"]
+                cache_load_start = time.perf_counter()
                 self._cached_cache = load_feature_cache(
                     self.feature_cache_root,
                     video_id=meta["video_id"],
@@ -619,7 +628,14 @@ class HIVAUDataset(Dataset):
                     max_pixels=self.max_pixels,
                     model_id=self.feature_cache_model_id,
                     map_location="cpu",
+                    require_spatial=self.require_spatial,
                 )
+                if self.profile_cache_io:
+                    elapsed = time.perf_counter() - cache_load_start
+                    print(
+                        f"feature_cache_load: video_id={meta['video_id']} "
+                        f"seconds={elapsed:.3f}"
+                    )
             cache = self._cached_cache
             features = cache["compressed_features"][ci_start:ci_end]
             if n_actual < self.max_windows:

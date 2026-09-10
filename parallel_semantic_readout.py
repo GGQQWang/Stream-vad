@@ -16,7 +16,8 @@ class ParallelSemanticReadout(nn.Module):
 
     The learned query embedding at each output position gives positions
     1..K distinct roles; no previous target or predicted token is ever
-    fed into another position.
+    fed into another position.  The semantic state and all query positions use
+    bidirectional self-attention; no causal mask is applied.
     """
 
     def __init__(
@@ -27,7 +28,7 @@ class ParallelSemanticReadout(nn.Module):
         num_queries: int = 16,
         decoder_dim: int | None = None,
         num_heads: int = 8,
-        num_layers: int = 1,
+        num_layers: int = 2,
         use_output_projection: bool = True,
     ) -> None:
         super().__init__()
@@ -35,6 +36,8 @@ class ParallelSemanticReadout(nn.Module):
         self.vocab_size = int(vocab_size)
         self.num_queries = int(num_queries)
         self.decoder_dim = int(decoder_dim or input_dim)
+        self.num_heads = int(num_heads)
+        self.num_layers = int(num_layers)
 
         self.input_proj = (
             nn.Identity()
@@ -42,14 +45,14 @@ class ParallelSemanticReadout(nn.Module):
             else nn.Linear(self.input_dim, self.decoder_dim)
         )
         self.query_embed = nn.Parameter(torch.randn(self.num_queries, self.decoder_dim) * 0.02)
-        layer = nn.TransformerDecoderLayer(
+        layer = nn.TransformerEncoderLayer(
             d_model=self.decoder_dim,
-            nhead=int(num_heads),
+            nhead=self.num_heads,
             dim_feedforward=4 * self.decoder_dim,
             batch_first=True,
             norm_first=True,
         )
-        self.decoder = nn.TransformerDecoder(layer, num_layers=int(num_layers))
+        self.encoder = nn.TransformerEncoder(layer, num_layers=self.num_layers)
         self.norm = nn.LayerNorm(self.decoder_dim)
         self.output_proj = (
             nn.Linear(self.decoder_dim, self.vocab_size)
@@ -64,10 +67,13 @@ class ParallelSemanticReadout(nn.Module):
     ) -> torch.Tensor:
         if z_sem.ndim != 2:
             raise ValueError(f"z_sem must be [B, D], got {tuple(z_sem.shape)}")
-        memory = self.input_proj(z_sem).unsqueeze(1)
+        param = next(self.parameters())
+        z_sem = z_sem.detach().to(device=param.device, dtype=param.dtype)
+        z_tok = self.input_proj(z_sem).unsqueeze(1)
         queries = self.query_embed.unsqueeze(0).expand(z_sem.shape[0], -1, -1)
-        h = self.decoder(tgt=queries, memory=memory)
-        h = self.norm(h)
+        tokens = torch.cat([z_tok, queries], dim=1)
+        h = self.encoder(tokens)
+        h = self.norm(h[:, 1:])
         if output_weight is not None:
             if output_weight.shape[-1] != h.shape[-1]:
                 raise ValueError(

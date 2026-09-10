@@ -34,12 +34,51 @@ def test_parallel_semantic_readout_shape():
     readout = ParallelSemanticReadout(8, 32, num_queries=16, decoder_dim=8, num_heads=2)
     logits = readout(torch.randn(3, 8))
     assert logits.shape == (3, 16, 32)
+    assert logits.dtype == torch.float32
+
+
+def test_bfloat16_semantic_state_enters_float32_readout_boundary():
+    stage1 = nn.Linear(8, 8).to(dtype=torch.bfloat16)
+    readout = ParallelSemanticReadout(8, 32, num_queries=16, decoder_dim=8, num_heads=2)
+    z_sem = stage1(torch.randn(3, 8, dtype=torch.bfloat16))
+    logits = readout(z_sem)
+    targets = torch.randint(0, 32, (3, 16), dtype=torch.long)
+    loss, _ = parallel_semantic_loss(logits, targets, eos_token_id=2)
+    loss.backward()
+    assert logits.shape == (3, 16, 32)
+    assert logits.dtype == torch.float32
+    assert all(p.grad is None for p in stage1.parameters())
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in readout.parameters())
 
 
 def test_parallel_queries_have_distinct_position_roles():
     readout = ParallelSemanticReadout(8, 32, num_queries=16, decoder_dim=8, num_heads=2)
     assert readout.query_embed.shape == (16, 8)
     assert torch.unique(readout.query_embed.detach(), dim=0).shape[0] == 16
+
+
+def test_parallel_readout_uses_noncausal_encoder_over_semantic_and_queries():
+    readout = ParallelSemanticReadout(8, 32, num_queries=16, decoder_dim=8, num_heads=2)
+    seen = {}
+    original_forward = readout.encoder.forward
+
+    def wrapped(src, mask=None, src_key_padding_mask=None, is_causal=None):
+        seen["shape"] = tuple(src.shape)
+        seen["mask"] = mask
+        seen["is_causal"] = is_causal
+        return original_forward(
+            src,
+            mask=mask,
+            src_key_padding_mask=src_key_padding_mask,
+            is_causal=is_causal,
+        )
+
+    readout.encoder.forward = wrapped
+    logits = readout(torch.randn(2, 8))
+    assert seen["shape"] == (2, 17, 8)
+    assert seen["mask"] is None
+    assert seen["is_causal"] in (None, False)
+    assert logits.shape == (2, 16, 32)
 
 
 def test_pad_positions_do_not_contribute_to_loss():
@@ -79,9 +118,7 @@ def test_freeze_all_except_parallel_readout():
 def test_semantic_backward_does_not_touch_original_model_params():
     backbone = nn.Linear(4, 4)
     readout = ParallelSemanticReadout(4, 8, num_queries=2, decoder_dim=4, num_heads=2)
-    for p in backbone.parameters():
-        p.requires_grad = False
-    z = backbone(torch.randn(3, 4)).detach()
+    z = backbone(torch.randn(3, 4))
     logits = readout(z)
     targets = torch.tensor([[1, 2], [1, IGNORE_INDEX], [2, IGNORE_INDEX]])
     loss, _ = parallel_semantic_loss(logits, targets, eos_token_id=2)

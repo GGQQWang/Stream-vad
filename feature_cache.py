@@ -100,6 +100,7 @@ def load_feature_cache(
     model_id: str,
     map_location: str | torch.device = "cpu",
     require_spatial: bool = False,
+    keep_spatial: bool | None = None,
 ) -> dict:
     path = feature_cache_path(cache_root, video_id)
     if not path.is_file():
@@ -139,6 +140,13 @@ def load_feature_cache(
                 f"spatial_features shape mismatch for {video_id}: "
                 f"{tuple(sf.shape)}, expected [{n_windows}, R_max, hidden]"
             )
+    if keep_spatial is None:
+        keep_spatial = require_spatial
+    if not keep_spatial:
+        return {
+            "compressed_features": features,
+            "metadata": cache["metadata"],
+        }
     return cache
 
 

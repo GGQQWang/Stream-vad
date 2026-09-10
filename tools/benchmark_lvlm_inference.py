@@ -167,6 +167,7 @@ def load_parallel_readout(path: str | Path, device: torch.device) -> ParallelSem
         num_queries=int(cfg.get("num_semantic_queries", 16)),
         decoder_dim=int(cfg.get("decoder_dim", cfg["input_dim"])),
         num_heads=int(cfg.get("num_heads", 8)),
+        num_layers=int(cfg.get("num_layers", 2)),
         use_output_projection=not bool(cfg.get("uses_frozen_lm_head", False)),
     ).to(device)
     readout.load_state_dict(ckpt["parallel_readout"])
