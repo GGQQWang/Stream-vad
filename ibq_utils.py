@@ -13,6 +13,7 @@ where F = frames per window (16), T = tokens per frame (392 for
 448x224 input).
 """
 
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -31,30 +32,118 @@ IBQ_FRAME_SIZE = (448, 224)
 IBQ_TOKENS_PER_FRAME = 392
 IBQ_CODEBOOK_SIZE = 131072
 IBQ_CODE_EMBED_DIM = 256
+IBQ_CACHE_VERSION = 2
+IBQ_CODEBOOK_CACHE_VERSION = 1
 
 
-def save_codebook(cache_root: str | Path, model) -> Path:
-    """Persist the tokenizer's (frozen) codebook into the cache root.
-
-    Training computes codebook logits as a dot product against this
-    frozen embedding instead of learning a huge [V, H] output layer.
-    """
-    path = Path(cache_root) / "_codebook.pt"
-    if path.is_file():
-        return path
-    weight = model.quantize.embedding.weight.detach().cpu()
-    torch.save({"codebook": weight}, path)
-    return path
+def tensor_sha256(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(cpu.dtype).encode("utf-8"))
+    digest.update(str(tuple(cpu.shape)).encode("utf-8"))
+    digest.update(cpu.float().numpy().tobytes())
+    return digest.hexdigest()
 
 
-def load_codebook(cache_root: str | Path) -> torch.Tensor:
+def build_codebook_metadata(*, codebook: torch.Tensor, model_id: str) -> dict:
+    if codebook.ndim != 2:
+        raise ValueError(f"IBQ codebook must be 2D, got shape {tuple(codebook.shape)}")
+    return {
+        "cache_version": IBQ_CODEBOOK_CACHE_VERSION,
+        "model_id": str(model_id),
+        "codebook_size": int(codebook.shape[0]),
+        "codebook_embed_dim": int(codebook.shape[1]),
+        "codebook_dtype": str(codebook.dtype),
+        "codebook_sha256": tensor_sha256(codebook),
+    }
+
+
+def load_codebook_cache(cache_root: str | Path) -> dict:
     path = Path(cache_root) / "_codebook.pt"
     if not path.is_file():
         raise FileNotFoundError(
             f"IBQ codebook not found at {path}; re-run precompute_ibq_tokens.py "
             "once (it saves the codebook automatically)"
         )
-    return torch.load(path, map_location="cpu", weights_only=True)["codebook"]
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if isinstance(payload, torch.Tensor):
+        payload = {"codebook": payload}
+    if "codebook" not in payload:
+        raise ValueError(f"invalid IBQ codebook cache at {path}: missing codebook")
+    return payload
+
+
+def validate_codebook_cache(
+    cache_root: str | Path,
+    *,
+    expected_model_id: str | None = None,
+    expected_codebook: torch.Tensor | None = None,
+) -> dict:
+    path = Path(cache_root) / "_codebook.pt"
+    payload = load_codebook_cache(cache_root)
+    codebook = payload["codebook"]
+    if codebook.ndim != 2:
+        raise ValueError(f"IBQ codebook cache mismatch at {path}: codebook must be 2D, got {tuple(codebook.shape)}")
+    expected_shape = (IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+    if tuple(codebook.shape) != expected_shape:
+        raise ValueError(
+            f"IBQ codebook cache mismatch at {path}: codebook shape expected "
+            f"{expected_shape}, got {tuple(codebook.shape)}"
+        )
+    actual_sha256 = tensor_sha256(codebook)
+    if expected_codebook is not None:
+        expected_sha256 = tensor_sha256(expected_codebook)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"IBQ codebook cache mismatch at {path}: codebook_sha256 expected "
+                f"{expected_sha256}, got {actual_sha256}"
+            )
+
+    metadata = dict(payload.get("metadata", {}))
+    if metadata:
+        checks = {
+            "codebook_size": IBQ_CODEBOOK_SIZE,
+            "codebook_embed_dim": IBQ_CODE_EMBED_DIM,
+            "codebook_sha256": actual_sha256,
+        }
+        if expected_model_id is not None:
+            checks["model_id"] = str(expected_model_id)
+        for key, expected in checks.items():
+            actual = metadata.get(key)
+            if actual != expected:
+                raise ValueError(
+                    f"IBQ codebook cache mismatch at {path}: {key} expected "
+                    f"{expected!r}, got {actual!r}"
+                )
+    elif expected_codebook is None:
+        # A legacy _codebook.pt without metadata can still be tied to video
+        # caches by the computed fingerprint, but it cannot carry model_id.
+        metadata = {}
+
+    metadata.setdefault("codebook_size", int(codebook.shape[0]))
+    metadata.setdefault("codebook_embed_dim", int(codebook.shape[1]))
+    metadata.setdefault("codebook_sha256", actual_sha256)
+    return metadata
+
+
+def save_codebook(cache_root: str | Path, model, model_id: str = "") -> Path:
+    """Persist the tokenizer's (frozen) codebook into the cache root.
+
+    Training computes codebook logits as a dot product against this
+    frozen embedding instead of learning a huge [V, H] output layer.
+    """
+    path = Path(cache_root) / "_codebook.pt"
+    weight = model.quantize.embedding.weight.detach().cpu()
+    if path.is_file():
+        validate_codebook_cache(cache_root, expected_model_id=model_id, expected_codebook=weight)
+        return path
+    metadata = build_codebook_metadata(codebook=weight, model_id=model_id)
+    torch.save({"codebook": weight, "metadata": metadata}, path)
+    return path
+
+
+def load_codebook(cache_root: str | Path) -> torch.Tensor:
+    return load_codebook_cache(cache_root)["codebook"]
 
 
 def load_ibq_tokenizer(model_dir: str | Path, device, dtype=torch.float32):
@@ -104,8 +193,10 @@ def build_ibq_cache_metadata(
     sample_interval: int,
     tokens_per_frame: int,
     model_id: str,
+    codebook_sha256: str = "",
 ) -> dict:
     return {
+        "cache_version": IBQ_CACHE_VERSION,
         "video_id": video_id,
         "n_windows": int(n_windows),
         "n_frames": int(n_frames),
@@ -114,6 +205,8 @@ def build_ibq_cache_metadata(
         "sample_interval": int(sample_interval),
         "tokens_per_frame": int(tokens_per_frame),
         "codebook_size": int(IBQ_CODEBOOK_SIZE),
+        "codebook_embed_dim": int(IBQ_CODE_EMBED_DIM),
+        "codebook_sha256": str(codebook_sha256),
         "model_id": str(model_id),
     }
 
@@ -142,6 +235,106 @@ def load_ibq_cache(cache_root: str | Path, *, video_id: str) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"IBQ cache not found for {video_id}: {path}")
     return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def load_ibq_cache_header(cache_root: str | Path, *, video_id: str) -> dict:
+    path = Path(cache_root) / f"{video_id}.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"IBQ cache not found for {video_id}: {path}")
+    try:
+        return torch.load(path, map_location="meta", weights_only=True)
+    except (RuntimeError, TypeError):
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def validate_ibq_cache(
+    cache_root: str | Path,
+    *,
+    video_id: str,
+    frames_per_clip: int,
+    sample_interval: int,
+    tokens_per_frame: int,
+    codebook_metadata: dict,
+    n_windows: int | None = None,
+    n_frames: int | None = None,
+) -> dict:
+    path = Path(cache_root) / f"{video_id}.pt"
+    payload = load_ibq_cache_header(cache_root, video_id=video_id)
+    if "metadata" not in payload or "ibq_tokens" not in payload:
+        raise ValueError(f"invalid IBQ cache for video {video_id} at {path}: missing metadata or ibq_tokens")
+    metadata = payload["metadata"]
+    tokens = payload["ibq_tokens"]
+    if tokens.ndim != 3:
+        raise ValueError(
+            f"IBQ cache mismatch for video {video_id} at {path}: ibq_tokens "
+            f"must be 3D, got {tuple(tokens.shape)}"
+        )
+
+    expected = {
+        "video_id": str(video_id),
+        "frames_per_clip": int(frames_per_clip),
+        "sample_interval": int(sample_interval),
+        "tokens_per_frame": int(tokens_per_frame),
+        "codebook_size": int(codebook_metadata["codebook_size"]),
+        "codebook_embed_dim": int(codebook_metadata["codebook_embed_dim"]),
+        "codebook_sha256": str(codebook_metadata["codebook_sha256"]),
+    }
+    if codebook_metadata.get("model_id"):
+        expected["model_id"] = str(codebook_metadata["model_id"])
+    if n_windows is not None:
+        expected["n_windows"] = int(n_windows)
+    if n_frames is not None:
+        expected["n_frames"] = int(n_frames)
+
+    for key, expected_value in expected.items():
+        if key not in metadata:
+            raise ValueError(
+                f"IBQ cache mismatch for video {video_id} at {path}: missing "
+                f"metadata field {key}"
+            )
+        actual = metadata[key]
+        actual_value = int(actual) if isinstance(expected_value, int) else str(actual)
+        if actual_value != expected_value:
+            raise ValueError(
+                f"IBQ cache mismatch for video {video_id} at {path}: {key} "
+                f"expected {expected_value!r}, got {actual!r}"
+            )
+
+    expected_shape = (
+        int(metadata["n_windows"]),
+        int(metadata["frames_per_clip"]),
+        int(metadata["tokens_per_frame"]),
+    )
+    if tuple(tokens.shape) != expected_shape:
+        raise ValueError(
+            f"IBQ cache mismatch for video {video_id} at {path}: ibq_tokens "
+            f"shape expected {expected_shape}, got {tuple(tokens.shape)}"
+        )
+    return metadata
+
+
+def validate_ibq_cache_set(
+    cache_root: str | Path,
+    *,
+    video_ids: list[str],
+    frames_per_clip: int,
+    sample_interval: int,
+    tokens_per_frame: int,
+    codebook_metadata: dict,
+    expected_by_video: dict[str, dict] | None = None,
+) -> None:
+    for video_id in sorted(set(video_ids)):
+        expected_video = (expected_by_video or {}).get(video_id, {})
+        validate_ibq_cache(
+            cache_root,
+            video_id=video_id,
+            frames_per_clip=frames_per_clip,
+            sample_interval=sample_interval,
+            tokens_per_frame=tokens_per_frame,
+            codebook_metadata=codebook_metadata,
+            n_windows=expected_video.get("n_windows"),
+            n_frames=expected_video.get("n_frames"),
+        )
 
 
 class IBQTokenCache:

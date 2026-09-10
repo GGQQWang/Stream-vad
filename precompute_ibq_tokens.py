@@ -30,11 +30,15 @@ from tqdm import tqdm
 
 from ibq_utils import (
     IBQ_FRAME_SIZE,
+    IBQ_TOKENS_PER_FRAME,
     build_ibq_cache_metadata,
     encode_frames,
     load_ibq_tokenizer,
     save_codebook,
     save_ibq_cache_atomic,
+    tensor_sha256,
+    validate_codebook_cache,
+    validate_ibq_cache,
 )
 from stage1_streaming import build_window_infos
 
@@ -67,6 +71,28 @@ def _encode_frames_gpu(model, frames: torch.Tensor, device: torch.device, batch:
     return torch.cat(parts, dim=0)
 
 
+def _validate_existing_video_cache_for_skip(
+    *,
+    cache_root: str | Path,
+    video_id: str,
+    frames_per_clip: int,
+    sample_interval: int,
+    codebook_metadata: dict,
+    n_windows: int,
+    n_frames: int,
+) -> None:
+    validate_ibq_cache(
+        cache_root,
+        video_id=video_id,
+        frames_per_clip=frames_per_clip,
+        sample_interval=sample_interval,
+        tokens_per_frame=IBQ_TOKENS_PER_FRAME,
+        codebook_metadata=codebook_metadata,
+        n_windows=n_windows,
+        n_frames=n_frames,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--annotation-json", required=True)
@@ -93,10 +119,17 @@ def main() -> None:
     model_id = args.model_id or str(args.ibq_model_dir)
     cache_root = Path(args.cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
+    codebook = model.quantize.embedding.weight.detach().cpu()
+    codebook_sha256 = tensor_sha256(codebook)
 
     # persist the frozen codebook once so training can compute dot-product
     # logits against it without loading the tokenizer
-    save_codebook(cache_root, model)
+    save_codebook(cache_root, model, model_id=model_id)
+    codebook_metadata = validate_codebook_cache(
+        cache_root,
+        expected_model_id=model_id,
+        expected_codebook=codebook,
+    )
 
     n_done = 0
     n_skip = 0
@@ -107,14 +140,6 @@ def main() -> None:
         n_frames = int(meta["n_frames"])
         fps = float(meta.get("fps", 30.0))
         out_path = cache_root / f"{video_id}.pt"
-        if out_path.is_file():
-            n_skip += 1
-            continue
-
-        video_path = Path(args.video_root) / f"{video_id}.mp4"
-        if not video_path.exists():
-            n_missing += 1
-            continue
 
         # same windowing as training
         infos = build_window_infos(
@@ -128,6 +153,23 @@ def main() -> None:
         n_windows = len(infos)
         if n_windows == 0:
             continue
+        if out_path.is_file():
+            _validate_existing_video_cache_for_skip(
+                cache_root=cache_root,
+                video_id=video_id,
+                frames_per_clip=args.frames_per_clip,
+                sample_interval=args.sample_interval,
+                codebook_metadata=codebook_metadata,
+                n_windows=n_windows,
+                n_frames=n_frames,
+            )
+            n_skip += 1
+            continue
+
+        video_path = Path(args.video_root) / f"{video_id}.mp4"
+        if not video_path.exists():
+            n_missing += 1
+            continue
 
         # decode only the sampled frames (not the whole video)
         needed = [fi for info in infos for fi in info.sampled_frames]
@@ -136,6 +178,12 @@ def main() -> None:
 
         ids = _encode_frames_gpu(model, frames, device, args.encode_batch)  # [N, T]
         tokens_per_frame = int(ids.shape[1])
+        if tokens_per_frame != IBQ_TOKENS_PER_FRAME:
+            raise ValueError(
+                f"IBQ tokenizer output mismatch for {video_id}: "
+                f"tokens_per_frame expected {IBQ_TOKENS_PER_FRAME}, "
+                f"got {tokens_per_frame}"
+            )
         F = args.frames_per_clip
         ibq_tokens = torch.zeros(n_windows, F, tokens_per_frame, dtype=torch.int32)
         for wi, info in enumerate(infos):
@@ -158,6 +206,7 @@ def main() -> None:
             sample_interval=args.sample_interval,
             tokens_per_frame=tokens_per_frame,
             model_id=model_id,
+            codebook_sha256=codebook_sha256,
         )
         save_ibq_cache_atomic(cache_root, video_id=video_id, ibq_tokens=ibq_tokens, metadata=metadata)
         n_done += 1

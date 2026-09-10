@@ -70,7 +70,8 @@ from ibq_utils import (
     IBQ_TOKENS_PER_FRAME,
     IBQTokenCache,
     load_codebook,
-    load_ibq_cache,
+    validate_codebook_cache,
+    validate_ibq_cache_set,
 )
 from world_model import WorldModelBranch
 
@@ -2037,23 +2038,9 @@ def main():
             )
         if not args.ibq_cache_root:
             raise ValueError("--lambda-world > 0 requires --ibq-cache-root")
-        probe_video = train_ds.samples[0]["video_id"]
-        try:
-            probe_meta = load_ibq_cache(args.ibq_cache_root, video_id=probe_video)["metadata"]
-        except FileNotFoundError:
-            raise ValueError(
-                f"IBQ cache missing for {probe_video}; "
-                "run precompute_ibq_tokens.py first"
-            )
-        if int(probe_meta["frames_per_clip"]) != args.frames_per_clip or \
-           int(probe_meta["sample_interval"]) != args.sample_interval:
-            raise ValueError(
-                "IBQ cache windowing mismatch: "
-                f"cache={probe_meta['frames_per_clip']}/{probe_meta['sample_interval']}, "
-                f"args={args.frames_per_clip}/{args.sample_interval}"
-            )
         ibq_cache = IBQTokenCache(args.ibq_cache_root)
         # load the frozen codebook for dot-product logits
+        codebook_metadata = validate_codebook_cache(args.ibq_cache_root)
         codebook = load_codebook(args.ibq_cache_root).to(
             device=model.ibq_codebook.device, dtype=model.ibq_codebook.dtype,
         )
@@ -2064,6 +2051,21 @@ def main():
             )
         model.ibq_codebook.copy_(codebook)
         del codebook
+        validate_ibq_cache_set(
+            args.ibq_cache_root,
+            video_ids=[s["video_id"] for s in train_ds.samples],
+            frames_per_clip=args.frames_per_clip,
+            sample_interval=args.sample_interval,
+            tokens_per_frame=IBQ_TOKENS_PER_FRAME,
+            codebook_metadata=codebook_metadata,
+            expected_by_video={
+                s["video_id"]: {
+                    "n_windows": s["n_total_windows"],
+                    "n_frames": s["n_frames"],
+                }
+                for s in train_ds.samples
+            },
+        )
         print(f"World-model loss enabled: lambda_world={args.lambda_world}, "
               f"horizon={args.world_horizon}, ibq_cache={args.ibq_cache_root}")
 
