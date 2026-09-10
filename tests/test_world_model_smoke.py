@@ -172,6 +172,11 @@ def test_warmup_detach_blocks_gradient():
         def __init__(self, n_windows):
             self.n_windows = n_windows
 
+        def valid_frame_count(self, vid, window_idx):
+            if window_idx >= self.n_windows:
+                raise IndexError
+            return 16
+
         def get(self, vid, window_idx, frame_idx):
             if window_idx >= self.n_windows:
                 raise IndexError
