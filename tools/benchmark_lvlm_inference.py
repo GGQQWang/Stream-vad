@@ -37,12 +37,18 @@ from infer_stage1_ucf import (  # noqa: E402
     normalize_manifest,
 )
 from mil_utils import group_video_chunks  # noqa: E402
+from parallel_semantic_readout import (  # noqa: E402
+    ParallelSemanticReadout,
+    decode_parallel_tokens,
+    frozen_lm_head_weight,
+)
 
 
 INFERENCE_MODES = {
-    "forward": None,
-    "ar16": 16,
-    "ar64": 64,
+    "score-only": None,
+    "parallel-16": 16,
+    "ar-16": 16,
+    "ar-64": 64,
 }
 LATENCY_SCOPE = "cached_visual_feature_to_prediction"
 STREAMING_PROTOCOL = "strict_single_window_sequential"
@@ -108,17 +114,15 @@ def _require_single_window(states: torch.Tensor, *, context: str) -> None:
         raise ValueError(f"{context} requires batch size 1, got shape={tuple(states.shape)}")
 
 
-def build_generation_inputs(model, embed_fn, tokenizer, states: torch.Tensor, prompt_text: str) -> dict:
-    """Build the AR prefix from the current state and prompt only."""
+def build_generation_inputs(model, embed_fn, tokenizer, states: torch.Tensor, prompt_text: str | None = None) -> dict:
+    """Build the AR prefix used by summary CE: ``[state] [summary_query]``."""
     _require_single_window(states, context="generation")
     llm_weight = embed_fn.weight
     llm_device = llm_weight.device
     llm_dtype = llm_weight.dtype
     states = states.to(device=llm_device, dtype=llm_dtype)
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
-    prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=llm_device)
-    prompt_emb = embed_fn(prompt_ids_t).unsqueeze(0).expand(states.shape[0], -1, -1)
-    inputs_embeds = torch.cat([states.unsqueeze(1), prompt_emb], dim=1)
+    query = model.summary_query.to(device=llm_device, dtype=llm_dtype).reshape(1, 1, -1).expand(states.shape[0], 1, -1)
+    inputs_embeds = torch.cat([states.unsqueeze(1), query], dim=1)
     attention_mask = torch.ones(states.shape[0], inputs_embeds.shape[1], dtype=torch.bool, device=llm_device)
     return {"inputs_embeds": inputs_embeds, "attention_mask": attention_mask}
 
@@ -152,6 +156,36 @@ def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, m
         use_cache=True,
     )
     return decode_generated(tokenizer, sequences, max_new_tokens)
+
+
+def load_parallel_readout(path: str | Path, device: torch.device) -> ParallelSemanticReadout:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    cfg = ckpt["config"]
+    readout = ParallelSemanticReadout(
+        int(cfg["input_dim"]),
+        int(cfg["vocab_size"]),
+        num_queries=int(cfg.get("num_semantic_queries", 16)),
+        decoder_dim=int(cfg.get("decoder_dim", cfg["input_dim"])),
+        num_heads=int(cfg.get("num_heads", 8)),
+        use_output_projection=not bool(cfg.get("uses_frozen_lm_head", False)),
+    ).to(device)
+    readout.load_state_dict(ckpt["parallel_readout"])
+    readout.eval()
+    for p in readout.parameters():
+        p.requires_grad = False
+    return readout
+
+
+def parallel_readout_texts(model, readout, embed_fn, tokenizer, states) -> List[str]:
+    _require_single_window(states, context="parallel semantic readout")
+    sum_hidden = model.forward_summary_query_hidden(states, embed_fn).detach()
+    output_proj = getattr(readout, "output_proj", None)
+    output_weight = (
+        frozen_lm_head_weight(model.qwen, embed_fn).detach()
+        if output_proj is None else None
+    )
+    logits = readout(sum_hidden, output_weight=output_weight)
+    return decode_parallel_tokens(tokenizer, logits.argmax(dim=-1))
 
 
 def score_single_window(model, embed_fn, tokenizer, states, prompt_text: str):
@@ -204,6 +238,7 @@ def run_video_benchmark(
     prompt_text: str,
     gt_root: str | Path,
     inference_mode: str,
+    parallel_readout,
     latency_f,
     text_f,
     warmup_state: dict,
@@ -276,7 +311,17 @@ def run_video_benchmark(
 
                 generation_ms = 0.0
                 generated_texts: List[str] = []
-                if max_new_tokens is not None:
+                if inference_mode == "parallel-16":
+                    if parallel_readout is None:
+                        raise ValueError("--parallel-readout-checkpoint is required for parallel-16")
+                    generation_start = time.perf_counter()
+                    with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                        generated_texts = parallel_readout_texts(
+                            model, parallel_readout, embed_fn, tokenizer, states,
+                        )
+                    synchronize(device)
+                    generation_ms = (time.perf_counter() - generation_start) * 1000.0
+                elif max_new_tokens is not None:
                     generation_start = time.perf_counter()
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                         generated_texts = maybe_generate_texts(
@@ -328,11 +373,18 @@ def run_video_benchmark(
                 if max_new_tokens is not None:
                     text_f.write(json.dumps({
                         "video_id": video_id,
+                        "sample_id": f"{video_id}:{window_idx}",
                         "window_idx": window_idx,
+                        "ground_truth_text": "",
+                        "parallel_16_text": generated_texts[0] if inference_mode == "parallel-16" and generated_texts else "",
+                        "ar_16_text": generated_texts[0] if inference_mode == "ar-16" and generated_texts else "",
+                        "ar_64_text": generated_texts[0] if inference_mode == "ar-64" and generated_texts else "",
                         "score": score,
+                        "anomaly_score": score,
                         "gt_label": gt_label,
                         "generated_text": generated_texts[0] if generated_texts else "",
                         "max_new_tokens": max_new_tokens,
+                        "latency_ms": latency_ms,
                     }, ensure_ascii=False) + "\n")
                 warmup_state["seen_windows"] += 1
 
@@ -374,6 +426,7 @@ def main() -> None:
     parser.add_argument("--video-id", default="")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--inference-mode", required=True, choices=sorted(INFERENCE_MODES))
+    parser.add_argument("--parallel-readout-checkpoint", default="")
     parser.add_argument("--warmup-windows", type=int, default=30)
     parser.add_argument("--skip-failed-videos", action="store_true")
     args = parser.parse_args()
@@ -384,6 +437,11 @@ def main() -> None:
     normalized_manifest = normalize_manifest(args.test_manifest, run_dir, args.video_id)
     model, processor, tokenizer, dtype, prompt_text = load_stage1_model(args)
     model.eval()
+    parallel_readout = None
+    if args.inference_mode == "parallel-16":
+        if not args.parallel_readout_checkpoint:
+            raise ValueError("--parallel-readout-checkpoint is required for parallel-16")
+        parallel_readout = load_parallel_readout(args.parallel_readout_checkpoint, args.device)
 
     dataset = HIVAUDataset(
         normalized_manifest,
@@ -438,6 +496,7 @@ def main() -> None:
                         prompt_text=prompt_text,
                         gt_root=args.gt_root,
                         inference_mode=args.inference_mode,
+                        parallel_readout=parallel_readout,
                         latency_f=latency_f,
                         text_f=text_f_cm,
                         warmup_state=warmup_state,

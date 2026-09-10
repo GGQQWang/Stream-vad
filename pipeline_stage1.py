@@ -810,6 +810,32 @@ class StreamingVADGenerationModel(nn.Module):
         hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
         return self.score_head(hidden).squeeze(-1)
 
+    def forward_summary_query_hidden(
+        self,
+        state_embeddings: torch.Tensor,
+        embed_fn: nn.Module,
+    ) -> torch.Tensor:
+        """One-pass LLM forward -> existing summary-query hidden state."""
+        N = state_embeddings.shape[0]
+        if N == 0:
+            return state_embeddings.new_zeros(0, state_embeddings.shape[-1])
+
+        llm_weight = embed_fn.weight
+        llm_device = llm_weight.device
+        llm_dtype = llm_weight.dtype
+        state_embeddings = state_embeddings.to(device=llm_device, dtype=llm_dtype)
+        query = self.summary_query.to(device=llm_device, dtype=llm_dtype).reshape(1, 1, -1).expand(N, 1, -1)
+        inputs = torch.cat([state_embeddings.unsqueeze(1), query], dim=1)
+        attn = torch.ones(N, inputs.shape[1], dtype=torch.bool, device=llm_device)
+        out = self.qwen(
+            inputs_embeds=inputs,
+            attention_mask=attn,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        return out.hidden_states[-1][:, -1, :]
+
 
 def _state_dict_shapes_match(module: nn.Module, saved: dict) -> bool:
     """Check a saved state dict against a module BEFORE loading it.

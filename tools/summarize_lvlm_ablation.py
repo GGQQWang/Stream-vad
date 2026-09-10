@@ -8,14 +8,22 @@ from pathlib import Path
 
 
 ROWS = [
-    ("forward", "Forward-only"),
-    ("ar16", "AR-16"),
-    ("ar64", "AR-64"),
+    ("score-only", "Score-only"),
+    ("parallel-16", "Parallel-16"),
+    ("ar-16", "AR-16"),
+    ("ar-64", "AR-64"),
 ]
+LEGACY_MODE_ALIASES = {
+    "score-only": "forward",
+    "ar-16": "ar16",
+    "ar-64": "ar64",
+}
 
 
 def load_metrics(root: Path, mode: str) -> dict | None:
     path = root / mode / "metrics.json"
+    if not path.is_file() and mode in LEGACY_MODE_ALIASES:
+        path = root / LEGACY_MODE_ALIASES[mode] / "metrics.json"
     if not path.is_file():
         return None
     with open(path, "r") as f:
@@ -55,7 +63,7 @@ def main() -> None:
             f"{fmt(m.get('RTF'))} | {fmt(peak_mem)} GB |"
         )
 
-    base = metrics.get("forward") or {}
+    base = metrics.get("score-only") or {}
     print()
     print("| LVLM Inference | Latency Increase | Throughput Drop | Memory Increase |")
     print("|---|---:|---:|---:|")
