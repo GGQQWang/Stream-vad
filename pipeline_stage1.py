@@ -67,6 +67,7 @@ from stage1_streaming import (
 from ibq_utils import (
     IBQ_CODE_EMBED_DIM,
     IBQ_CODEBOOK_SIZE,
+    IBQ_TOKENS_PER_FRAME,
     IBQTokenCache,
     load_codebook,
     load_ibq_cache,
@@ -926,10 +927,12 @@ def _world_model_loss(
 
             # per-window-pair independent random frame
             try:
-                tgt = ibq_cache.get(
-                    vid, cs + w + horizon,
-                    random.randint(0, frames_per_clip - 1),
-                ).long()
+                tgt = _sample_future_ibq_target(
+                    ibq_cache,
+                    vid,
+                    cs + w + horizon,
+                    expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME,
+                )
             except IndexError:
                 continue                                    # no future window
             tgt = tgt.to(device=h_internal.device)
@@ -999,6 +1002,24 @@ def _world_model_loss(
         ),
     }
     return loss_ibq, info
+
+
+def _sample_future_ibq_target(
+    ibq_cache: IBQTokenCache,
+    video_id: str,
+    window_idx: int,
+    expected_tokens_per_frame: int,
+) -> torch.Tensor:
+    valid_frames = ibq_cache.valid_frame_count(video_id, window_idx)
+    frame_idx = random.randint(0, valid_frames - 1)
+    tgt = ibq_cache.get(video_id, window_idx, frame_idx).long()
+    if tgt.ndim != 1 or int(tgt.numel()) != int(expected_tokens_per_frame):
+        raise ValueError(
+            f"{video_id}: IBQ target shape {tuple(tgt.shape)} for "
+            f"window_idx={window_idx}, frame_idx={frame_idx}; expected "
+            f"[{expected_tokens_per_frame}]"
+        )
+    return tgt
 
 
 def _verify_attention_backend(model: nn.Module, requested: str) -> None:

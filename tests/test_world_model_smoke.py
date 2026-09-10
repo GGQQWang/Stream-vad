@@ -198,6 +198,88 @@ def test_warmup_detach_blocks_gradient():
     print("test 7 OK: warmup detach blocks SSM gradient")
 
 
+def test_future_ibq_target_samples_only_valid_complete_window():
+    pipe = _import_pipeline_stage1()
+    calls = []
+
+    class _FakeIBQ:
+        def valid_frame_count(self, vid, window_idx):
+            return 16
+
+        def get(self, vid, window_idx, frame_idx):
+            assert 0 <= frame_idx <= 15
+            return torch.zeros(IBQ_TOKENS_PER_FRAME, dtype=torch.int32)
+
+    def _randint(lo, hi):
+        calls.append((lo, hi))
+        return hi
+
+    old_randint = pipe.random.randint
+    try:
+        pipe.random.randint = _randint
+        tgt = pipe._sample_future_ibq_target(
+            _FakeIBQ(), "v1", 0, expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME)
+    finally:
+        pipe.random.randint = old_randint
+    assert calls == [(0, 15)]
+    assert tgt.shape == (IBQ_TOKENS_PER_FRAME,)
+    print("future IBQ target OK: complete window samples full frame range")
+
+
+def test_future_ibq_target_samples_only_valid_partial_window():
+    pipe = _import_pipeline_stage1()
+    calls = []
+
+    class _FakeIBQ:
+        def valid_frame_count(self, vid, window_idx):
+            return 5
+
+        def get(self, vid, window_idx, frame_idx):
+            assert 0 <= frame_idx <= 4
+            return torch.zeros(IBQ_TOKENS_PER_FRAME, dtype=torch.int32)
+
+    def _randint(lo, hi):
+        calls.append((lo, hi))
+        return hi
+
+    old_randint = pipe.random.randint
+    try:
+        pipe.random.randint = _randint
+        pipe._sample_future_ibq_target(
+            _FakeIBQ(), "v1", 1, expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME)
+    finally:
+        pipe.random.randint = old_randint
+    assert calls == [(0, 4)]
+    print("future IBQ target OK: partial window excludes padded frames")
+
+
+def test_future_ibq_target_samples_only_single_valid_frame():
+    pipe = _import_pipeline_stage1()
+    calls = []
+
+    class _FakeIBQ:
+        def valid_frame_count(self, vid, window_idx):
+            return 1
+
+        def get(self, vid, window_idx, frame_idx):
+            assert frame_idx == 0
+            return torch.zeros(IBQ_TOKENS_PER_FRAME, dtype=torch.int32)
+
+    def _randint(lo, hi):
+        calls.append((lo, hi))
+        return hi
+
+    old_randint = pipe.random.randint
+    try:
+        pipe.random.randint = _randint
+        pipe._sample_future_ibq_target(
+            _FakeIBQ(), "v1", 1, expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME)
+    finally:
+        pipe.random.randint = old_randint
+    assert calls == [(0, 0)]
+    print("future IBQ target OK: single-frame window samples frame 0")
+
+
 def test_grid_shape_assert():
     assert IBQ_GRID_ROWS * IBQ_GRID_COLS == IBQ_TOKENS_PER_FRAME
     print("test 8 OK: grid shape consistent")
@@ -330,6 +412,9 @@ if __name__ == "__main__":
     test_zero_temporal_token_is_truly_zero()
     test_joint_gradient_reaches_h_through_temporal_proj()
     test_warmup_detach_blocks_gradient()
+    test_future_ibq_target_samples_only_valid_complete_window()
+    test_future_ibq_target_samples_only_valid_partial_window()
+    test_future_ibq_target_samples_only_single_valid_frame()
     test_grid_shape_assert()
     test_zero_init_modulation_matches_old_formula()
     test_temporal_modulator_receives_anomaly_gradient()

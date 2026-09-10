@@ -17,6 +17,7 @@ from stage1_streaming import (
     make_window_score_record,
     score_bce_loss,
     score_metrics_from_logits,
+    sampled_frame_count_for_window,
     sorted_window_score_records,
     summary_ce_loss,
 )
@@ -72,6 +73,64 @@ def test_window_soft_labels_and_tail_denominator():
         sample_interval=1,
     )
     assert no_overlap[0].soft_label == pytest.approx(0.0, abs=1e-7)
+
+
+def test_sampled_frame_count_matches_complete_window():
+    count = sampled_frame_count_for_window(
+        n_frames=16,
+        window_index=0,
+        frames_per_clip=16,
+        sample_interval=1,
+    )
+    assert count == 16
+
+
+def test_sampled_frame_count_matches_partial_window():
+    count = sampled_frame_count_for_window(
+        n_frames=21,
+        window_index=1,
+        frames_per_clip=16,
+        sample_interval=1,
+    )
+    assert count == 5
+
+
+def test_sampled_frame_count_matches_single_frame_window():
+    count = sampled_frame_count_for_window(
+        n_frames=17,
+        window_index=1,
+        frames_per_clip=16,
+        sample_interval=1,
+    )
+    assert count == 1
+
+
+def test_sampled_frame_count_matches_range_with_sample_interval_gt_one():
+    n_frames = 20
+    frames_per_clip = 4
+    sample_interval = 3
+    window_index = 1
+    start = window_index * frames_per_clip * sample_interval
+    valid_end = min(start + frames_per_clip * sample_interval, n_frames)
+
+    count = sampled_frame_count_for_window(
+        n_frames=n_frames,
+        window_index=window_index,
+        frames_per_clip=frames_per_clip,
+        sample_interval=sample_interval,
+    )
+    assert count == len(range(start, valid_end, sample_interval))
+    assert count == 3
+
+
+def test_sampled_frame_count_keeps_exact_span_multiple_full():
+    count = sampled_frame_count_for_window(
+        n_frames=96,
+        window_index=1,
+        frames_per_clip=16,
+        sample_interval=3,
+    )
+    assert count == 16
 
 
 def test_summary_trigger_fires_when_clip_end_falls_inside_window():

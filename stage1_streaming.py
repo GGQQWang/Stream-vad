@@ -36,6 +36,28 @@ def window_span_frames(frames_per_clip: int, sample_interval: int) -> int:
     return int(frames_per_clip) * int(sample_interval)
 
 
+def sampled_frame_count_for_window(
+    *,
+    n_frames: int,
+    window_index: int,
+    frames_per_clip: int,
+    sample_interval: int,
+) -> int:
+    """Return the number of real sampled frames in a streaming window.
+
+    This is exactly equivalent to the window construction below:
+    ``range(start, valid_end, sample_interval)``.
+    """
+    if n_frames <= 0:
+        return 0
+    span = window_span_frames(frames_per_clip, sample_interval)
+    start = int(window_index) * span
+    if start >= int(n_frames):
+        return 0
+    valid_end = min(start + span, int(n_frames))
+    return len(range(start, valid_end, int(sample_interval)))
+
+
 def build_window_infos(
     *,
     n_frames: int,
@@ -95,6 +117,12 @@ def build_window_infos(
         start = wi * span
         valid_end = min(start + span, n_frames)
         sampled = tuple(range(start, valid_end, sample_interval))
+        assert len(sampled) == sampled_frame_count_for_window(
+            n_frames=n_frames,
+            window_index=wi,
+            frames_per_clip=frames_per_clip,
+            sample_interval=sample_interval,
+        )
         if not sampled:
             soft = 0.0
         else:

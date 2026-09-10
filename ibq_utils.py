@@ -18,6 +18,8 @@ from typing import Optional
 
 import torch
 
+from stage1_streaming import sampled_frame_count_for_window
+
 # CLIP normalization statistics (tokenizer pretraining preprocessing).
 # The model itself performs no normalization; the caller must apply it.
 IBQ_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -157,8 +159,49 @@ class IBQTokenCache:
     def get(self, video_id: str, window_idx: int, frame_idx: int) -> torch.Tensor:
         if video_id not in self._loaded:
             self._loaded[video_id] = load_ibq_cache(self.root, video_id=video_id)
-        data = self._loaded[video_id]["ibq_tokens"]
+        cache = self._loaded[video_id]
+        data = cache["ibq_tokens"]
+        if window_idx < 0 or window_idx >= int(data.shape[0]):
+            raise IndexError(f"{video_id}: window_idx={window_idx} outside IBQ cache")
+        valid_frames = self.valid_frame_count(video_id, window_idx)
+        if frame_idx < 0 or frame_idx >= valid_frames:
+            raise IndexError(
+                f"{video_id}: frame_idx={frame_idx} outside valid sampled frames "
+                f"for window_idx={window_idx} (valid={valid_frames})"
+            )
         return data[window_idx, frame_idx]  # [T] int32
+
+    def valid_frame_count(self, video_id: str, window_idx: int) -> int:
+        if video_id not in self._loaded:
+            self._loaded[video_id] = load_ibq_cache(self.root, video_id=video_id)
+        cache = self._loaded[video_id]
+        data = cache["ibq_tokens"]
+        if window_idx < 0 or window_idx >= int(data.shape[0]):
+            raise IndexError(f"{video_id}: window_idx={window_idx} outside IBQ cache")
+        metadata = cache.get("metadata", {})
+        required = ("n_frames", "frames_per_clip", "sample_interval")
+        missing = [key for key in required if key not in metadata]
+        if missing:
+            raise ValueError(
+                f"IBQ cache metadata for {video_id} is missing {missing}; "
+                "cannot distinguish valid frames from padding"
+            )
+        valid_frames = sampled_frame_count_for_window(
+            n_frames=int(metadata["n_frames"]),
+            window_index=int(window_idx),
+            frames_per_clip=int(metadata["frames_per_clip"]),
+            sample_interval=int(metadata["sample_interval"]),
+        )
+        if valid_frames <= 0:
+            raise IndexError(
+                f"{video_id}: window_idx={window_idx} has no valid sampled frames"
+            )
+        if valid_frames > int(data.shape[1]):
+            raise ValueError(
+                f"IBQ cache shape mismatch for {video_id}: window_idx={window_idx} "
+                f"has {valid_frames} valid frames but cache stores {data.shape[1]}"
+            )
+        return valid_frames
 
     @property
     def tokens_per_frame(self) -> int:
