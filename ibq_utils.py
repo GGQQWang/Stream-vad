@@ -348,6 +348,34 @@ class IBQTokenCache:
     def __init__(self, cache_root: str | Path):
         self.root = Path(cache_root)
         self._loaded: dict = {}
+        self._headers: dict = {}
+
+    def _header(self, video_id: str) -> dict:
+        if video_id in self._loaded:
+            return self._loaded[video_id]
+        if video_id not in self._headers:
+            self._headers[video_id] = load_ibq_cache_header(self.root, video_id=video_id)
+        return self._headers[video_id]
+
+    def num_windows(self, video_id: str) -> int:
+        header = self._header(video_id)
+        if "metadata" not in header or "ibq_tokens" not in header:
+            raise ValueError(
+                f"invalid IBQ cache for {video_id}: missing metadata or ibq_tokens"
+            )
+        data = header["ibq_tokens"]
+        metadata = header["metadata"]
+        if "n_windows" not in metadata:
+            raise ValueError(
+                f"IBQ cache metadata for {video_id} is missing n_windows"
+            )
+        n_windows = int(metadata["n_windows"])
+        if n_windows != int(data.shape[0]):
+            raise ValueError(
+                f"IBQ cache shape mismatch for {video_id}: n_windows metadata "
+                f"{n_windows} but ibq_tokens stores {data.shape[0]}"
+            )
+        return n_windows
 
     def get(self, video_id: str, window_idx: int, frame_idx: int) -> torch.Tensor:
         if video_id not in self._loaded:

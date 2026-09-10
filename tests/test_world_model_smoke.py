@@ -7,6 +7,7 @@ Run on the server:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytest
 import sys
 import types
 
@@ -172,6 +173,9 @@ def test_warmup_detach_blocks_gradient():
         def __init__(self, n_windows):
             self.n_windows = n_windows
 
+        def num_windows(self, vid):
+            return self.n_windows
+
         def valid_frame_count(self, vid, window_idx):
             if window_idx >= self.n_windows:
                 raise IndexError
@@ -201,6 +205,125 @@ def test_warmup_detach_blocks_gradient():
         "warmup detach must block gradients into h_internal"
     )
     print("test 7 OK: warmup detach blocks SSM gradient")
+
+
+class _TinyWorldBranch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.temporal_proj = nn.Linear(2, 2)
+
+    def forward_once(
+        self, C_t, m_t, h_t, codebook, tgt, logit_chunk_size=32,
+        zero_temporal=False,
+    ):
+        return h_t.sum() * 0.0 + tgt.float().mean() * 0.0 + 1.0
+
+
+class _TinyWorldModel:
+    def __init__(self):
+        self.world_branch = _TinyWorldBranch()
+        self.ibq_codebook = torch.empty(0)
+
+
+def _tiny_world_inputs():
+    B, W, R, H = 1, 1, 1, 2
+    h = torch.randn(B, W, H, requires_grad=True)
+    sf = torch.randn(B, W, R, H)
+    sm = torch.ones(B, W, R, dtype=torch.bool)
+    valid = torch.ones(B, W, dtype=torch.bool)
+    batch = {"chunk_start": [0], "video_id": ["v1"]}
+    return batch, valid, h, sf, sm
+
+
+def test_world_model_loss_skips_missing_future_window_boundary():
+    pipe = _import_pipeline_stage1()
+
+    class _FakeIBQ:
+        def num_windows(self, vid):
+            return 1
+
+        def valid_frame_count(self, vid, window_idx):
+            raise AssertionError("missing future window should be skipped before sampling")
+
+        def get(self, vid, window_idx, frame_idx):
+            raise AssertionError("missing future window should be skipped before get")
+
+    batch, valid, h, sf, sm = _tiny_world_inputs()
+    loss, info = pipe._world_model_loss(
+        _TinyWorldModel(), _FakeIBQ(), batch, valid, valid, h, sf, sm,
+        1, 16, 32, False,
+    )
+    assert loss.ndim == 0
+    assert info["num_world_windows"] == 0
+
+
+def test_world_model_loss_uses_existing_future_window_target():
+    pipe = _import_pipeline_stage1()
+
+    class _FakeIBQ:
+        def __init__(self):
+            self.got = []
+
+        def num_windows(self, vid):
+            return 2
+
+        def valid_frame_count(self, vid, window_idx):
+            return 1
+
+        def get(self, vid, window_idx, frame_idx):
+            self.got.append((vid, window_idx, frame_idx))
+            return torch.zeros(IBQ_TOKENS_PER_FRAME, dtype=torch.int32)
+
+    ibq = _FakeIBQ()
+    batch, valid, h, sf, sm = _tiny_world_inputs()
+    _, info = pipe._world_model_loss(
+        _TinyWorldModel(), ibq, batch, valid, valid, h, sf, sm,
+        1, 16, 32, False,
+    )
+    assert info["num_world_windows"] == 1
+    assert ibq.got == [("v1", 1, 0)]
+
+
+def test_world_model_loss_propagates_valid_frame_count_index_error():
+    pipe = _import_pipeline_stage1()
+
+    class _FakeIBQ:
+        def num_windows(self, vid):
+            return 2
+
+        def valid_frame_count(self, vid, window_idx):
+            raise IndexError("in-range window has invalid metadata")
+
+        def get(self, vid, window_idx, frame_idx):
+            raise AssertionError("get should not run")
+
+    batch, valid, h, sf, sm = _tiny_world_inputs()
+    with pytest.raises(IndexError, match="invalid metadata"):
+        pipe._world_model_loss(
+            _TinyWorldModel(), _FakeIBQ(), batch, valid, valid, h, sf, sm,
+            1, 16, 32, False,
+        )
+
+
+def test_world_model_loss_propagates_get_index_error_for_existing_window():
+    pipe = _import_pipeline_stage1()
+
+    class _FakeIBQ:
+        def num_windows(self, vid):
+            return 2
+
+        def valid_frame_count(self, vid, window_idx):
+            return 1
+
+        def get(self, vid, window_idx, frame_idx):
+            raise IndexError("in-range window get failed")
+
+    batch, valid, h, sf, sm = _tiny_world_inputs()
+    with pytest.raises(IndexError, match="get failed"):
+        pipe._world_model_loss(
+            _TinyWorldModel(), _FakeIBQ(), batch, valid, valid, h, sf, sm,
+            1, 16, 32, False,
+        )
 
 
 def test_future_ibq_target_samples_only_valid_complete_window():
@@ -417,6 +540,10 @@ if __name__ == "__main__":
     test_zero_temporal_token_is_truly_zero()
     test_joint_gradient_reaches_h_through_temporal_proj()
     test_warmup_detach_blocks_gradient()
+    test_world_model_loss_skips_missing_future_window_boundary()
+    test_world_model_loss_uses_existing_future_window_target()
+    test_world_model_loss_propagates_valid_frame_count_index_error()
+    test_world_model_loss_propagates_get_index_error_for_existing_window()
     test_future_ibq_target_samples_only_valid_complete_window()
     test_future_ibq_target_samples_only_valid_partial_window()
     test_future_ibq_target_samples_only_single_valid_frame()

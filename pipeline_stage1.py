@@ -925,17 +925,22 @@ def _world_model_loss(
             if not bool(valid_mask_cpu[b, w]):
                 continue
             h_t = h_int[b, w]
+            future_window_idx = cs + w + horizon
+            if future_window_idx < 0:
+                raise ValueError(
+                    f"{vid}: future_window_idx={future_window_idx} is negative "
+                    f"(chunk_start={cs}, local_window={w}, horizon={horizon})"
+                )
+            if future_window_idx >= ibq_cache.num_windows(vid):
+                continue                                    # no future window
 
             # per-window-pair independent random frame
-            try:
-                tgt = _sample_future_ibq_target(
-                    ibq_cache,
-                    vid,
-                    cs + w + horizon,
-                    expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME,
-                )
-            except IndexError:
-                continue                                    # no future window
+            tgt = _sample_future_ibq_target(
+                ibq_cache,
+                vid,
+                future_window_idx,
+                expected_tokens_per_frame=IBQ_TOKENS_PER_FRAME,
+            )
             tgt = tgt.to(device=h_internal.device)
 
             C_t = spatial_features[b, w].to(device=h_internal.device)
