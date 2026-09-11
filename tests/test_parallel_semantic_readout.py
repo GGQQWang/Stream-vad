@@ -13,10 +13,14 @@ from stage1_streaming import IGNORE_INDEX
 
 class _Tokenizer:
     eos_token_id = 2
+    pad_token_id = 0
 
     def encode(self, text, add_special_tokens=False):
         table = {"a": 3, "b": 4}
         return [table[t] for t in text.split()]
+
+    def convert_ids_to_tokens(self, ids):
+        return [f"tok_{int(x)}" for x in ids]
 
     def batch_decode(self, sequences, skip_special_tokens=True):
         out = []
@@ -26,6 +30,22 @@ class _Tokenizer:
                 if skip_special_tokens and int(x) == self.eos_token_id:
                     break
                 toks.append(str(int(x)))
+            out.append(" ".join(toks))
+        return out
+
+
+class _BatchDecodeDoesNotTruncateTokenizer:
+    eos_token_id = 2
+    pad_token_id = 0
+
+    def batch_decode(self, sequences, skip_special_tokens=True):
+        out = []
+        for row in sequences:
+            toks = [
+                str(int(x))
+                for x in row
+                if not skip_special_tokens or int(x) not in {self.eos_token_id, self.pad_token_id}
+            ]
             out.append(" ".join(toks))
         return out
 
@@ -99,6 +119,32 @@ def test_eos_target_and_decode_work():
     assert targets.tolist() == [[3, 4, 2, IGNORE_INDEX]]
     text = decode_parallel_tokens(tokenizer, torch.tensor([[3, 4, 2, 7]]))
     assert text == ["3 4"]
+
+
+def test_decode_parallel_tokens_truncates_at_first_eos_or_pad_before_batch_decode():
+    tokenizer = _BatchDecodeDoesNotTruncateTokenizer()
+    texts = decode_parallel_tokens(
+        tokenizer,
+        torch.tensor([
+            [5, 6, 2, 7, 8],
+            [9, 0, 10, 2, 11],
+            [12, 13, 14, 15, 16],
+        ]),
+    )
+    assert texts == ["5 6", "9", "12 13 14 15 16"]
+
+
+def test_avg_pred_length_uses_first_eos_position():
+    logits = torch.zeros(3, 5, 8)
+    logits[0, :, 1] = 1.0
+    logits[0, 2, 2] = 2.0  # first EOS at position 2
+    logits[0, 4, 2] = 3.0
+    logits[1, :, 1] = 1.0
+    logits[1, 0, 2] = 2.0  # first EOS at position 0
+    logits[2, :, 1] = 1.0  # no EOS, length K
+    targets = torch.ones(3, 5, dtype=torch.long)
+    _, info = parallel_semantic_loss(logits, targets, eos_token_id=2)
+    assert abs(info["avg_pred_length"] - ((2 + 0 + 5) / 3)) < 1e-6
 
 
 def test_freeze_all_except_parallel_readout():

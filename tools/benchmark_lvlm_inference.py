@@ -41,6 +41,7 @@ from parallel_semantic_readout import (  # noqa: E402
     ParallelSemanticReadout,
     decode_parallel_tokens,
     frozen_lm_head_weight,
+    parallel_token_debug,
 )
 
 
@@ -178,6 +179,11 @@ def load_parallel_readout(path: str | Path, device: torch.device) -> ParallelSem
 
 
 def parallel_readout_texts(model, readout, embed_fn, tokenizer, states) -> List[str]:
+    texts, _ = parallel_readout_predictions(model, readout, embed_fn, tokenizer, states)
+    return texts
+
+
+def parallel_readout_predictions(model, readout, embed_fn, tokenizer, states) -> tuple[List[str], torch.Tensor]:
     _require_single_window(states, context="parallel semantic readout")
     sum_hidden = model.forward_summary_query_hidden(states, embed_fn).detach()
     output_proj = getattr(readout, "output_proj", None)
@@ -186,7 +192,8 @@ def parallel_readout_texts(model, readout, embed_fn, tokenizer, states) -> List[
         if output_proj is None else None
     )
     logits = readout(sum_hidden, output_weight=output_weight)
-    return decode_parallel_tokens(tokenizer, logits.argmax(dim=-1))
+    pred_ids = logits.argmax(dim=-1)
+    return decode_parallel_tokens(tokenizer, pred_ids), pred_ids
 
 
 def score_single_window(model, embed_fn, tokenizer, states, prompt_text: str):
@@ -240,6 +247,7 @@ def run_video_benchmark(
     gt_root: str | Path,
     inference_mode: str,
     parallel_readout,
+    parallel_debug_samples: int,
     latency_f,
     text_f,
     warmup_state: dict,
@@ -255,6 +263,7 @@ def run_video_benchmark(
     ssm_cache: dict = {}
     rows: List[dict] = []
     max_new_tokens = max_new_tokens_for_mode(inference_mode)
+    parallel_debug_printed = 0
 
     with torch.no_grad():
         for chunk_i, ref in enumerate(refs):
@@ -312,16 +321,28 @@ def run_video_benchmark(
 
                 generation_ms = 0.0
                 generated_texts: List[str] = []
+                parallel_token_ids = None
                 if inference_mode == "parallel-16":
                     if parallel_readout is None:
                         raise ValueError("--parallel-readout-checkpoint is required for parallel-16")
                     generation_start = time.perf_counter()
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        generated_texts = parallel_readout_texts(
+                        generated_texts, parallel_token_ids = parallel_readout_predictions(
                             model, parallel_readout, embed_fn, tokenizer, states,
                         )
                     synchronize(device)
                     generation_ms = (time.perf_counter() - generation_start) * 1000.0
+                    if parallel_debug_printed < parallel_debug_samples:
+                        for debug_item in parallel_token_debug(tokenizer, parallel_token_ids):
+                            print(json.dumps({
+                                "parallel_debug": True,
+                                "video_id": video_id,
+                                "window_idx": int(batch["chunk_start"][b]) + w,
+                                **debug_item,
+                            }, ensure_ascii=False))
+                            parallel_debug_printed += 1
+                            if parallel_debug_printed >= parallel_debug_samples:
+                                break
                 elif max_new_tokens is not None:
                     generation_start = time.perf_counter()
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
@@ -428,6 +449,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--inference-mode", required=True, choices=sorted(INFERENCE_MODES))
     parser.add_argument("--parallel-readout-checkpoint", default="")
+    parser.add_argument("--parallel-debug-samples", type=int, default=0)
     parser.add_argument("--warmup-windows", type=int, default=30)
     parser.add_argument("--skip-failed-videos", action="store_true")
     args = parser.parse_args()
@@ -498,6 +520,7 @@ def main() -> None:
                         gt_root=args.gt_root,
                         inference_mode=args.inference_mode,
                         parallel_readout=parallel_readout,
+                        parallel_debug_samples=max(0, int(args.parallel_debug_samples)),
                         latency_f=latency_f,
                         text_f=text_f_cm,
                         warmup_state=warmup_state,

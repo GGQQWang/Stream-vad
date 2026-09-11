@@ -143,10 +143,13 @@ def parallel_semantic_loss(
             (pred[eos_mask] == targets[eos_mask]).float().mean()
             if eos_mask.any() else torch.tensor(0.0, device=logits.device)
         )
-        pred_len = (
-            (pred != int(eos_token_id)).float().sum(dim=1).mean()
-            if eos_token_id is not None else torch.full((), float(pred.shape[1]), device=logits.device)
-        )
+        if eos_token_id is not None:
+            eos_pos = pred == int(eos_token_id)
+            positions = torch.arange(pred.shape[1], device=pred.device).unsqueeze(0).expand_as(pred)
+            first_eos = torch.where(eos_pos, positions, pred.new_full((), pred.shape[1])).min(dim=1).values
+            pred_len = first_eos.float().mean()
+        else:
+            pred_len = torch.full((), float(pred.shape[1]), device=logits.device)
     return loss, {
         "token_accuracy": float(token_acc.item()),
         "sequence_exact_match": float(seq_ok.item()),
@@ -156,13 +159,53 @@ def parallel_semantic_loss(
     }
 
 
-def decode_parallel_tokens(tokenizer, token_ids: torch.Tensor) -> list[str]:
+def _tokenizer_stop_ids(tokenizer) -> set[int]:
+    stop_ids = set()
+    for attr in ("eos_token_id", "pad_token_id"):
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is not None:
+            stop_ids.add(int(token_id))
+    return stop_ids
+
+
+def _truncate_at_first_stop(row: list[int], stop_ids: set[int]) -> tuple[list[int], int | None]:
+    for i, token_id in enumerate(row):
+        if int(token_id) in stop_ids:
+            return row[:i], i
+    return row, None
+
+
+def parallel_token_debug(tokenizer, token_ids: torch.Tensor) -> list[dict]:
     if token_ids.ndim == 1:
         token_ids = token_ids.unsqueeze(0)
-    ids = token_ids.detach().cpu()
-    if hasattr(tokenizer, "batch_decode"):
-        return list(tokenizer.batch_decode(ids, skip_special_tokens=True))
-    return [tokenizer.decode(row.tolist()) for row in ids]
+    ids = token_ids.detach().cpu().tolist()
+    stop_ids = _tokenizer_stop_ids(tokenizer)
+    out = []
+    for row in ids:
+        raw_ids = [int(x) for x in row]
+        truncated, first_stop = _truncate_at_first_stop(raw_ids, stop_ids)
+        if hasattr(tokenizer, "convert_ids_to_tokens"):
+            token_strings = [str(x) for x in tokenizer.convert_ids_to_tokens(raw_ids)]
+        else:
+            token_strings = [str(x) for x in raw_ids]
+        if hasattr(tokenizer, "decode"):
+            text = tokenizer.decode(truncated, skip_special_tokens=True)
+        elif hasattr(tokenizer, "batch_decode"):
+            text = tokenizer.batch_decode([truncated], skip_special_tokens=True)[0]
+        else:
+            text = " ".join(str(x) for x in truncated)
+        out.append({
+            "raw_token_ids": raw_ids,
+            "token_strings": token_strings,
+            "first_stop_position": first_stop,
+            "truncated_decoded_text": text,
+        })
+    return out
+
+
+def decode_parallel_tokens(tokenizer, token_ids: torch.Tensor) -> list[str]:
+    debug = parallel_token_debug(tokenizer, token_ids)
+    return [item["truncated_decoded_text"] for item in debug]
 
 
 def frozen_lm_head_weight(model: nn.Module, fallback_embed_fn: nn.Module) -> torch.Tensor:
