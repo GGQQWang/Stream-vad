@@ -13,6 +13,8 @@ from tools.benchmark_lvlm_inference import (  # noqa: E402
     handle_video_failure,
     max_new_tokens_for_mode,
     maybe_generate_texts,
+    maybe_generate_oracle_transition_texts,
+    oracle_transition_type,
     parallel_readout_texts,
     score_single_window,
 )
@@ -85,7 +87,7 @@ def test_forward_mode_does_not_call_generate_and_generation_time_is_zero():
 
 
 def test_ar16_and_ar64_generation_arguments_are_fixed():
-    for mode, expected_tokens in [("ar-16", 16), ("ar-64", 64)]:
+    for mode, expected_tokens in [("ar-16", 16), ("ar-64", 64), ("oracle-transition-ar-16", 16)]:
         model = _Model()
         tokenizer = _Tokenizer()
         states = torch.randn(1, 4)
@@ -104,6 +106,47 @@ def test_ar16_and_ar64_generation_arguments_are_fixed():
         assert call["do_sample"] is False
         assert call["num_beams"] == 1
         assert call["use_cache"] is True
+
+
+def test_oracle_transition_type_skips_first_and_same_state_windows():
+    assert oracle_transition_type(None, 0) is None
+    assert oracle_transition_type(None, 1) is None
+    assert oracle_transition_type(0, 0) is None
+    assert oracle_transition_type(1, 1) is None
+    assert oracle_transition_type(0, 1) == "anomaly_onset"
+    assert oracle_transition_type(1, 0) == "anomaly_offset"
+
+
+def test_oracle_transition_generation_only_on_gt_state_changes():
+    model = _Model()
+    tokenizer = _Tokenizer()
+    embed = model.qwen.get_input_embeddings()
+    states = torch.randn(1, 4)
+    sequence = [0, 0, 1, 1, 0]
+    previous = None
+    transitions = []
+    for current in sequence:
+        texts, token_count, transition = maybe_generate_oracle_transition_texts(
+            model,
+            embed,
+            tokenizer,
+            states,
+            "Current video status:",
+            previous,
+            current,
+        )
+        if transition is None:
+            assert texts == []
+            assert token_count == 0
+        else:
+            transitions.append(transition)
+            assert len(texts) == 1
+            assert token_count == 16
+        previous = current
+
+    assert transitions == ["anomaly_onset", "anomaly_offset"]
+    assert len(model.qwen.generate_calls) == 2
+    assert [call["max_new_tokens"] for call in model.qwen.generate_calls] == [16, 16]
 
 
 def test_anomaly_score_is_identical_across_modes():

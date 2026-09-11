@@ -49,8 +49,10 @@ INFERENCE_MODES = {
     "score-only": None,
     "parallel-16": 16,
     "ar-16": 16,
+    "oracle-transition-ar-16": 16,
     "ar-64": 64,
 }
+ORACLE_TRANSITION_AR_MODE = "oracle-transition-ar-16"
 LATENCY_SCOPE = "cached_visual_feature_to_prediction"
 STREAMING_PROTOCOL = "strict_single_window_sequential"
 
@@ -78,17 +80,21 @@ def aggregate_latency(records: Iterable[dict]) -> dict:
     temporal = [float(r.get("temporal_time_ms", 0.0)) for r in measured]
     forward = [float(r.get("lvlm_forward_time_ms", 0.0)) for r in measured]
     generation = [float(r.get("generation_time_ms", 0.0)) for r in measured]
+    generation_tokens = [int(r.get("generation_tokens", 0)) for r in measured]
     total_sec = sum(latencies) / 1000.0
     total_window_video_sec = sum(float(r.get("window_duration_sec", 0.0)) for r in measured)
     return {
         "latency_mean_ms": float(np.mean(latencies)) if latencies else None,
+        "overall_latency_mean_ms_per_window": float(np.mean(latencies)) if latencies else None,
         "latency_p50_ms": percentile(latencies, 50),
         "latency_p95_ms": percentile(latencies, 95),
+        "p95_latency_ms": percentile(latencies, 95),
         "throughput_windows_per_sec": (len(latencies) / total_sec) if total_sec > 0 else None,
         "RTF": (total_sec / total_window_video_sec) if total_window_video_sec > 0 else None,
         "temporal_time_ms": float(np.mean(temporal)) if temporal else None,
         "lvlm_forward_time_ms": float(np.mean(forward)) if forward else None,
         "generation_time_ms": float(np.mean(generation)) if generation else None,
+        "total_generated_tokens": int(sum(generation_tokens)),
         "measured_windows": len(latencies),
         "measured_processing_sec": total_sec,
         "measured_video_sec": total_window_video_sec,
@@ -131,6 +137,13 @@ def build_generation_inputs(model, embed_fn, tokenizer, states: torch.Tensor, pr
 def decode_generated(tokenizer, sequences, max_new_tokens: int) -> List[str]:
     if sequences is None:
         return []
+    sequences = generated_continuation_tokens(sequences, max_new_tokens)
+    if hasattr(tokenizer, "batch_decode"):
+        return list(tokenizer.batch_decode(sequences, skip_special_tokens=True))
+    return [tokenizer.decode(row.tolist()) for row in sequences]
+
+
+def generated_continuation_tokens(sequences, max_new_tokens: int) -> torch.Tensor:
     if hasattr(sequences, "detach"):
         sequences = sequences.detach().cpu()
     if getattr(sequences, "ndim", 0) == 1:
@@ -139,14 +152,10 @@ def decode_generated(tokenizer, sequences, max_new_tokens: int) -> List[str]:
     # a backend prepends prompt ids, keep only the continuation budget.
     if sequences.shape[-1] > max_new_tokens:
         sequences = sequences[:, -max_new_tokens:]
-    if hasattr(tokenizer, "batch_decode"):
-        return list(tokenizer.batch_decode(sequences, skip_special_tokens=True))
-    return [tokenizer.decode(row.tolist()) for row in sequences]
+    return sequences
 
 
-def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, max_new_tokens: int | None) -> List[str]:
-    if max_new_tokens is None:
-        return []
+def generate_texts_and_token_count(model, embed_fn, tokenizer, states, prompt_text: str, max_new_tokens: int) -> tuple[List[str], int]:
     _require_single_window(states, context="generation")
     gen_inputs = build_generation_inputs(model, embed_fn, tokenizer, states, prompt_text)
     sequences = model.qwen.generate(
@@ -156,7 +165,51 @@ def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, m
         num_beams=1,
         use_cache=True,
     )
-    return decode_generated(tokenizer, sequences, max_new_tokens)
+    continuation = generated_continuation_tokens(sequences, max_new_tokens)
+    return decode_generated(tokenizer, continuation, max_new_tokens), int(continuation.numel())
+
+
+def maybe_generate_texts(model, embed_fn, tokenizer, states, prompt_text: str, max_new_tokens: int | None) -> List[str]:
+    if max_new_tokens is None:
+        return []
+    texts, _ = generate_texts_and_token_count(
+        model, embed_fn, tokenizer, states, prompt_text, max_new_tokens,
+    )
+    return texts
+
+
+def oracle_transition_type(previous_gt_state: int | None, current_gt_state: int) -> str | None:
+    current_gt_state = int(current_gt_state)
+    if current_gt_state not in (0, 1):
+        raise ValueError(f"current GT state must be binary, got {current_gt_state}")
+    if previous_gt_state is not None and int(previous_gt_state) not in (0, 1):
+        raise ValueError(f"previous GT state must be binary, got {previous_gt_state}")
+    if previous_gt_state is None or int(previous_gt_state) == current_gt_state:
+        return None
+    if int(previous_gt_state) == 0 and current_gt_state == 1:
+        return "anomaly_onset"
+    if int(previous_gt_state) == 1 and current_gt_state == 0:
+        return "anomaly_offset"
+    raise RuntimeError(f"unreachable GT transition: previous={previous_gt_state}, current={current_gt_state}")
+
+
+def maybe_generate_oracle_transition_texts(
+    model,
+    embed_fn,
+    tokenizer,
+    states,
+    prompt_text: str,
+    previous_gt_state: int | None,
+    current_gt_state: int,
+) -> tuple[List[str], int, str | None]:
+    transition = oracle_transition_type(previous_gt_state, current_gt_state)
+    if transition is None:
+        return [], 0, None
+    _require_single_window(states, context="generation")
+    texts, token_count = generate_texts_and_token_count(
+        model, embed_fn, tokenizer, states, prompt_text, 16,
+    )
+    return texts, token_count, transition
 
 
 def load_parallel_readout(path: str | Path, device: torch.device) -> ParallelSemanticReadout:
@@ -264,6 +317,10 @@ def run_video_benchmark(
     rows: List[dict] = []
     max_new_tokens = max_new_tokens_for_mode(inference_mode)
     parallel_debug_printed = 0
+    previous_gt_state: int | None = None
+    num_generation_triggers = 0
+    total_generated_tokens = 0
+    generation_trigger_latencies: List[float] = []
 
     with torch.no_grad():
         for chunk_i, ref in enumerate(refs):
@@ -319,7 +376,17 @@ def run_video_benchmark(
                 synchronize(device)
                 forward_ms = (time.perf_counter() - forward_start) * 1000.0
 
+                probs = torch.sigmoid(logits).detach().float().cpu()
+                logits_cpu = logits.detach().float().cpu()
+                start_frame = int(start_frames[b, w].item())
+                end_frame = int(end_frames[b, w].item())
+                window_idx = int(batch["chunk_start"][b]) + w
+                score = float(probs[0].item())
+                gt_label = int(gt[start_frame:min(end_frame, n_frames)].max()) if end_frame > start_frame else 0
+                transition = oracle_transition_type(previous_gt_state, gt_label)
+
                 generation_ms = 0.0
+                generated_token_count = 0
                 generated_texts: List[str] = []
                 parallel_token_ids = None
                 if inference_mode == "parallel-16":
@@ -343,10 +410,30 @@ def run_video_benchmark(
                             parallel_debug_printed += 1
                             if parallel_debug_printed >= parallel_debug_samples:
                                 break
+                elif inference_mode == ORACLE_TRANSITION_AR_MODE:
+                    if transition is not None:
+                        generation_start = time.perf_counter()
+                        with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
+                            generated_texts, generated_token_count, checked_transition = maybe_generate_oracle_transition_texts(
+                                model,
+                                embed_fn,
+                                tokenizer,
+                                states,
+                                prompt_text,
+                                previous_gt_state,
+                                gt_label,
+                            )
+                        synchronize(device)
+                        generation_ms = (time.perf_counter() - generation_start) * 1000.0
+                        if checked_transition != transition:
+                            raise RuntimeError(
+                                f"{video_id}: inconsistent oracle transition at window {window_idx}: "
+                                f"{checked_transition!r} vs {transition!r}"
+                            )
                 elif max_new_tokens is not None:
                     generation_start = time.perf_counter()
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        generated_texts = maybe_generate_texts(
+                        generated_texts, generated_token_count = generate_texts_and_token_count(
                             model,
                             embed_fn,
                             tokenizer,
@@ -360,13 +447,6 @@ def run_video_benchmark(
                 synchronize(device)
                 latency_ms = (time.perf_counter() - window_start_time) * 1000.0
 
-                probs = torch.sigmoid(logits).detach().float().cpu()
-                logits_cpu = logits.detach().float().cpu()
-                start_frame = int(start_frames[b, w].item())
-                end_frame = int(end_frames[b, w].item())
-                window_idx = int(batch["chunk_start"][b]) + w
-                score = float(probs[0].item())
-                gt_label = int(gt[start_frame:min(end_frame, n_frames)].max()) if end_frame > start_frame else 0
                 row = {
                     "video_id": video_id,
                     "window_idx": window_idx,
@@ -378,6 +458,18 @@ def run_video_benchmark(
                     "gt_label": gt_label,
                 }
                 rows.append(row)
+
+                if inference_mode == ORACLE_TRANSITION_AR_MODE:
+                    if transition is not None:
+                        num_generation_triggers += 1
+                        total_generated_tokens += generated_token_count
+                        generation_trigger_latencies.append(generation_ms)
+                else:
+                    total_generated_tokens += generated_token_count
+                    if generated_texts:
+                        num_generation_triggers += 1
+                        generation_trigger_latencies.append(generation_ms)
+
                 latency_record = {
                     "video_id": video_id,
                     "window_idx": window_idx,
@@ -390,10 +482,14 @@ def run_video_benchmark(
                     "is_warmup": is_warmup,
                     "latency_scope": LATENCY_SCOPE,
                     "window_duration_sec": max(0, end_frame - start_frame) / fps,
+                    "generation_tokens": generated_token_count,
                 }
                 latency_f.write(json.dumps(latency_record) + "\n")
-                if max_new_tokens is not None:
-                    text_f.write(json.dumps({
+                write_text = max_new_tokens is not None and (
+                    inference_mode != ORACLE_TRANSITION_AR_MODE or transition is not None
+                )
+                if write_text:
+                    text_row = {
                         "video_id": video_id,
                         "sample_id": f"{video_id}:{window_idx}",
                         "window_idx": window_idx,
@@ -406,9 +502,20 @@ def run_video_benchmark(
                         "gt_label": gt_label,
                         "generated_text": generated_texts[0] if generated_texts else "",
                         "max_new_tokens": max_new_tokens,
+                        "generation_time_ms": generation_ms,
                         "latency_ms": latency_ms,
+                    }
+                    if inference_mode == ORACLE_TRANSITION_AR_MODE:
+                        text_row.update({
+                            "transition_type": transition,
+                            "previous_gt_state": previous_gt_state,
+                            "current_gt_state": gt_label,
+                        })
+                    text_f.write(json.dumps({
+                        **text_row,
                     }, ensure_ascii=False) + "\n")
                 warmup_state["seen_windows"] += 1
+                previous_gt_state = gt_label
 
     ssm_cache.pop(video_id, None)
     rows.sort(key=lambda r: int(r["window_idx"]))
@@ -420,6 +527,12 @@ def run_video_benchmark(
         "n_frames": n_frames,
         "fps": fps,
         "num_windows": len(rows),
+        "num_generation_triggers": num_generation_triggers,
+        "total_generated_tokens": total_generated_tokens,
+        "generation_latency_trigger_sum_ms": float(sum(generation_trigger_latencies)),
+        "mean_generation_latency_per_trigger": (
+            float(np.mean(generation_trigger_latencies)) if generation_trigger_latencies else None
+        ),
         "standard_auc": standard_auc,
         "standard_ap": standard_ap,
         "causal_auc": causal_auc,
@@ -554,6 +667,12 @@ def main() -> None:
     latency_records = read_jsonl(latency_path)
     latency_metrics = aggregate_latency(latency_records)
     effective_warmup_windows = sum(1 for r in latency_records if r.get("is_warmup", False))
+    num_windows = sum(int(v.get("num_windows", 0)) for v in videos)
+    num_generation_triggers = sum(int(v.get("num_generation_triggers", 0)) for v in videos)
+    total_generated_tokens = sum(int(v.get("total_generated_tokens", 0)) for v in videos)
+    generation_latency_trigger_sum_ms = sum(
+        float(v.get("generation_latency_trigger_sum_ms", 0.0)) for v in videos
+    )
     peak_allocated, peak_reserved = peak_memory_gb(args.device)
 
     rtf_note = None
@@ -569,6 +688,14 @@ def main() -> None:
         "warmup_windows_requested": warmup_state["warmup_windows"],
         "warmup_windows_effective": effective_warmup_windows,
         "num_videos": len(videos),
+        "num_windows": num_windows,
+        "num_generation_triggers": num_generation_triggers,
+        "trigger_rate": (num_generation_triggers / num_windows) if num_windows > 0 else None,
+        "total_generated_tokens": total_generated_tokens,
+        "mean_generation_latency_per_trigger": (
+            (generation_latency_trigger_sum_ms / num_generation_triggers)
+            if num_generation_triggers > 0 else None
+        ),
         "num_failed_videos": len(failed_videos),
         "failed_videos": failed_videos,
         "global_standard_auc": global_standard_auc,
@@ -582,6 +709,7 @@ def main() -> None:
         "videos": videos,
         **latency_metrics,
     }
+    metrics["total_generated_tokens"] = total_generated_tokens
     with open(run_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps({k: v for k, v in metrics.items() if k != "videos"}, indent=2))

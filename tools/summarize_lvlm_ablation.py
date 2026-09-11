@@ -11,6 +11,7 @@ ROWS = [
     ("score-only", "Score-only"),
     ("parallel-16", "Parallel-16"),
     ("ar-16", "AR-16"),
+    ("oracle-transition-ar-16", "Oracle-transition AR-16"),
     ("ar-64", "AR-64"),
 ]
 LEGACY_MODE_ALIASES = {
