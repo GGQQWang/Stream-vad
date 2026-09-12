@@ -490,6 +490,175 @@ def test_stage_c_modulation_path_reaches_temporal_proj_and_ssm():
     print("test 11 OK: Stage C modulation path reaches temporal_proj and SSM")
 
 
+def test_film_spatial_prefix_drops_padding_and_gathers_score_query():
+    pipe = _import_pipeline_stage1()
+
+    class _PrefixQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Identity()
+            self.seen_attention_mask = None
+
+        def forward(self, inputs_embeds, attention_mask, **kwargs):
+            self.seen_attention_mask = attention_mask
+            return type("Out", (), {"hidden_states": [inputs_embeds.float()]})
+
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    class _Embed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, ids):
+            return self.weight[ids]
+
+    old_ssm = pipe.SSMBlock
+    old_vit = pipe.ViTForwarder
+    try:
+        pipe.SSMBlock = _FakeSSM
+        pipe.ViTForwarder = lambda visual, reducer: nn.Identity()
+        model = pipe.StreamingVADGenerationModel(
+            _PrefixQwen(),
+            d_ssm=4,
+            llm_hidden=4,
+            visual_fusion="film_spatial",
+        )
+    finally:
+        pipe.SSMBlock = old_ssm
+        pipe.ViTForwarder = old_vit
+    state = torch.zeros(1, 2, 4)
+    spatial = torch.randn(1, 2, 3, 4)
+    spatial_mask = torch.tensor([[[True, False, False], [True, True, False]]])
+    h_internal = torch.randn(1, 2, 4)
+    valid_b = torch.tensor([0, 0])
+    valid_w = torch.tensor([0, 1])
+    prefix, prefix_mask = model.select_visual_prefix(state, valid_b, valid_w, spatial, spatial_mask, h_internal)
+    logits = model.forward_score_visual_prefix(prefix, prefix_mask, _Embed(), _Tok(), "prompt")
+    assert prefix_mask.tolist() == [[True, False, False], [True, True, False]]
+    assert model.qwen.seen_attention_mask.tolist() == [
+        [True, True, True, True, False],
+        [True, True, True, True, True],
+    ]
+    assert logits.shape == (2,)
+    print("test film OK: padding spatial tokens are masked and score query is gathered")
+
+
+def test_state_only_score_path_ignores_spatial_film_module():
+    pipe = _import_pipeline_stage1()
+
+    class _PrefixQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Identity()
+
+        def forward(self, inputs_embeds, attention_mask, **kwargs):
+            return type("Out", (), {"hidden_states": [inputs_embeds.cumsum(dim=1).float()]})
+
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2]
+
+    class _Embed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, ids):
+            return self.weight[ids]
+
+    old_ssm = pipe.SSMBlock
+    old_vit = pipe.ViTForwarder
+    try:
+        pipe.SSMBlock = _FakeSSM
+        pipe.ViTForwarder = lambda visual, reducer: nn.Identity()
+        model = pipe.StreamingVADGenerationModel(
+            _PrefixQwen(),
+            d_ssm=4,
+            llm_hidden=4,
+            visual_fusion="state_only",
+        ).eval()
+    finally:
+        pipe.SSMBlock = old_ssm
+        pipe.ViTForwarder = old_vit
+
+    state = torch.randn(2, 4)
+    embed = _Embed()
+    logits_before = model.forward_score_token(state, embed, _Tok(), "prompt")
+    with torch.no_grad():
+        for p in model.spatial_film.parameters():
+            p.add_(torch.randn_like(p))
+    logits_after = model.forward_score_token(state, embed, _Tok(), "prompt")
+    assert torch.allclose(logits_before, logits_after, atol=0.0, rtol=0.0)
+    print("test state_only OK: score path is independent of SpatialFiLM")
+
+
+def test_film_spatial_backward_hits_film_and_masks_padding_tokens():
+    pipe = _import_pipeline_stage1()
+
+    class _MixingQwen(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.visual = nn.Identity()
+
+        def forward(self, inputs_embeds, attention_mask, **kwargs):
+            masked = inputs_embeds * attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
+            return type("Out", (), {"hidden_states": [masked.cumsum(dim=1).float()]})
+
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            return [1]
+
+    class _Embed(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(8, 4))
+
+        def forward(self, ids):
+            return self.weight[ids]
+
+    old_ssm = pipe.SSMBlock
+    old_vit = pipe.ViTForwarder
+    try:
+        pipe.SSMBlock = _FakeSSM
+        pipe.ViTForwarder = lambda visual, reducer: nn.Identity()
+        model = pipe.StreamingVADGenerationModel(
+            _MixingQwen(),
+            d_ssm=4,
+            llm_hidden=4,
+            visual_fusion="film_spatial",
+        ).eval()
+    finally:
+        pipe.SSMBlock = old_ssm
+        pipe.ViTForwarder = old_vit
+
+    with torch.no_grad():
+        model.spatial_film.net[-1].weight.fill_(0.01)
+
+    state = torch.zeros(1, 1, 4)
+    spatial = torch.randn(1, 1, 3, 4, requires_grad=True)
+    spatial_mask = torch.tensor([[[True, False, True]]])
+    h_internal = torch.randn(1, 1, 4, requires_grad=True)
+    valid_b = torch.tensor([0])
+    valid_w = torch.tensor([0])
+    prefix, prefix_mask = model.select_visual_prefix(state, valid_b, valid_w, spatial, spatial_mask, h_internal)
+    logits = model.forward_score_visual_prefix(prefix, prefix_mask, _Embed(), _Tok(), "prompt")
+    logits.sum().backward()
+
+    assert model.spatial_film.net[-1].weight.grad is not None
+    assert model.spatial_film.net[-1].weight.grad.abs().sum() > 0
+    assert h_internal.grad is not None
+    assert h_internal.grad.abs().sum() > 0
+    assert model.score_head[0].weight.grad is not None
+    assert model.score_head[0].weight.grad.abs().sum() > 0
+    assert spatial.grad[0, 0, 0].abs().sum() > 0
+    assert spatial.grad[0, 0, 1].abs().sum() == 0
+    assert spatial.grad[0, 0, 2].abs().sum() > 0
+    print("test film grad OK: FiLM/score gradients flow and padding token has zero contribution")
+
+
 def test_inference_model_runs_without_ibq_decoder():
     torch.manual_seed(0)
     model = _make_streaming_model(world_include_decoder=False)
@@ -551,6 +720,9 @@ if __name__ == "__main__":
     test_zero_init_modulation_matches_old_formula()
     test_temporal_modulator_receives_anomaly_gradient()
     test_stage_c_modulation_path_reaches_temporal_proj_and_ssm()
+    test_film_spatial_prefix_drops_padding_and_gathers_score_query()
+    test_state_only_score_path_ignores_spatial_film_module()
+    test_film_spatial_backward_hits_film_and_masks_padding_tokens()
     test_inference_model_runs_without_ibq_decoder()
     test_legacy_checkpoint_missing_modulator_keeps_zero_init()
     test_stage_b_warmup_trainability()

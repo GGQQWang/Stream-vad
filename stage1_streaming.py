@@ -395,6 +395,65 @@ def build_summary_query_batch(
     }
 
 
+def build_summary_visual_prefix_batch(
+    embed_fn: torch.nn.Module,
+    tokenizer,
+    visual_prefix: torch.Tensor,
+    visual_mask: torch.Tensor,
+    summary_query: torch.Tensor,
+    summary_texts: Sequence[str],
+) -> dict:
+    """Build ``[valid visual tokens] [summary_query] [caption tokens]``."""
+    llm_weight = embed_fn.weight
+    device = llm_weight.device
+    dtype = llm_weight.dtype
+    visual_prefix = visual_prefix.to(device=device, dtype=dtype)
+    visual_mask = visual_mask.to(device=device).bool()
+    N, _, H = visual_prefix.shape
+    if N != len(summary_texts):
+        raise ValueError("visual prefix count must match summary text count")
+    if visual_mask.shape != visual_prefix.shape[:2]:
+        raise ValueError("visual_mask shape must match visual_prefix[:2]")
+
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        eos_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    prompt_lengths = visual_mask.sum(dim=1).long()
+    if bool((prompt_lengths <= 0).any()):
+        raise ValueError("summary visual prefix contains an empty visual-token sequence")
+
+    token_lists: List[List[int]] = []
+    max_caption = 0
+    for text in summary_texts:
+        ids = list(tokenizer.encode(text, add_special_tokens=False)) + [int(eos_id)]
+        token_lists.append(ids)
+        max_caption = max(max_caption, len(ids))
+
+    max_visual = int(prompt_lengths.max().item())
+    max_len = max_visual + 1 + max_caption
+    inputs = torch.zeros(N, max_len, H, device=device, dtype=dtype)
+    attn = torch.zeros(N, max_len, dtype=torch.bool, device=device)
+    labels = torch.full((N, max_len), IGNORE_INDEX, dtype=torch.long, device=device)
+    query = summary_query.to(device=device, dtype=dtype).reshape(1, H)
+    for i, ids in enumerate(token_lists):
+        r = int(prompt_lengths[i].item())
+        inputs[i, :r] = visual_prefix[i, visual_mask[i]]
+        inputs[i, r] = query
+        attn[i, :r + 1 + len(ids)] = True
+        if ids:
+            id_t = torch.tensor(ids, dtype=torch.long, device=device)
+            inputs[i, r + 1:r + 1 + len(ids)] = embed_fn(id_t)
+            labels[i, r + 1:r + 1 + len(ids)] = id_t
+
+    return {
+        "inputs_embeds": inputs,
+        "attention_mask": attn,
+        "labels": labels,
+        "caption_token_count": int(sum(len(ids) for ids in token_lists)),
+        "num_triggers": N,
+    }
+
+
 def summary_ce_loss(
     qwen,
     embed_fn: torch.nn.Module,
@@ -431,6 +490,47 @@ def summary_ce_loss(
     per_trigger = (ce * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp_min(1)
     loss = per_trigger.mean()
     return loss, {
+        "num_summary_triggers": int(batch["num_triggers"]),
+        "caption_token_count": int(batch["caption_token_count"]),
+    }
+
+
+def summary_ce_loss_visual_prefix(
+    qwen,
+    embed_fn: torch.nn.Module,
+    tokenizer,
+    visual_prefix: torch.Tensor,
+    visual_mask: torch.Tensor,
+    summary_query: torch.Tensor,
+    summary_texts: Sequence[str],
+) -> tuple[torch.Tensor, dict]:
+    if len(summary_texts) == 0:
+        return visual_prefix.new_zeros(()), {
+            "num_summary_triggers": 0,
+            "caption_token_count": 0,
+        }
+    batch = build_summary_visual_prefix_batch(
+        embed_fn, tokenizer, visual_prefix, visual_mask, summary_query, summary_texts,
+    )
+    out = qwen(
+        inputs_embeds=batch["inputs_embeds"],
+        attention_mask=batch["attention_mask"],
+        use_cache=False,
+        return_dict=True,
+    )
+    logits = out.logits
+    labels = batch["labels"]
+    shift_logits = logits[:, :-1].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    mask = shift_labels != IGNORE_INDEX
+    ce = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.shape[-1]),
+        shift_labels.reshape(-1),
+        ignore_index=IGNORE_INDEX,
+        reduction="none",
+    ).reshape(shift_labels.shape)
+    per_trigger = (ce * mask.float()).sum(dim=1) / mask.float().sum(dim=1).clamp_min(1)
+    return per_trigger.mean(), {
         "num_summary_triggers": int(batch["num_triggers"]),
         "caption_token_count": int(batch["caption_token_count"]),
     }

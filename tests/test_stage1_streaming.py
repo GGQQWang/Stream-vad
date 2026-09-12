@@ -10,6 +10,7 @@ import torch.nn as nn
 from hivau_dataset import _read_video_label
 from stage1_streaming import (
     build_summary_query_batch,
+    build_summary_visual_prefix_batch,
     build_window_infos,
     collect_summary_triggers,
     detach_state_cache,
@@ -496,6 +497,26 @@ def test_no_summary_trigger_zero_loss():
     loss, info = summary_ce_loss(lm, embed, tok, states, query, [])
     assert loss.item() == pytest.approx(0.0, abs=1e-7)
     assert info["num_summary_triggers"] == 0
+
+
+def test_summary_visual_prefix_batch_uses_variable_caption_offsets():
+    class _Tok:
+        eos_token_id = 9
+
+        def encode(self, text, add_special_tokens=False):
+            return [1, 2] if text == "long" else [3]
+
+    embed = torch.nn.Embedding(16, 4)
+    visual = torch.randn(2, 3, 4)
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+    query = torch.randn(1, 4)
+    batch = build_summary_visual_prefix_batch(embed, _Tok(), visual, mask, query, ["long", "short"])
+    assert batch["attention_mask"].tolist() == [
+        [True, True, True, True, True, False],
+        [True, True, True, True, False, False],
+    ]
+    assert batch["labels"][0].tolist() == [-100, -100, -100, 1, 2, 9]
+    assert batch["labels"][1].tolist() == [-100, -100, 3, 9, -100, -100]
 
 
 def test_official_hivau_label_formats():

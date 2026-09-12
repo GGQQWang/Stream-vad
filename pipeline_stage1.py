@@ -42,6 +42,7 @@ from peft import LoraConfig, get_peft_model
 
 from temporal import TemporalTokenReducer
 from spatial import SpatialTokenCompressor
+from spatial_film import SpatialFiLM
 from ssm_block import SSMBlock
 from vit_forwarder import ViTForwarder
 from hivau_dataset import HIVAUDataset
@@ -63,6 +64,7 @@ from stage1_streaming import (
     score_metrics_from_logits,
     sorted_window_score_records,
     summary_ce_loss,
+    summary_ce_loss_visual_prefix,
 )
 from ibq_utils import (
     IBQ_CODE_EMBED_DIM,
@@ -501,8 +503,11 @@ class StreamingVADGenerationModel(nn.Module):
         lof_k: int = 8,
         vit_micro_batch: int = 1,
         world_include_decoder: bool = True,
+        visual_fusion: str = "state_only",
     ):
         super().__init__()
+        if visual_fusion not in {"state_only", "film_spatial"}:
+            raise ValueError(f"unknown visual_fusion: {visual_fusion}")
         visual = _find_visual(qwen)
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
@@ -523,6 +528,7 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
+        self.spatial_film = SpatialFiLM(d_ssm=d_ssm, llm_hidden=llm_hidden)
         # world-model auxiliary branch (training-only): SSM internal
         # temporal hidden -> predicted delta; current spatial tokens +
         # delta token -> autoregressive IBQ visual decoder.  The frozen
@@ -549,9 +555,11 @@ class StreamingVADGenerationModel(nn.Module):
         self.register_buffer("ibq_codebook", codebook, persistent=False)
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
         self.llm_hidden = llm_hidden
+        self.visual_fusion = visual_fusion
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
         self.last_modulation_stats: Dict[str, float] = {}
+        self.last_spatial_film_stats: Dict[str, float] = {}
 
         # Full Qwen model with LoRA
         self.qwen = qwen
@@ -584,6 +592,70 @@ class StreamingVADGenerationModel(nn.Module):
                     "modulation_delta_rel": math.nan,
                 }
         return modulated
+
+    def apply_spatial_film(
+        self,
+        spatial_features: torch.Tensor,
+        spatial_mask: torch.Tensor,
+        h_internal: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+        if spatial_features is None or spatial_mask is None:
+            raise ValueError("film_spatial requires spatial_features and spatial_mask")
+        if spatial_features.ndim != 3:
+            raise ValueError(f"spatial_features must be [N, R, H], got {tuple(spatial_features.shape)}")
+        if h_internal is None or h_internal.ndim != 2:
+            shape = None if h_internal is None else tuple(h_internal.shape)
+            raise ValueError(f"h_internal must be [N, d_ssm], got {shape}")
+        if h_internal.shape[0] != spatial_features.shape[0]:
+            raise ValueError(
+                f"h_internal batch {h_internal.shape[0]} does not match "
+                f"spatial_features batch {spatial_features.shape[0]}"
+            )
+        if spatial_mask.shape != spatial_features.shape[:2]:
+            raise ValueError(
+                f"spatial_mask shape {tuple(spatial_mask.shape)} does not match "
+                f"spatial_features {tuple(spatial_features.shape)}"
+            )
+        valid_counts = spatial_mask.bool().sum(dim=1)
+        if bool((valid_counts <= 0).any()):
+            raise ValueError("film_spatial encountered a window with no valid spatial tokens")
+        param = next(self.spatial_film.parameters())
+        x = spatial_features.to(device=param.device, dtype=param.dtype)
+        h = h_internal.to(device=param.device, dtype=param.dtype)
+        modulated, stats = self.spatial_film(x, h)
+        mask = spatial_mask.to(device=modulated.device).bool()
+        with torch.no_grad():
+            stats = dict(stats)
+            diff = (modulated[mask] - x[mask]).detach().float()
+            base = x[mask].detach().float()
+            rel = diff.norm(dim=-1) / base.norm(dim=-1).clamp_min(1e-8)
+            stats["film_delta_rel"] = float(rel.mean().item())
+            stats["spatial_tokens_mean"] = float(valid_counts.detach().float().mean().item())
+            stats["spatial_tokens_max"] = float(valid_counts.detach().max().item())
+            self.last_spatial_film_stats = stats
+        return modulated, mask, stats
+
+    def select_visual_prefix(
+        self,
+        state_embeddings: torch.Tensor,
+        valid_b: torch.Tensor,
+        valid_w: torch.Tensor,
+        spatial_features: torch.Tensor | None = None,
+        spatial_mask: torch.Tensor | None = None,
+        h_internal: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.visual_fusion == "state_only":
+            self.last_spatial_film_stats = {}
+            prefix = state_embeddings[valid_b, valid_w].unsqueeze(1)
+            mask = torch.ones(prefix.shape[:2], dtype=torch.bool, device=prefix.device)
+            return prefix, mask
+        if spatial_features is None or spatial_mask is None or h_internal is None:
+            raise ValueError("film_spatial requires spatial_features, spatial_mask, and h_internal")
+        selected_spatial = spatial_features[valid_b, valid_w]
+        selected_mask = spatial_mask[valid_b, valid_w]
+        selected_h = h_internal[valid_b, valid_w]
+        modulated, mask, _ = self.apply_spatial_film(selected_spatial, selected_mask, selected_h)
+        return modulated, mask
 
     def encode_window_features(
         self,
@@ -806,6 +878,59 @@ class StreamingVADGenerationModel(nn.Module):
             return_dict=True,
         )
         hidden = out.hidden_states[-1][:, -1, :]
+        score_param = next(self.score_head.parameters())
+        hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
+        return self.score_head(hidden).squeeze(-1)
+
+    def forward_score_visual_prefix(
+        self,
+        visual_prefix: torch.Tensor,
+        visual_mask: torch.Tensor,
+        embed_fn: nn.Module,
+        tokenizer,
+        prompt_text: str,
+    ) -> torch.Tensor:
+        """One Qwen forward over variable valid visual tokens + prompt + score query."""
+        if visual_prefix.ndim != 3:
+            raise ValueError(f"visual_prefix must be [N, R, H], got {tuple(visual_prefix.shape)}")
+        if visual_mask.shape != visual_prefix.shape[:2]:
+            raise ValueError("visual_mask shape must match visual_prefix[:2]")
+        N, _, H = visual_prefix.shape
+        if N == 0:
+            return visual_prefix.new_zeros(0)
+        llm_weight = embed_fn.weight
+        device = llm_weight.device
+        dtype = llm_weight.dtype
+        visual_prefix = visual_prefix.to(device=device, dtype=dtype)
+        visual_mask = visual_mask.to(device=device).bool()
+        valid_counts = visual_mask.sum(dim=1).long()
+        if bool((valid_counts <= 0).any()):
+            raise ValueError("score visual prefix contains an empty visual-token sequence")
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        prompt_emb = embed_fn(prompt_ids_t)
+        query = self.score_query.to(device=device, dtype=dtype).reshape(1, H)
+        max_len = int(valid_counts.max().item()) + len(prompt_ids) + 1
+        inputs = torch.zeros(N, max_len, H, device=device, dtype=dtype)
+        attn = torch.zeros(N, max_len, dtype=torch.bool, device=device)
+        query_pos = torch.empty(N, dtype=torch.long, device=device)
+        for i in range(N):
+            r = int(valid_counts[i].item())
+            inputs[i, :r] = visual_prefix[i, visual_mask[i]]
+            inputs[i, r:r + len(prompt_ids)] = prompt_emb
+            qpos = r + len(prompt_ids)
+            inputs[i, qpos] = query
+            attn[i, :qpos + 1] = True
+            query_pos[i] = qpos
+        out = self.qwen(
+            inputs_embeds=inputs,
+            attention_mask=attn,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden_all = out.hidden_states[-1]
+        hidden = hidden_all[torch.arange(N, device=device), query_pos]
         score_param = next(self.score_head.parameters())
         hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
         return self.score_head(hidden).squeeze(-1)
@@ -1670,14 +1795,27 @@ def validate_score_token(
         binary = binary.to(device)
         labels = labels.to(device)
 
+        spatial_features = None
+        spatial_mask = None
+        h_internal = None
         # --- encode ---
         if "features" in batch:
             window_batch = batch["features"].to(device=device, dtype=torch.bfloat16)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                state_emb, _, _, ssm_cache = model.encode_window_features(
-                    window_batch, valid_mask, batch["video_id"], ssm_cache,
-                    training=False,
-                )
+                if model.visual_fusion == "film_spatial":
+                    if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
+                        raise ValueError("film_spatial validation requires spatial_features/spatial_mask")
+                    state_emb, _, _, h_internal, ssm_cache = model.encode_window_features(
+                        window_batch, valid_mask, batch["video_id"], ssm_cache,
+                        training=False, return_internal=True,
+                    )
+                    spatial_features = batch["spatial_features"].to(device=device)
+                    spatial_mask = batch["spatial_mask"].to(device=device)
+                else:
+                    state_emb, _, _, ssm_cache = model.encode_window_features(
+                        window_batch, valid_mask, batch["video_id"], ssm_cache,
+                        training=False,
+                    )
         else:
             frames_list = batch["frames"]
             B, max_w = binary.shape[:2]
@@ -1693,9 +1831,18 @@ def validate_score_token(
             pv = processed["pixel_values_videos"].to(device)
             gthw = processed["video_grid_thw"].to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-                state_emb, _, ssm_cache, _ = model.encode_stream(
-                    pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=False,
-                )
+                if model.visual_fusion == "film_spatial":
+                    window_batch, spatial_features, spatial_mask = model.extract_window_features(
+                        pv, gthw, valid_mask, return_stats=False, return_spatial=True,
+                    )
+                    state_emb, _, _, h_internal, ssm_cache = model.encode_window_features(
+                        window_batch, valid_mask, batch["video_id"], ssm_cache,
+                        training=False, return_internal=True,
+                    )
+                else:
+                    state_emb, _, ssm_cache, _ = model.encode_stream(
+                        pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=False,
+                    )
 
         # --- release cache for finished videos ---
         _clear_finished_states(model, batch, ssm_cache)
@@ -1705,13 +1852,20 @@ def validate_score_token(
         valid_b, valid_w = valid.nonzero(as_tuple=True)
         if len(valid_b) == 0:
             continue
-        all_state = state_emb[valid_b, valid_w]
-
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-            logits_flat = model.forward_score_token(
-                all_state, embed_fn, tokenizer,
-                prompt_text,
-            )
+            if model.visual_fusion == "film_spatial":
+                visual_prefix, visual_prefix_mask = model.select_visual_prefix(
+                    state_emb, valid_b, valid_w, spatial_features, spatial_mask, h_internal,
+                )
+                logits_flat = model.forward_score_visual_prefix(
+                    visual_prefix, visual_prefix_mask, embed_fn, tokenizer, prompt_text,
+                )
+            else:
+                all_state = state_emb[valid_b, valid_w]
+                logits_flat = model.forward_score_token(
+                    all_state, embed_fn, tokenizer,
+                    prompt_text,
+                )
         all_logits.append(logits_flat.detach().float().cpu())
         all_soft_targets.append(labels[valid_b, valid_w].detach().float().cpu())
         if dump_window_scores:
@@ -1847,6 +2001,8 @@ def main():
                        help="IBQ positions per logits chunk (memory bound)")
     parser.add_argument("--world-baseline-every", type=int, default=100,
                        help="run the zero-temporal shortcut baseline every N optimizer steps (0 disables)")
+    parser.add_argument("--visual-fusion", choices=("state_only", "film_spatial"), default="state_only",
+                       help="state_only keeps the original single state token; film_spatial feeds FiLM-modulated spatial tokens to Qwen")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -1870,6 +2026,8 @@ def main():
         raise ValueError("--save-every must be >= 1")
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
+    if args.visual_fusion == "film_spatial" and args.objective != "score_token":
+        raise ValueError("film_spatial currently supports --objective score_token only")
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -1938,6 +2096,7 @@ def main():
     model = StreamingVADGenerationModel(
         qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=args.vit_micro_batch,
+        visual_fusion=args.visual_fusion,
     ).to(device)
     model.debug_state = bool(args.debug_state)
     model.ssm.debug_device = bool(args.debug_device)
@@ -1951,6 +2110,12 @@ def main():
         # world model disabled: freeze the branch so it costs no
         # optimizer memory and receives no gradients
         for p in model.world_branch.parameters():
+            p.requires_grad = False
+    if args.visual_fusion == "state_only":
+        # Keep the default path's trainable parameter set compatible with
+        # previous state-only runs.  SpatialFiLM is used only by the
+        # explicit film_spatial ablation.
+        for p in model.spatial_film.parameters():
             p.requires_grad = False
 
     # ---- param counts ----
@@ -1976,7 +2141,7 @@ def main():
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
         anomaly_video_root=args.anomaly_video_root or None,
-        require_spatial=(args.lambda_world > 0),
+        require_spatial=(args.lambda_world > 0 or args.visual_fusion == "film_spatial"),
     )
     from hivau_dataset import hivau_collate
     from hivau_sampler import SequentialVideoSampler, VideoChunkSampler, VideoPairSampler
@@ -2010,7 +2175,7 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
             anomaly_video_root=args.anomaly_video_root or None,
-        require_spatial=(args.lambda_world > 0),
+            require_spatial=(args.lambda_world > 0 or args.visual_fusion == "film_spatial"),
         )
         if args.objective in ("answer_ce", "score_token"):
             val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, collate_fn=hivau_collate)
@@ -2116,6 +2281,14 @@ def main():
                 f"{mode} model mismatch: checkpoint feature_cache_model_id="
                 f"{ckpt['feature_cache_model_id']!r}, expected {args.model_path!r}"
             )
+        if "visual_fusion" in ckpt and ckpt["visual_fusion"] != args.visual_fusion:
+            msg = (
+                f"{mode} visual_fusion mismatch: checkpoint={ckpt['visual_fusion']!r}, "
+                f"requested {args.visual_fusion!r}"
+            )
+            if args.resume:
+                raise ValueError(msg)
+            print(f"WARNING: {msg}; loading weights into the requested protocol.")
 
         # model components
         model.ssm.load_state_dict(ckpt["ssm"])
@@ -2167,6 +2340,13 @@ def main():
                     "state will be reset."
                 )
         _load_temporal_conditioning(model, ckpt)
+        if "spatial_film" in ckpt:
+            if _state_dict_shapes_match(model.spatial_film, ckpt["spatial_film"]):
+                model.spatial_film.load_state_dict(ckpt["spatial_film"])
+            else:
+                print("WARNING: spatial_film checkpoint is incompatible; using zero-initialized SpatialFiLM.")
+        elif args.visual_fusion == "film_spatial":
+            print("WARNING: checkpoint has no spatial_film; using zero-initialized SpatialFiLM.")
         if "score_head" in ckpt:
             model.score_head.load_state_dict(ckpt["score_head"])
         for attr in ("score_query", "summary_query"):
@@ -2258,6 +2438,7 @@ def main():
             "world_branch": model.world_branch.state_dict(),
             "temporal_proj": model.world_branch.temporal_proj.state_dict(),
             "temporal_modulator": model.temporal_modulator.state_dict(),
+            "spatial_film": model.spatial_film.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
             "alpha_logit": model.alpha_logit.detach().cpu(),
@@ -2286,6 +2467,7 @@ def main():
             "lambda_score": args.lambda_score,
             "lambda_sum": args.lambda_sum,
             "lambda_world": args.lambda_world,
+            "visual_fusion": args.visual_fusion,
             "world_horizon": args.world_horizon,
             "world_warmup_steps": args.world_warmup_steps,
             "ibq_cache_root": args.ibq_cache_root,
@@ -2322,6 +2504,11 @@ def main():
         gamma_abs_mean_list: List[float] = []
         gamma_std_list: List[float] = []
         modulation_delta_rel_list: List[float] = []
+        film_gamma_abs_mean_list: List[float] = []
+        film_beta_abs_mean_list: List[float] = []
+        film_delta_rel_list: List[float] = []
+        spatial_tokens_mean_list: List[float] = []
+        spatial_tokens_max_list: List[float] = []
         train_valid_windows: List[float] = []
         train_summary_triggers: List[float] = []
         train_skipped_summary: List[float] = []
@@ -2360,6 +2547,8 @@ def main():
                 # --- encode ---
                 ssm_out = None
                 h_internal = None
+                spatial_features = None
+                spatial_mask = None
                 if "features" in batch:
                     window_batch = batch["features"].to(device=device, dtype=dtype)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
@@ -2367,6 +2556,11 @@ def main():
                             window_batch, valid_mask, batch["video_id"], ssm_cache,
                             training=True, return_internal=True,
                         )
+                    if model.visual_fusion == "film_spatial" or args.lambda_world > 0:
+                        if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
+                            raise ValueError("film_spatial/world training requires spatial_features/spatial_mask")
+                        spatial_features = batch["spatial_features"].to(device=device)
+                        spatial_mask = batch["spatial_mask"].to(device=device)
                 else:
                     frames_list = batch["frames"]
                     B, max_w = binary.shape[:2]
@@ -2382,16 +2576,26 @@ def main():
                     pv = processed["pixel_values_videos"].to(device)
                     gthw = processed["video_grid_thw"].to(device)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                        state_emb, visual_windows, ssm_cache, _ = model.encode_stream(
-                            pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
-                        )
+                        if model.visual_fusion == "film_spatial" or args.lambda_world > 0:
+                            visual_windows, spatial_features, spatial_mask = model.extract_window_features(
+                                pv, gthw, valid_mask, return_stats=False, return_spatial=True,
+                            )
+                            state_emb, visual_windows, ssm_out, h_internal, ssm_cache = model.encode_window_features(
+                                visual_windows, valid_mask, batch["video_id"], ssm_cache,
+                                training=True, return_internal=True,
+                            )
+                        else:
+                            state_emb, visual_windows, ssm_cache, _ = model.encode_stream(
+                                pv, gthw, valid_mask, batch["video_id"], ssm_cache, training=True,
+                            )
 
                 # --- early world warmup determination (before any VAD work) ---
                 use_world = (
                     args.lambda_world > 0
                     and ibq_cache is not None
                     and h_internal is not None
-                    and batch.get("spatial_features") is not None
+                    and spatial_features is not None
+                    and spatial_mask is not None
                 )
                 warmup_phase = False
                 if use_world:
@@ -2420,8 +2624,8 @@ def main():
                         loss_world, world_info = _world_model_loss(
                             model, ibq_cache, batch, valid_mask_cpu, valid_mask,
                             h_internal,
-                            batch["spatial_features"].to(device=device),
-                            batch["spatial_mask"].to(device=device),
+                            spatial_features,
+                            spatial_mask,
                             args.world_horizon, args.frames_per_clip,
                             args.world_logit_chunk_size,
                             run_baseline, detach_states=True,
@@ -2441,9 +2645,17 @@ def main():
                     if len(valid_b) == 0:
                         raise RuntimeError("score_token batch has no valid windows")
                     all_state = state_emb[valid_b, valid_w]
-                    score_logits_flat = model.forward_score_token(
-                        all_state, embed_fn, tokenizer, args.status_prompt,
-                    )
+                    if model.visual_fusion == "film_spatial":
+                        visual_prefix, visual_prefix_mask = model.select_visual_prefix(
+                            state_emb, valid_b, valid_w, spatial_features, spatial_mask, h_internal,
+                        )
+                        score_logits_flat = model.forward_score_visual_prefix(
+                            visual_prefix, visual_prefix_mask, embed_fn, tokenizer, args.status_prompt,
+                        )
+                    else:
+                        score_logits_flat = model.forward_score_token(
+                            all_state, embed_fn, tokenizer, args.status_prompt,
+                        )
                     score_logits = torch.zeros(
                         (B, max_w),
                         device=score_logits_flat.device,
@@ -2463,12 +2675,21 @@ def main():
                         if triggers:
                             trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
                             trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
-                            trigger_states = state_emb[trigger_b, trigger_w]
                             summary_texts = [str(t[2]["text"]) for t in triggers]
-                            loss_summary, summary_info = summary_ce_loss(
-                                model.qwen, embed_fn, tokenizer,
-                                trigger_states, model.summary_query, summary_texts,
-                            )
+                            if model.visual_fusion == "film_spatial":
+                                visual_prefix, visual_prefix_mask = model.select_visual_prefix(
+                                    state_emb, trigger_b, trigger_w, spatial_features, spatial_mask, h_internal,
+                                )
+                                loss_summary, summary_info = summary_ce_loss_visual_prefix(
+                                    model.qwen, embed_fn, tokenizer,
+                                    visual_prefix, visual_prefix_mask, model.summary_query, summary_texts,
+                                )
+                            else:
+                                trigger_states = state_emb[trigger_b, trigger_w]
+                                loss_summary, summary_info = summary_ce_loss(
+                                    model.qwen, embed_fn, tokenizer,
+                                    trigger_states, model.summary_query, summary_texts,
+                                )
                         else:
                             loss_summary = state_emb.new_zeros(())
                             summary_info = {"num_summary_triggers": 0, "caption_token_count": 0}
@@ -2482,8 +2703,8 @@ def main():
                             loss_world, world_info = _world_model_loss(
                                 model, ibq_cache, batch, valid_mask_cpu, valid_mask,
                                 h_internal,
-                                batch["spatial_features"].to(device=device),
-                                batch["spatial_mask"].to(device=device),
+                                spatial_features,
+                                spatial_mask,
                                 args.world_horizon, args.frames_per_clip,
                                 args.world_logit_chunk_size,
                                 run_baseline, detach_states=False,
@@ -2529,6 +2750,12 @@ def main():
                             writer.add_scalar("step/gamma_abs_mean", finite_mean(gamma_abs_mean_list[-500:]), global_step)
                             writer.add_scalar("step/gamma_std", finite_mean(gamma_std_list[-500:]), global_step)
                             writer.add_scalar("step/modulation_delta_rel", finite_mean(modulation_delta_rel_list[-500:]), global_step)
+                        if film_gamma_abs_mean_list:
+                            writer.add_scalar("step/film_gamma_abs_mean", finite_mean(film_gamma_abs_mean_list[-500:]), global_step)
+                            writer.add_scalar("step/film_beta_abs_mean", finite_mean(film_beta_abs_mean_list[-500:]), global_step)
+                            writer.add_scalar("step/film_delta_rel", finite_mean(film_delta_rel_list[-500:]), global_step)
+                            writer.add_scalar("step/spatial_tokens_mean", finite_mean(spatial_tokens_mean_list[-500:]), global_step)
+                            writer.add_scalar("step/spatial_tokens_max", finite_mean(spatial_tokens_max_list[-500:]), global_step)
 
                 train_losses.append(float(raw_total_loss.detach().item()))
                 train_score_losses.append(float(loss_score.detach().item()))
@@ -2546,6 +2773,13 @@ def main():
                     gamma_abs_mean_list.append(float(mod_stats["gamma_abs_mean"]))
                     gamma_std_list.append(float(mod_stats["gamma_std"]))
                     modulation_delta_rel_list.append(float(mod_stats["modulation_delta_rel"]))
+                film_stats = model.last_spatial_film_stats
+                if film_stats:
+                    film_gamma_abs_mean_list.append(float(film_stats["film_gamma_abs_mean"]))
+                    film_beta_abs_mean_list.append(float(film_stats["film_beta_abs_mean"]))
+                    film_delta_rel_list.append(float(film_stats["film_delta_rel"]))
+                    spatial_tokens_mean_list.append(float(film_stats["spatial_tokens_mean"]))
+                    spatial_tokens_max_list.append(float(film_stats["spatial_tokens_max"]))
                 num_valid_windows = float(valid.sum().item()) if not warmup_phase else 0.0
                 num_summary_triggers = float(summary_info["num_summary_triggers"])
                 train_valid_windows.append(num_valid_windows)
@@ -2783,6 +3017,12 @@ def main():
                 writer.add_scalar("train/gamma_abs_mean", finite_mean(gamma_abs_mean_list), epoch)
                 writer.add_scalar("train/gamma_std", finite_mean(gamma_std_list), epoch)
                 writer.add_scalar("train/modulation_delta_rel", finite_mean(modulation_delta_rel_list), epoch)
+            if film_gamma_abs_mean_list:
+                writer.add_scalar("train/film_gamma_abs_mean", finite_mean(film_gamma_abs_mean_list), epoch)
+                writer.add_scalar("train/film_beta_abs_mean", finite_mean(film_beta_abs_mean_list), epoch)
+                writer.add_scalar("train/film_delta_rel", finite_mean(film_delta_rel_list), epoch)
+                writer.add_scalar("train/spatial_tokens_mean", finite_mean(spatial_tokens_mean_list), epoch)
+                writer.add_scalar("train/spatial_tokens_max", finite_mean(spatial_tokens_max_list), epoch)
             # step/* tags are written at the 500-step boundary with
             # global_step only; no epoch-scalar duplicates here
             writer.add_scalar("train/score_prob_mean", score_prob_mean_epoch, epoch)
@@ -2801,6 +3041,11 @@ def main():
                 f"gamma_abs={finite_mean(gamma_abs_mean_list):.4f} "
                 f"gamma_std={finite_mean(gamma_std_list):.4f} "
                 f"modulation_delta_rel={finite_mean(modulation_delta_rel_list):.4f} "
+                f"film_gamma_abs={finite_mean(film_gamma_abs_mean_list):.4f} "
+                f"film_beta_abs={finite_mean(film_beta_abs_mean_list):.4f} "
+                f"film_delta_rel={finite_mean(film_delta_rel_list):.4f} "
+                f"R_mean={finite_mean(spatial_tokens_mean_list):.1f} "
+                f"R_max={finite_mean(spatial_tokens_max_list):.1f} "
                 f"valid_windows_total={int(train_valid_windows_total)} "
                 f"summary_triggers_total={int(train_summary_triggers_total)} "
                 f"skipped_summary_total={int(train_skipped_summary_total)}"
