@@ -124,9 +124,27 @@ def test_load_stage1_model_restores_film_spatial_checkpoint(monkeypatch, tmp_pat
     assert model.eval_called
 
 
-def test_load_stage1_model_film_spatial_requires_spatial_film(monkeypatch, tmp_path):
+def test_load_stage1_model_restores_state_spatial_film_checkpoint(monkeypatch, tmp_path):
     infer = _import_infer(monkeypatch)
-    monkeypatch.setattr(infer.torch, "load", lambda *args, **kwargs: _state("film_spatial", include_spatial_film=False))
+    state = _state("state_spatial_film")
+    monkeypatch.setattr(infer.torch, "load", lambda *args, **kwargs: state)
+    monkeypatch.setattr(infer, "StreamingVADGenerationModel", _FakeStage1Model)
+    monkeypatch.setattr(infer, "_load_temporal_conditioning", lambda *args, **kwargs: None)
+
+    model, *_ = infer.load_stage1_model(_args(tmp_path))
+
+    assert model.visual_fusion == "state_spatial_film"
+    assert model.spatial_film.loaded is state["spatial_film"]
+    assert model.eval_called
+
+
+def test_load_stage1_model_spatial_fusion_requires_spatial_film(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    monkeypatch.setattr(
+        infer.torch,
+        "load",
+        lambda *args, **kwargs: _state("state_spatial_film", include_spatial_film=False),
+    )
     monkeypatch.setattr(infer, "StreamingVADGenerationModel", _FakeStage1Model)
 
     with pytest.raises(ValueError, match="missing spatial_film"):
@@ -231,9 +249,40 @@ class _StateOnlyInferModel(_InferModel):
         return torch.tensor([0.1, -0.2])
 
 
+class _StateSpatialInferModel(_InferModel):
+    visual_fusion = "state_spatial_film"
+
+
 def test_film_spatial_cached_inference_uses_visual_prefix_path(monkeypatch, tmp_path):
     infer = _import_infer(monkeypatch)
     model = _InferModel()
+    monkeypatch.setattr(infer, "hivau_collate", lambda items: items[0])
+    monkeypatch.setattr(infer, "load_gt", lambda *args, **kwargs: np.zeros(10, dtype=np.int64))
+    monkeypatch.setattr(infer, "save_window_csv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(infer, "_find_embed", lambda qwen: torch.nn.Embedding(8, 4))
+
+    result = infer.infer_video(
+        model=model,
+        processor=None,
+        tokenizer=type("Tok", (), {})(),
+        dataset=_Dataset(_cached_batch(include_spatial=True)),
+        refs=[_Ref()],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prompt_text="prompt",
+        output_dir=tmp_path,
+        gt_root=tmp_path,
+        debug_state=False,
+    )
+
+    assert result["num_windows"] == 2
+    assert model.used_visual_prefix
+    assert not model.used_state_score
+
+
+def test_state_spatial_film_cached_inference_uses_visual_prefix_path(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    model = _StateSpatialInferModel()
     monkeypatch.setattr(infer, "hivau_collate", lambda items: items[0])
     monkeypatch.setattr(infer, "load_gt", lambda *args, **kwargs: np.zeros(10, dtype=np.int64))
     monkeypatch.setattr(infer, "save_window_csv", lambda *args, **kwargs: None)

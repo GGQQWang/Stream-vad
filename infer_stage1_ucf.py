@@ -21,6 +21,8 @@ from transformers import AutoTokenizer, Qwen2VLForConditionalGeneration, Qwen2VL
 from hivau_dataset import HIVAUDataset, hivau_collate
 from mil_utils import group_video_chunks
 from pipeline_stage1 import (
+    SPATIAL_FUSION_MODES,
+    VISUAL_FUSION_MODES,
     StreamingVADGenerationModel,
     _find_embed,
     _load_temporal_conditioning,
@@ -121,10 +123,10 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     _check_stage1_config(state, args.model_path)
     visual_fusion = str(state.get("visual_fusion", "state_only"))
-    if visual_fusion not in {"state_only", "film_spatial"}:
+    if visual_fusion not in VISUAL_FUSION_MODES:
         raise ValueError(f"unknown Stage-1 visual_fusion={visual_fusion!r}")
-    if visual_fusion == "film_spatial" and "spatial_film" not in state:
-        raise ValueError("film_spatial checkpoint is missing spatial_film state_dict")
+    if visual_fusion in SPATIAL_FUSION_MODES and "spatial_film" not in state:
+        raise ValueError(f"{visual_fusion} checkpoint is missing spatial_film state_dict")
 
     dtype = torch.bfloat16
     print("Loading Qwen2-VL base model ...")
@@ -155,7 +157,7 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     model.ssm.load_state_dict(state["ssm"])
     model.adapter.load_state_dict(state["adapter"])
     _load_temporal_conditioning(model, state)
-    if visual_fusion == "film_spatial":
+    if visual_fusion in SPATIAL_FUSION_MODES:
         model.spatial_film.load_state_dict(state["spatial_film"])
     model.score_head.load_state_dict(state["score_head"])
     model.score_query.data.copy_(state["score_query"].to(model.score_query.device, model.score_query.dtype))
@@ -274,9 +276,9 @@ def infer_video(
             if "features" in batch:
                 window_batch = batch["features"].to(device=device, dtype=dtype)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    if model.visual_fusion == "film_spatial":
+                    if model.visual_fusion in SPATIAL_FUSION_MODES:
                         if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
-                            raise ValueError("film_spatial inference requires spatial_features/spatial_mask")
+                            raise ValueError("spatial FiLM inference requires spatial_features/spatial_mask")
                         state_emb, _, _, h_internal, ssm_cache = model.encode_window_features(
                             window_batch,
                             valid_mask,
@@ -303,7 +305,7 @@ def infer_video(
                 pixel_values = processed["pixel_values_videos"].to(device)
                 grid_thw = processed["video_grid_thw"].to(device)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    if model.visual_fusion == "film_spatial":
+                    if model.visual_fusion in SPATIAL_FUSION_MODES:
                         window_batch, spatial_features, spatial_mask = model.extract_window_features(
                             pixel_values,
                             grid_thw,
@@ -335,7 +337,7 @@ def infer_video(
             if chunk_i == 0:
                 first_chunk_scored = len(valid_b)
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                if model.visual_fusion == "film_spatial":
+                if model.visual_fusion in SPATIAL_FUSION_MODES:
                     visual_prefix, visual_prefix_mask = model.select_visual_prefix(
                         state_emb,
                         valid_b,
@@ -515,7 +517,7 @@ def main() -> None:
         feature_cache_model_id=args.model_path,
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,
-        require_spatial=(model.visual_fusion == "film_spatial"),
+        require_spatial=(model.visual_fusion in SPATIAL_FUSION_MODES),
     )
     grouped = group_video_chunks(dataset.samples)
     if args.video_id:

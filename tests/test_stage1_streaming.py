@@ -519,6 +519,25 @@ def test_summary_visual_prefix_batch_uses_variable_caption_offsets():
     assert batch["labels"][1].tolist() == [-100, -100, 3, 9, -100, -100]
 
 
+def test_summary_visual_prefix_batch_supports_state_spatial_prefix():
+    class _Tok:
+        eos_token_id = 9
+
+        def encode(self, text, add_special_tokens=False):
+            return [4, 5]
+
+    embed = torch.nn.Embedding(16, 4)
+    prefix = torch.randn(1, 4, 4)
+    mask = torch.tensor([[True, True, False, True]])
+    query = torch.randn(1, 4)
+    batch = build_summary_visual_prefix_batch(embed, _Tok(), prefix, mask, query, ["caption"])
+    assert batch["attention_mask"].tolist() == [[True, True, True, True, True, True, True]]
+    assert batch["labels"].tolist() == [[-100, -100, -100, -100, 4, 5, 9]]
+    assert torch.allclose(batch["inputs_embeds"][0, 0], prefix[0, 0])
+    assert torch.allclose(batch["inputs_embeds"][0, 1], prefix[0, 1])
+    assert torch.allclose(batch["inputs_embeds"][0, 2], prefix[0, 3])
+
+
 def test_official_hivau_label_formats():
     empty_frames = np.zeros(4, dtype=np.uint8)
     assert _read_video_label({"label": ["Normal"]}, empty_frames) == 0
