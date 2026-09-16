@@ -99,9 +99,10 @@ def test_feature_cache_dataset_does_not_need_video_reader_or_video_files(tmp_pat
     second = ds[1]
     assert "features" in first
     assert "frames" not in first
-    assert torch.allclose(first["features"], expected[:2].float())
-    assert torch.allclose(second["features"][0], expected[2].float())
-    assert torch.allclose(second["features"][1], torch.zeros(4))
+    assert first["features"].dtype == torch.float16
+    assert torch.allclose(first["features"], expected[:2].to(first["features"].dtype))
+    assert torch.allclose(second["features"][0], expected[2].to(second["features"].dtype))
+    assert torch.allclose(second["features"][1], torch.zeros_like(second["features"][1]))
     assert second["valid_mask"].tolist() == [True, False]
 
 
