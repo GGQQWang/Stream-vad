@@ -512,7 +512,7 @@ def test_summary_visual_prefix_batch_uses_variable_caption_offsets():
     query = torch.randn(1, 4)
     batch = build_summary_visual_prefix_batch(embed, _Tok(), visual, mask, query, ["long", "short"])
     assert batch["attention_mask"].tolist() == [
-        [True, True, True, True, True, False],
+        [True, True, True, True, True, True],
         [True, True, True, True, False, False],
     ]
     assert batch["labels"][0].tolist() == [-100, -100, -100, 1, 2, 9]

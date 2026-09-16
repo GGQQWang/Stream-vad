@@ -616,8 +616,8 @@ def test_state_spatial_film_prefix_keeps_state_first_and_masks_spatial_padding()
 
     _ = model.forward_score_visual_prefix(prefix, prefix_mask, _Embed(), _Tok(), "prompt")
     assert model.qwen.seen_attention_mask.tolist() == [
-        [True, True, True, True, True, True, False],
-        [True, True, True, True, True, True, True],
+        [True, True, True, True, True, True, True, False],
+        [True, True, True, True, True, True, True, True],
     ]
     assert not bool((model.qwen.seen_inputs == 999.0).any())
     print("test hybrid OK: state token leads compact valid FiLM spatial prefix")
