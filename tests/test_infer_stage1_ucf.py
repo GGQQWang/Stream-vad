@@ -221,9 +221,13 @@ class _InferModel:
         self.used_visual_prefix = True
         return torch.randn(2, 2, 4), torch.tensor([[True, False], [True, True]])
 
-    def forward_score_visual_prefix(self, visual_prefix, visual_mask, embed_fn, tokenizer, prompt_text):
+    def forward_score_visual_prefix(
+        self, visual_prefix, visual_mask, embed_fn, tokenizer, prompt_text, return_hidden=False,
+    ):
         assert self.used_visual_prefix
-        return torch.tensor([0.1, -0.2])
+        logits = torch.tensor([0.1, -0.2])
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        return (logits, hidden) if return_hidden else logits
 
     def forward_score_token(self, *args, **kwargs):
         self.used_state_score = True
@@ -244,9 +248,11 @@ class _StateOnlyInferModel(_InferModel):
     def forward_score_visual_prefix(self, *args, **kwargs):
         raise AssertionError("state_only inference must not call forward_score_visual_prefix")
 
-    def forward_score_token(self, states, embed_fn, tokenizer, prompt_text):
+    def forward_score_token(self, states, embed_fn, tokenizer, prompt_text, return_hidden=False):
         self.used_state_score = True
-        return torch.tensor([0.1, -0.2])
+        logits = torch.tensor([0.1, -0.2])
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        return (logits, hidden) if return_hidden else logits
 
 
 class _StateSpatialInferModel(_InferModel):
@@ -332,6 +338,33 @@ def test_state_only_cached_inference_uses_original_score_token_path(monkeypatch,
     assert result["num_windows"] == 2
     assert model.used_state_score
     assert not model.used_visual_prefix
+
+
+def test_infer_video_optionally_collects_score_head_input_hidden(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    model = _StateOnlyInferModel()
+    monkeypatch.setattr(infer, "hivau_collate", lambda items: items[0])
+    monkeypatch.setattr(infer, "load_gt", lambda *args, **kwargs: np.zeros(10, dtype=np.int64))
+    monkeypatch.setattr(infer, "save_window_csv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(infer, "_find_embed", lambda qwen: torch.nn.Embedding(8, 4))
+
+    result = infer.infer_video(
+        model=model,
+        processor=None,
+        tokenizer=type("Tok", (), {})(),
+        dataset=_Dataset(_cached_batch(include_spatial=False)),
+        refs=[_Ref()],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prompt_text="prompt",
+        output_dir=tmp_path,
+        gt_root=tmp_path,
+        debug_state=False,
+        collect_score_hidden=True,
+    )
+
+    assert [row["window_index"] for row in result["window_rows"]] == [0, 1]
+    assert torch.equal(result["score_hidden"], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
 
 
 def test_film_spatial_cached_inference_missing_spatial_cache_fails(monkeypatch, tmp_path):

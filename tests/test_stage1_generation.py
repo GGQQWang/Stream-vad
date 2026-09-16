@@ -183,9 +183,17 @@ def test_score_path_casts_qwen_inputs_to_embedding_dtype_and_score_head_to_fp32(
 
     embed = nn.Embedding(8, 4).to(dtype=torch.bfloat16)
     state = torch.randn(3, 4, dtype=torch.float32)
-    logits = harness.forward_score_token(state, embed, _Tokenizer(), "prompt")
+    with torch.no_grad():
+        original_logits = harness.forward_score_token(state, embed, _Tokenizer(), "prompt")
+    logits, score_hidden = harness.forward_score_token(
+        state, embed, _Tokenizer(), "prompt", return_hidden=True,
+    )
     assert harness.qwen.seen_dtype == torch.bfloat16
     assert logits.dtype == torch.float32
+    assert score_hidden.dtype == torch.float32
+    assert score_hidden.shape == (3, 4)
+    assert torch.equal(logits, original_logits)
+    assert torch.equal(logits, harness.score_head(score_hidden).squeeze(-1))
     logits.sum().backward()
     assert harness.score_query.grad is not None
     assert harness.score_query.grad.abs().sum().item() > 0

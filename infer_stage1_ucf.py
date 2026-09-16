@@ -236,6 +236,7 @@ def infer_video(
     output_dir: Path,
     gt_root: str | Path,
     debug_state: bool,
+    collect_score_hidden: bool = False,
 ) -> dict:
     video_id = refs[0].video_id
     first_meta = dataset.samples[refs[0].index]
@@ -245,6 +246,7 @@ def infer_video(
     embed_fn = _find_embed(model.qwen)
     ssm_cache: dict = {}
     rows: List[dict] = []
+    score_hidden_by_window: Dict[int, torch.Tensor] = {}
 
     # timing accumulators (wall-clock; processing excludes data loading)
     data_loading_sec = 0.0
@@ -346,21 +348,40 @@ def infer_video(
                         spatial_mask,
                         h_internal,
                     )
-                    logits = model.forward_score_visual_prefix(
-                        visual_prefix,
-                        visual_prefix_mask,
-                        embed_fn,
-                        tokenizer,
-                        prompt_text=prompt_text,
-                    )
+                    if collect_score_hidden:
+                        logits, score_hidden = model.forward_score_visual_prefix(
+                            visual_prefix,
+                            visual_prefix_mask,
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                            return_hidden=True,
+                        )
+                    else:
+                        logits = model.forward_score_visual_prefix(
+                            visual_prefix,
+                            visual_prefix_mask,
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                        )
                 else:
                     states = state_emb[valid_b, valid_w]
-                    logits = model.forward_score_token(
-                        states,
-                        embed_fn,
-                        tokenizer,
-                        prompt_text=prompt_text,
-                    )
+                    if collect_score_hidden:
+                        logits, score_hidden = model.forward_score_token(
+                            states,
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                            return_hidden=True,
+                        )
+                    else:
+                        logits = model.forward_score_token(
+                            states,
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                        )
             if not torch.isfinite(logits).all():
                 raise RuntimeError(
                     f"{video_id}: non-finite score logits in chunk {chunk_i} "
@@ -380,9 +401,14 @@ def infer_video(
                 w = int(w_t.item())
                 start = int(start_frames[b, w].item())
                 end = int(valid_end_frames[b, w].item())
+                window_index = int(batch["chunk_start"][b]) + w
+                if collect_score_hidden:
+                    if window_index in score_hidden_by_window:
+                        raise ValueError(f"{video_id}: duplicate score hidden for window {window_index}")
+                    score_hidden_by_window[window_index] = score_hidden[i].detach().float().cpu()
                 rows.append({
                     "video_id": video_id,
-                    "window_index": int(batch["chunk_start"][b]) + w,
+                    "window_index": window_index,
                     "start_frame": start,
                     "end_frame": end,
                     "start_sec": start / fps,
@@ -465,7 +491,7 @@ def infer_video(
         f"rtf_full={rtf_full:.3f} avg_win_ms={avg_window_ms:.1f} "
         f"steady_win_ms={steady_window_ms:.1f}"
     )
-    return {
+    result = {
         "video_id": video_id,
         "n_frames": n_frames,
         "fps": fps,
@@ -485,6 +511,19 @@ def infer_video(
         "causal_scores": causal_scores,
         "causal_valid": causal_valid,
     }
+    if collect_score_hidden:
+        missing = [
+            int(row["window_index"])
+            for row in rows
+            if int(row["window_index"]) not in score_hidden_by_window
+        ]
+        if missing:
+            raise ValueError(f"{video_id}: missing score hidden for windows {missing}")
+        result["window_rows"] = rows
+        result["score_hidden"] = torch.stack(
+            [score_hidden_by_window[int(row["window_index"])] for row in rows], dim=0,
+        )
+    return result
 
 
 def main() -> None:

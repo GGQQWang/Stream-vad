@@ -536,7 +536,9 @@ def test_film_spatial_prefix_drops_padding_and_gathers_score_query():
     valid_b = torch.tensor([0, 0])
     valid_w = torch.tensor([0, 1])
     prefix, prefix_mask = model.select_visual_prefix(state, valid_b, valid_w, spatial, spatial_mask, h_internal)
-    logits = model.forward_score_visual_prefix(prefix, prefix_mask, _Embed(), _Tok(), "prompt")
+    logits, score_hidden = model.forward_score_visual_prefix(
+        prefix, prefix_mask, _Embed(), _Tok(), "prompt", return_hidden=True,
+    )
     assert prefix.shape == (2, 3, 4)
     assert torch.allclose(prefix, spatial[0])
     assert prefix_mask.tolist() == [[True, False, False], [True, True, False]]
@@ -545,6 +547,8 @@ def test_film_spatial_prefix_drops_padding_and_gathers_score_query():
         [True, True, True, True, True],
     ]
     assert logits.shape == (2,)
+    assert score_hidden.shape == (2, 4)
+    assert torch.equal(logits, model.score_head(score_hidden).squeeze(-1))
     print("test film OK: padding spatial tokens are masked and score query is gathered")
 
 

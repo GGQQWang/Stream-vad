@@ -866,11 +866,14 @@ class StreamingVADGenerationModel(nn.Module):
         embed_fn: nn.Module,
         tokenizer,
         prompt_text: str,
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One-pass LLM forward -> explicit score query hidden -> anomaly logits."""
         N = state_embeddings.shape[0]
         if N == 0:
-            return state_embeddings.new_zeros(0)
+            logits = state_embeddings.new_zeros(0)
+            hidden = state_embeddings.new_zeros((0, state_embeddings.shape[-1]))
+            return (logits, hidden) if return_hidden else logits
 
         llm_weight = embed_fn.weight
         llm_device = llm_weight.device
@@ -898,7 +901,8 @@ class StreamingVADGenerationModel(nn.Module):
         hidden = out.hidden_states[-1][:, -1, :]
         score_param = next(self.score_head.parameters())
         hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
-        return self.score_head(hidden).squeeze(-1)
+        logits = self.score_head(hidden).squeeze(-1)
+        return (logits, hidden) if return_hidden else logits
 
     def forward_score_visual_prefix(
         self,
@@ -907,7 +911,8 @@ class StreamingVADGenerationModel(nn.Module):
         embed_fn: nn.Module,
         tokenizer,
         prompt_text: str,
-    ) -> torch.Tensor:
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One Qwen forward over variable valid visual tokens + prompt + score query."""
         if visual_prefix.ndim != 3:
             raise ValueError(f"visual_prefix must be [N, R, H], got {tuple(visual_prefix.shape)}")
@@ -915,7 +920,9 @@ class StreamingVADGenerationModel(nn.Module):
             raise ValueError("visual_mask shape must match visual_prefix[:2]")
         N, _, H = visual_prefix.shape
         if N == 0:
-            return visual_prefix.new_zeros(0)
+            logits = visual_prefix.new_zeros(0)
+            hidden = visual_prefix.new_zeros((0, H))
+            return (logits, hidden) if return_hidden else logits
         llm_weight = embed_fn.weight
         device = llm_weight.device
         dtype = llm_weight.dtype
@@ -951,7 +958,8 @@ class StreamingVADGenerationModel(nn.Module):
         hidden = hidden_all[torch.arange(N, device=device), query_pos]
         score_param = next(self.score_head.parameters())
         hidden = hidden.to(device=score_param.device, dtype=score_param.dtype)
-        return self.score_head(hidden).squeeze(-1)
+        logits = self.score_head(hidden).squeeze(-1)
+        return (logits, hidden) if return_hidden else logits
 
 
 def _state_dict_shapes_match(module: nn.Module, saved: dict) -> bool:
