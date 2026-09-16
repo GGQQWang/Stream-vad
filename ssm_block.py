@@ -275,6 +275,11 @@ class SSMBlock(nn.Module):
 
         self.d_model = d_model
         self.n_layers = n_layers
+        self.d_input = d_input
+        self.state_dim = d_model
+        self.output_dim = llm_hidden
+        self.history_length = None
+        self.temporal_model = "ssm"
 
         self.in_proj = nn.Sequential(
             nn.Linear(d_input, d_model),
@@ -397,6 +402,46 @@ class SSMBlock(nn.Module):
 
     def reset_cache(self) -> None:
         self._cache = None
+
+    def reset_state(self):
+        self.reset_cache()
+        return None
+
+    def step(self, x_t: torch.Tensor, memory=None):
+        """Unified temporal API returning the internal causal event state."""
+        _, new_memory, internal = self.forward_chunk(
+            x_t.unsqueeze(1), state=memory, return_internal=True,
+        )
+        return internal[:, 0], new_memory
+
+    def forward_sequence(self, x: torch.Tensor, memory=None):
+        """Unified temporal API returning all internal event states."""
+        _, new_memory, internal = self.forward_chunk(x, state=memory, return_internal=True)
+        return internal, new_memory
+
+    def get_memory_stats(self, memory) -> dict[str, int]:
+        if memory is None:
+            return {"num_elements": 0, "bytes": 0}
+        tensors = []
+        for state in memory.values():
+            tensors.extend((state.conv_state, state.ssm_state))
+        return {
+            "num_elements": int(sum(tensor.numel() for tensor in tensors)),
+            "bytes": int(sum(tensor.numel() * tensor.element_size() for tensor in tensors)),
+        }
+
+    def get_config(self) -> dict:
+        return {
+            "name": self.temporal_model,
+            "d_input": self.d_input,
+            "state_dim": self.state_dim,
+            "output_dim": self.output_dim,
+            "history_length": None,
+            "num_layers": self.n_layers,
+            "mamba_d_state": 64,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+        }
 
     def get_cache(self, detach: bool = False):
         if self._cache is None:

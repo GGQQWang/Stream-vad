@@ -27,6 +27,7 @@ from pipeline_stage1 import (
     _find_embed,
     _load_temporal_conditioning,
 )
+from temporal_modules import TEMPORAL_MODELS, checkpoint_temporal_config
 
 
 FRAMES_PER_CLIP = 16
@@ -111,6 +112,39 @@ def _check_stage1_config(state: dict, model_path: str) -> None:
         raise ValueError(f"Stage-1 inference requires objective='score_token', got {objective!r}")
 
 
+def _checkpoint_parameter_counts(model, state: dict) -> tuple[int, int]:
+    temporal_params = int(state["temporal_params"]) if "temporal_params" in state else sum(
+        parameter.numel() for parameter in model.ssm.parameters()
+    )
+    if "trainable_params" in state:
+        return temporal_params, int(state["trainable_params"])
+
+    # Legacy checkpoints predate explicit count metadata. Reconstruct the
+    # training freeze policy from module names and saved run configuration.
+    lambda_world = float(state.get("lambda_world", 0.0))
+    if lambda_world > 0:
+        raise ValueError(
+            "legacy checkpoint with trainable world branch lacks trainable_params metadata; "
+            "the inference-only model cannot reconstruct its training parameter count"
+        )
+    visual_fusion = str(state.get("visual_fusion", "state_only"))
+    trainable_params = 0
+    for name, parameter in model.named_parameters():
+        if name.startswith("vit.visual."):
+            continue
+        if name.startswith("qwen."):
+            if "lora_" in name:
+                trainable_params += parameter.numel()
+            continue
+        if name.startswith("world_branch.") and lambda_world <= 0:
+            continue
+        if name.startswith("spatial_film.") and visual_fusion == "state_only":
+            continue
+        trainable_params += parameter.numel()
+    print("WARNING: checkpoint lacks trainable_params metadata; reconstructed it from freeze policy.")
+    return temporal_params, int(trainable_params)
+
+
 def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object, torch.dtype, str]:
     stage1_dir = Path(args.stage1_dir)
     state_path = stage1_dir / "train_state.pt"
@@ -122,6 +156,13 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
 
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     _check_stage1_config(state, args.model_path)
+    requested_temporal = getattr(args, "temporal_model", "auto")
+    requested_history = int(getattr(args, "temporal_history", 0))
+    temporal_model, temporal_history = checkpoint_temporal_config(
+        state,
+        requested_model=None if requested_temporal == "auto" else requested_temporal,
+        requested_history=None if requested_history <= 0 else requested_history,
+    )
     visual_fusion = str(state.get("visual_fusion", "state_only"))
     if visual_fusion not in VISUAL_FUSION_MODES:
         raise ValueError(f"unknown Stage-1 visual_fusion={visual_fusion!r}")
@@ -153,6 +194,8 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         vit_micro_batch=1,
         world_include_decoder=False,
         visual_fusion=visual_fusion,
+        temporal_model=temporal_model,
+        temporal_history=temporal_history,
     ).to(args.device)
     model.ssm.load_state_dict(state["ssm"])
     model.adapter.load_state_dict(state["adapter"])
@@ -167,10 +210,16 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         model.alpha_logit.data.copy_(state["alpha_logit"].to(model.alpha_logit.device, model.alpha_logit.dtype))
     else:
         print("WARNING: alpha_logit missing from checkpoint; using model default.")
+    temporal_params, trainable_params = _checkpoint_parameter_counts(model, state)
+    model.temporal_param_count = temporal_params
+    model.training_trainable_param_count = trainable_params
     model.debug_state = False
     model.eval()
     prompt_text = str(state.get("prompt", "Current video status:"))
-    print(f"Loaded visual_fusion={visual_fusion}")
+    print(
+        f"Loaded visual_fusion={visual_fusion} temporal_model={temporal_model} "
+        f"temporal_history={temporal_history}"
+    )
     return model, processor, tokenizer, dtype, prompt_text
 
 
@@ -221,6 +270,168 @@ def _synchronize(device: torch.device) -> None:
     """
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+class OnlineInferenceProfiler:
+    """Accumulate strict single-window latency and temporal-memory metrics."""
+
+    def __init__(self, warmup_windows: int):
+        if warmup_windows < 0:
+            raise ValueError("profile warmup windows must be non-negative")
+        self.warmup_windows = int(warmup_windows)
+        self.seen_windows = 0
+        self.latencies_ms: List[float] = []
+        self.history_elements = 0
+        self.history_bytes = 0
+        self._peak_reset = False
+
+    def start_window(self, device: torch.device) -> tuple[float, bool]:
+        measured = self.seen_windows >= self.warmup_windows
+        if measured and not self._peak_reset and device.type == "cuda":
+            _synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            self._peak_reset = True
+        _synchronize(device)
+        return time.perf_counter(), measured
+
+    def finish_window(
+        self,
+        started_at: float,
+        measured: bool,
+        *,
+        device: torch.device,
+        temporal_module,
+        memory,
+    ) -> None:
+        _synchronize(device)
+        elapsed_ms = 1000.0 * (time.perf_counter() - started_at)
+        if measured:
+            self.latencies_ms.append(elapsed_ms)
+        self.seen_windows += 1
+        stats = temporal_module.get_memory_stats(memory)
+        self.history_elements = max(self.history_elements, int(stats["num_elements"]))
+        self.history_bytes = max(self.history_bytes, int(stats["bytes"]))
+
+    def summary(self, device: torch.device) -> dict:
+        mean_ms = float(np.mean(self.latencies_ms)) if self.latencies_ms else None
+        p95_ms = float(np.percentile(self.latencies_ms, 95)) if self.latencies_ms else None
+        peak_gb = None
+        if device.type == "cuda" and self._peak_reset:
+            peak_gb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 3))
+        return {
+            "mean_latency_ms": mean_ms,
+            "p95_latency_ms": p95_ms,
+            "throughput_windows_s": 1000.0 / mean_ms if mean_ms and mean_ms > 0 else None,
+            "history_elements": self.history_elements,
+            "history_buffer_bytes": self.history_bytes,
+            "history_buffer_mb": self.history_bytes / (1024 ** 2),
+            "peak_gpu_memory_gb": peak_gb,
+            "profile_warmup_windows": self.warmup_windows,
+            "profile_measured_windows": len(self.latencies_ms),
+            "profile_seen_windows": self.seen_windows,
+            "profiling_batch_size": 1,
+            "profiling_scope": "cached_visual_feature_to_score_logit",
+        }
+
+
+def profile_cached_video(
+    *,
+    model: StreamingVADGenerationModel,
+    tokenizer,
+    dataset: HIVAUDataset,
+    refs,
+    device: torch.device,
+    dtype: torch.dtype,
+    prompt_text: str,
+    profiler: OnlineInferenceProfiler,
+) -> None:
+    """Profile one stream window-by-window, with cache I/O outside timing."""
+    video_id = refs[0].video_id
+    embed_fn = _find_embed(model.qwen)
+    temporal_cache: dict = {}
+    with torch.no_grad():
+        for ref in refs:
+            batch = hivau_collate([dataset[ref.index]])
+            if "features" not in batch:
+                raise ValueError("online profiling requires --feature-cache-root")
+            valid_b, valid_w = batch["valid_mask"].nonzero(as_tuple=True)
+            for b_t, w_t in zip(valid_b, valid_w):
+                b = int(b_t.item())
+                w = int(w_t.item())
+                window = batch["features"][b:b + 1, w:w + 1].to(
+                    device=device, dtype=dtype,
+                )
+                valid_one = torch.ones(1, 1, dtype=torch.bool, device=device)
+                chunk_video_ids = [batch["video_id"][b]]
+                spatial_features = None
+                spatial_mask = None
+                if model.visual_fusion in SPATIAL_FUSION_MODES:
+                    if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
+                        raise ValueError(
+                            "spatial FiLM profiling requires spatial_features/spatial_mask"
+                        )
+                    spatial_features = batch["spatial_features"][
+                        b:b + 1, w:w + 1,
+                    ].to(device=device)
+                    spatial_mask = batch["spatial_mask"][b:b + 1, w:w + 1].to(device=device)
+
+                started_at, measured = profiler.start_window(device)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=dtype,
+                    enabled=(device.type == "cuda"),
+                ):
+                    if model.visual_fusion in SPATIAL_FUSION_MODES:
+                        state_emb, _, _, h_internal, temporal_cache = model.encode_window_features(
+                            window,
+                            valid_one,
+                            chunk_video_ids,
+                            temporal_cache,
+                            training=False,
+                            return_internal=True,
+                        )
+                        zero = torch.zeros(1, dtype=torch.long, device=device)
+                        visual_prefix, visual_prefix_mask = model.select_visual_prefix(
+                            state_emb,
+                            zero,
+                            zero,
+                            spatial_features,
+                            spatial_mask,
+                            h_internal,
+                        )
+                        logits = model.forward_score_visual_prefix(
+                            visual_prefix,
+                            visual_prefix_mask,
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                        )
+                    else:
+                        state_emb, _, _, temporal_cache = model.encode_window_features(
+                            window,
+                            valid_one,
+                            chunk_video_ids,
+                            temporal_cache,
+                            training=False,
+                        )
+                        logits = model.forward_score_token(
+                            state_emb[:, 0],
+                            embed_fn,
+                            tokenizer,
+                            prompt_text=prompt_text,
+                        )
+                profiler.finish_window(
+                    started_at,
+                    measured,
+                    device=device,
+                    temporal_module=model.ssm,
+                    memory=temporal_cache.get(video_id),
+                )
+                if logits.shape != (1,) or not bool(torch.isfinite(logits).all()):
+                    raise RuntimeError(
+                        f"{video_id}: invalid profiling score output shape/value {tuple(logits.shape)}"
+                    )
+    temporal_cache.pop(video_id, None)
 
 
 def infer_video(
@@ -537,8 +748,20 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--video-id", default="")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--temporal-model", choices=("auto", *TEMPORAL_MODELS), default="auto",
+                        help="auto restores the checkpoint temporal module; explicit values validate it")
+    parser.add_argument("--temporal-history", type=int, default=0,
+                        help="optional explicit history validation; 0 restores checkpoint metadata")
+    parser.add_argument("--profile-online", action="store_true",
+                        help="profile strict batch-1 cached-feature streaming before evaluation")
+    parser.add_argument("--profile-warmup-windows", type=int, default=16,
+                        help="number of initial streaming windows excluded from latency statistics")
     parser.add_argument("--debug-state", action="store_true")
     args = parser.parse_args()
+    if args.profile_warmup_windows < 0:
+        raise ValueError("--profile-warmup-windows must be non-negative")
+    if args.profile_online and not args.feature_cache_root:
+        raise ValueError("--profile-online requires --feature-cache-root")
 
     args.device = torch.device(args.device)
     output_dir = Path(args.output_dir)
@@ -564,6 +787,22 @@ def main() -> None:
         if selected_video_id not in grouped:
             raise ValueError(f"video_id={selected_video_id!r} not found in dataset")
         grouped = {selected_video_id: grouped[selected_video_id]}
+
+    profile_metrics = {}
+    if args.profile_online:
+        profiler = OnlineInferenceProfiler(args.profile_warmup_windows)
+        for refs in tqdm(grouped.values(), desc="Profile online windows"):
+            profile_cached_video(
+                model=model,
+                tokenizer=tokenizer,
+                dataset=dataset,
+                refs=refs,
+                device=args.device,
+                dtype=dtype,
+                prompt_text=prompt_text,
+                profiler=profiler,
+            )
+        profile_metrics = profiler.summary(args.device)
 
     all_gt = []
     all_standard = []
@@ -610,6 +849,12 @@ def main() -> None:
     total_windows = sum(int(v["num_windows"]) for v in videos)
 
     metrics = {
+        "temporal_model": model.temporal_model,
+        "temporal_history": model.temporal_history,
+        "visual_fusion": model.visual_fusion,
+        "inference_dtype": str(dtype),
+        "test_manifest": str(args.test_manifest),
+        "feature_cache_root": str(args.feature_cache_root),
         "num_videos": len(videos),
         "num_failed_videos": len(failed_videos),
         "failed_videos": failed_videos,
@@ -623,6 +868,9 @@ def main() -> None:
         "rtf_processing": total_processing_sec / total_video_sec if total_video_sec > 0 else None,
         "rtf_full": (total_processing_sec + total_data_sec) / total_video_sec if total_video_sec > 0 else None,
         "avg_window_ms": 1000.0 * total_processing_sec / max(total_windows, 1),
+        "temporal_params": model.temporal_param_count,
+        "trainable_params": model.training_trainable_param_count,
+        **profile_metrics,
         "videos": videos,
     }
     with open(output_dir / "metrics.json", "w") as f:

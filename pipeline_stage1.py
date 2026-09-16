@@ -11,6 +11,7 @@ Three objectives supported:
 """
 
 import argparse
+import json
 import math
 import os
 import random
@@ -44,6 +45,13 @@ from temporal import TemporalTokenReducer
 from spatial import SpatialTokenCompressor
 from spatial_film import SpatialFiLM
 from ssm_block import SSMBlock
+from temporal_modules import (
+    DEFAULT_TEMPORAL_HISTORY,
+    TEMPORAL_MODELS,
+    build_temporal_module,
+    checkpoint_temporal_config,
+    detach_temporal_memory,
+)
 from vit_forwarder import ViTForwarder
 from hivau_dataset import HIVAUDataset
 from mil_utils import (
@@ -495,7 +503,7 @@ def backward_generation_loss_microbatched(
 # ---------------------------------------------------------------------------
 
 class StreamingVADGenerationModel(nn.Module):
-    """ViT → spatial → pool → SSM → adapter → Qwen2-VL (full, LoRA)."""
+    """ViT → spatial → pool → temporal module → adapter → Qwen2-VL."""
 
     def __init__(
         self,
@@ -508,15 +516,27 @@ class StreamingVADGenerationModel(nn.Module):
         vit_micro_batch: int = 1,
         world_include_decoder: bool = True,
         visual_fusion: str = "state_only",
+        temporal_model: str = "ssm",
+        temporal_history: int = DEFAULT_TEMPORAL_HISTORY,
     ):
         super().__init__()
+        temporal_model = str(temporal_model).lower()
+        temporal_history = int(temporal_history)
         if visual_fusion not in VISUAL_FUSION_MODES:
             raise ValueError(f"unknown visual_fusion: {visual_fusion}")
         visual = _find_visual(qwen)
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
-        self.ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
-                            n_layers=n_ssm, llm_hidden=llm_hidden)
+        self.ssm = build_temporal_module(
+            temporal_model,
+            d_input=llm_hidden,
+            d_state=d_ssm,
+            output_dim=llm_hidden,
+            history_length=temporal_history,
+            ssm_layers=n_ssm,
+            ssm_cls=SSMBlock,
+            match_ssm_rng=True,
+        )
         self.adapter = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden),
             nn.GELU(),
@@ -559,6 +579,9 @@ class StreamingVADGenerationModel(nn.Module):
         self.register_buffer("ibq_codebook", codebook, persistent=False)
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
         self.llm_hidden = llm_hidden
+        self.d_ssm = d_ssm
+        self.temporal_model = temporal_model
+        self.temporal_history = temporal_history
         self.visual_fusion = visual_fusion
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
@@ -684,7 +707,7 @@ class StreamingVADGenerationModel(nn.Module):
         training: bool = True,
         return_internal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        """SSM + gated residual over precomputed per-window visual vectors."""
+        """Causal temporal module + gated residual over pooled window vectors."""
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
         ssm_param = next(self.ssm.parameters())
         adapter_param = next(self.adapter.parameters())
@@ -695,7 +718,7 @@ class StreamingVADGenerationModel(nn.Module):
         )
         h_internal = torch.zeros(
             window_batch.shape[0], window_batch.shape[1],
-            self.ssm.in_proj[0].out_features,
+            self.d_ssm,
             device=ssm_param.device, dtype=ssm_param.dtype,
         )
         for b in range(window_batch.shape[0]):
@@ -707,10 +730,11 @@ class StreamingVADGenerationModel(nn.Module):
             prev = ssm_state_cache.get(vid)
             had_prev = prev is not None
             if training and prev is not None:
-                prev = {i: s.detach() for i, s in prev.items()}
+                prev = detach_temporal_memory(prev)
             if self.debug_state:
                 print(
-                    f"SSM_STATE video_id={vid} valid_windows={len(bw)} "
+                    f"TEMPORAL_STATE model={self.temporal_model} video_id={vid} "
+                    f"valid_windows={len(bw)} "
                     f"reuse_prev={had_prev} detached={bool(training and had_prev)}"
                 )
             out, new_st, internal = self.ssm.forward_chunk(
@@ -1990,6 +2014,10 @@ def main():
     parser.add_argument("--lora-r", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--d-ssm", type=int, default=256)
+    parser.add_argument("--temporal-model", choices=TEMPORAL_MODELS, default="ssm",
+                       help="causal temporal module; ssm preserves the original Mamba path")
+    parser.add_argument("--temporal-history", type=int, default=DEFAULT_TEMPORAL_HISTORY,
+                       help="maximum explicit history for STC/Q-Former/Transformer baselines")
     parser.add_argument("--frames-per-clip", type=int, default=16,
                        help="frames per clip window")
     parser.add_argument("--sample-interval", type=int, default=3,
@@ -2033,7 +2061,7 @@ def main():
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
     parser.add_argument("--debug-state", action="store_true",
-                       help="print SSM state reuse/detach/clear events for streaming checks")
+                       help="print temporal state reuse/detach/clear events for streaming checks")
     parser.add_argument("--debug-device", action="store_true",
                        help="print Mamba tensor devices once before the first Triton scan")
     parser.add_argument("--seed", type=int, default=42)
@@ -2044,12 +2072,14 @@ def main():
                             "training continues from the next epoch with restored optimizer/scheduler")
     parser.add_argument("--init-checkpoint", default="",
                        help="path to a saved checkpoint dir for cross-stage initialization: "
-                            "restores model weights only (SSM/adapter/heads/queries/alpha/LoRA/"
+                            "restores model weights only (temporal/adapter/heads/queries/alpha/LoRA/"
                             "world_branch); optimizer/scheduler stay fresh and training starts "
                             "from epoch 0. Mutually exclusive with --resume.")
     args = parser.parse_args()
     if args.save_every < 1:
         raise ValueError("--save-every must be >= 1")
+    if args.temporal_history < 1:
+        raise ValueError("--temporal-history must be >= 1")
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.visual_fusion in SPATIAL_FUSION_MODES and args.objective != "score_token":
@@ -2123,6 +2153,8 @@ def main():
         qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=args.vit_micro_batch,
         visual_fusion=args.visual_fusion,
+        temporal_model=args.temporal_model,
+        temporal_history=args.temporal_history,
     ).to(device)
     model.debug_state = bool(args.debug_state)
     model.ssm.debug_device = bool(args.debug_device)
@@ -2147,15 +2179,27 @@ def main():
     # ---- param counts ----
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    ssm_params = sum(p.numel() for p in model.ssm.parameters())
+    temporal_params = sum(p.numel() for p in model.ssm.parameters())
     adapter_params = sum(p.numel() for p in model.adapter.parameters())
     lora_params = sum(p.numel() for n, p in qwen.named_parameters() if p.requires_grad and "lora" in n)
     vit_trainable = sum(p.numel() for p in _find_visual(qwen).parameters() if p.requires_grad)
+    print(f"Temporal Model : {args.temporal_model}")
+    print(f"Total Params   : {total}")
+    print(f"Trainable      : {trainable}")
+    print(f"Temporal Params: {temporal_params}")
     print(f"Params: total={total/1e6:.1f}M  trainable={trainable/1e6:.1f}M  "
-          f"SSM={ssm_params/1e3:.0f}K  adapter={adapter_params/1e3:.0f}K  "
+          f"temporal={temporal_params/1e3:.0f}K  adapter={adapter_params/1e3:.0f}K  "
           f"LoRA={lora_params/1e3:.0f}K  vit_trainable={vit_trainable}")
     assert vit_trainable == 0, "ViT should be frozen"
-    assert ssm_params > 0 and adapter_params > 0 and lora_params > 0
+    assert temporal_params > 0 and adapter_params > 0 and lora_params > 0
+    with open(Path(args.log_dir) / "temporal_config.json", "w") as f:
+        json.dump({
+            "temporal_model": args.temporal_model,
+            "temporal_config": model.ssm.get_config(),
+            "total_params": total,
+            "trainable_params": trainable,
+            "temporal_params": temporal_params,
+        }, f, indent=2)
 
     # ---- data ----
     train_ds = HIVAUDataset(
@@ -2286,6 +2330,11 @@ def main():
             raise FileNotFoundError(f"{mode} LoRA adapter not found: {lora_dir}")
 
         ckpt = torch.load(state_path, map_location="cpu", weights_only=True)
+        checkpoint_temporal_config(
+            ckpt,
+            requested_model=args.temporal_model,
+            requested_history=args.temporal_history,
+        )
 
         # config consistency: silently resuming with different data/model
         # config produces garbage — fail loudly instead
@@ -2459,6 +2508,12 @@ def main():
         model.qwen.save_pretrained(str(ckpt_dir / "lora_adapter"))
         torch.save({
             "ssm": model.ssm.state_dict(),
+            "temporal_model": args.temporal_model,
+            "temporal_config": model.ssm.get_config(),
+            "temporal_state_dim": args.d_ssm,
+            "temporal_history": args.temporal_history,
+            "temporal_params": temporal_params,
+            "trainable_params": trainable,
             "adapter": model.adapter.state_dict(),
             "score_head": model.score_head.state_dict(),
             "world_branch": model.world_branch.state_dict(),

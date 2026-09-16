@@ -53,11 +53,26 @@ class _Loadable:
     def load_state_dict(self, state):
         self.loaded = state
 
+    def parameters(self):
+        return iter(())
+
 
 class _FakeStage1Model:
-    def __init__(self, qwen, d_ssm, llm_hidden, vit_micro_batch, world_include_decoder, visual_fusion):
+    def __init__(
+        self,
+        qwen,
+        d_ssm,
+        llm_hidden,
+        vit_micro_batch,
+        world_include_decoder,
+        visual_fusion,
+        temporal_model="ssm",
+        temporal_history=16,
+    ):
         self.qwen = qwen
         self.visual_fusion = visual_fusion
+        self.temporal_model = temporal_model
+        self.temporal_history = temporal_history
         self.ssm = _Loadable()
         self.adapter = _Loadable()
         self.spatial_film = _Loadable()
@@ -75,8 +90,16 @@ class _FakeStage1Model:
         self.eval_called = True
         return self
 
+    def named_parameters(self):
+        return iter(())
 
-def _state(visual_fusion="state_only", include_spatial_film=True):
+
+def _state(
+    visual_fusion="state_only",
+    include_spatial_film=True,
+    temporal_model="ssm",
+    temporal_history=16,
+):
     out = {
         "frames_per_clip": 16,
         "sample_interval": 3,
@@ -92,6 +115,11 @@ def _state(visual_fusion="state_only", include_spatial_film=True):
         "summary_query": torch.randn(1, 4),
         "alpha_logit": torch.tensor(0.25),
         "visual_fusion": visual_fusion,
+        "temporal_model": temporal_model,
+        "temporal_history": temporal_history,
+        "temporal_config": {"name": temporal_model, "history_length": temporal_history},
+        "temporal_params": 123,
+        "trainable_params": 456,
     }
     if include_spatial_film:
         out["spatial_film"] = {"film": torch.ones(1)}
@@ -155,6 +183,11 @@ def test_load_stage1_model_state_only_keeps_old_checkpoint_compatible(monkeypatc
     infer = _import_infer(monkeypatch)
     state = _state("state_only", include_spatial_film=False)
     state.pop("visual_fusion")
+    state.pop("temporal_model")
+    state.pop("temporal_history")
+    state.pop("temporal_config")
+    state.pop("temporal_params")
+    state.pop("trainable_params")
     monkeypatch.setattr(infer.torch, "load", lambda *args, **kwargs: state)
     monkeypatch.setattr(infer, "StreamingVADGenerationModel", _FakeStage1Model)
     monkeypatch.setattr(infer, "_load_temporal_conditioning", lambda *args, **kwargs: None)
@@ -162,7 +195,34 @@ def test_load_stage1_model_state_only_keeps_old_checkpoint_compatible(monkeypatc
     model, *_ = infer.load_stage1_model(_args(tmp_path))
 
     assert model.visual_fusion == "state_only"
+    assert model.temporal_model == "ssm"
     assert model.spatial_film.loaded is None
+
+
+def test_load_stage1_model_auto_restores_temporal_baseline(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    state = _state("state_only", temporal_model="lstm", temporal_history=16)
+    monkeypatch.setattr(infer.torch, "load", lambda *args, **kwargs: state)
+    monkeypatch.setattr(infer, "StreamingVADGenerationModel", _FakeStage1Model)
+    monkeypatch.setattr(infer, "_load_temporal_conditioning", lambda *args, **kwargs: None)
+
+    model, *_ = infer.load_stage1_model(_args(tmp_path))
+
+    assert model.temporal_model == "lstm"
+    assert model.temporal_history == 16
+    assert model.ssm.loaded is state["ssm"]
+
+
+def test_load_stage1_model_rejects_explicit_temporal_mismatch(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    args = _args(tmp_path)
+    args.temporal_model = "transformer"
+    monkeypatch.setattr(
+        infer.torch, "load", lambda *args, **kwargs: _state(temporal_model="lstm"),
+    )
+
+    with pytest.raises(ValueError, match="temporal model mismatch"):
+        infer.load_stage1_model(args)
 
 
 class _Ref:
@@ -200,18 +260,28 @@ class _Dataset:
         return self.batch
 
 
+class _ProfileTemporal:
+    def get_memory_stats(self, memory):
+        if memory is None:
+            return {"num_elements": 0, "bytes": 0}
+        return {"num_elements": memory.numel(), "bytes": memory.numel() * memory.element_size()}
+
+
 class _InferModel:
     visual_fusion = "film_spatial"
 
     def __init__(self):
         self.qwen = object()
+        self.ssm = _ProfileTemporal()
         self.used_visual_prefix = False
         self.used_state_score = False
 
     def encode_window_features(self, window_batch, valid_mask, video_ids, ssm_cache, training, return_internal=False):
         assert return_internal
-        state = torch.randn(1, 2, 4)
-        h_internal = torch.randn(1, 2, 4)
+        num_windows = window_batch.shape[1]
+        state = torch.randn(1, num_windows, 4)
+        h_internal = torch.randn(1, num_windows, 4)
+        ssm_cache[video_ids[0]] = torch.zeros(num_windows, 4)
         return state, window_batch, torch.zeros_like(window_batch), h_internal, ssm_cache
 
     def select_visual_prefix(self, state_emb, valid_b, valid_w, spatial_features, spatial_mask, h_internal):
@@ -219,14 +289,16 @@ class _InferModel:
         assert spatial_mask is not None
         assert h_internal is not None
         self.used_visual_prefix = True
-        return torch.randn(2, 2, 4), torch.tensor([[True, False], [True, True]])
+        count = len(valid_b)
+        return torch.randn(count, 2, 4), torch.ones(count, 2, dtype=torch.bool)
 
     def forward_score_visual_prefix(
         self, visual_prefix, visual_mask, embed_fn, tokenizer, prompt_text, return_hidden=False,
     ):
         assert self.used_visual_prefix
-        logits = torch.tensor([0.1, -0.2])
-        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        count = visual_prefix.shape[0]
+        logits = torch.tensor([0.1, -0.2])[:count]
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])[:count]
         return (logits, hidden) if return_hidden else logits
 
     def forward_score_token(self, *args, **kwargs):
@@ -239,7 +311,9 @@ class _StateOnlyInferModel(_InferModel):
 
     def encode_window_features(self, window_batch, valid_mask, video_ids, ssm_cache, training, return_internal=False):
         assert not return_internal
-        state = torch.randn(1, 2, 4)
+        num_windows = window_batch.shape[1]
+        state = torch.randn(1, num_windows, 4)
+        ssm_cache[video_ids[0]] = torch.zeros(num_windows, 4)
         return state, window_batch, torch.zeros_like(window_batch), ssm_cache
 
     def select_visual_prefix(self, *args, **kwargs):
@@ -250,13 +324,63 @@ class _StateOnlyInferModel(_InferModel):
 
     def forward_score_token(self, states, embed_fn, tokenizer, prompt_text, return_hidden=False):
         self.used_state_score = True
-        logits = torch.tensor([0.1, -0.2])
-        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        count = states.shape[0]
+        logits = torch.tensor([0.1, -0.2])[:count]
+        hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])[:count]
         return (logits, hidden) if return_hidden else logits
 
 
 class _StateSpatialInferModel(_InferModel):
     visual_fusion = "state_spatial_film"
+
+
+def test_online_profiler_excludes_warmup_and_uses_actual_memory(monkeypatch):
+    infer = _import_infer(monkeypatch)
+    times = iter([0.0, 1.0, 2.0, 2.01, 3.0, 3.02])
+    monkeypatch.setattr(infer.time, "perf_counter", lambda: next(times))
+    profiler = infer.OnlineInferenceProfiler(warmup_windows=1)
+    temporal = _ProfileTemporal()
+    device = torch.device("cpu")
+    for memory in (torch.zeros(2), torch.zeros(4), torch.zeros(8)):
+        started, measured = profiler.start_window(device)
+        profiler.finish_window(
+            started,
+            measured,
+            device=device,
+            temporal_module=temporal,
+            memory=memory,
+        )
+    summary = profiler.summary(device)
+    assert summary["profile_seen_windows"] == 3
+    assert summary["profile_measured_windows"] == 2
+    assert summary["mean_latency_ms"] == pytest.approx(15.0)
+    assert summary["p95_latency_ms"] == pytest.approx(19.5)
+    assert summary["throughput_windows_s"] == pytest.approx(1000.0 / 15.0)
+    assert summary["history_elements"] == 8
+    assert summary["history_buffer_bytes"] == 32
+
+
+def test_cached_online_profile_is_strictly_single_window(monkeypatch):
+    infer = _import_infer(monkeypatch)
+    model = _InferModel()
+    monkeypatch.setattr(infer, "hivau_collate", lambda items: items[0])
+    monkeypatch.setattr(infer, "_find_embed", lambda qwen: torch.nn.Embedding(8, 4))
+    profiler = infer.OnlineInferenceProfiler(warmup_windows=0)
+    infer.profile_cached_video(
+        model=model,
+        tokenizer=type("Tok", (), {})(),
+        dataset=_Dataset(_cached_batch(include_spatial=True)),
+        refs=[_Ref()],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prompt_text="prompt",
+        profiler=profiler,
+    )
+    summary = profiler.summary(torch.device("cpu"))
+    assert summary["profile_seen_windows"] == 2
+    assert summary["profile_measured_windows"] == 2
+    assert summary["profiling_batch_size"] == 1
+    assert model.used_visual_prefix
 
 
 def test_film_spatial_cached_inference_uses_visual_prefix_path(monkeypatch, tmp_path):
