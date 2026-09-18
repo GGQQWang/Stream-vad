@@ -28,6 +28,7 @@ from pipeline_stage1 import (
     _load_temporal_conditioning,
 )
 from temporal_modules import TEMPORAL_MODELS, checkpoint_temporal_config
+from ucf_eval_utils import load_gt
 
 
 FRAMES_PER_CLIP = 16
@@ -231,17 +232,6 @@ def _auc_ap(scores: np.ndarray, gt: np.ndarray) -> tuple[float | None, float | N
     except ImportError:
         raise ImportError("scikit-learn is required for UCF evaluation")
     return float(roc_auc_score(gt, scores)), float(average_precision_score(gt, scores))
-
-
-def load_gt(gt_root: str | Path, video_id: str, n_frames: int) -> np.ndarray:
-    path = Path(gt_root) / f"{video_id}.txt"
-    if not path.is_file():
-        raise FileNotFoundError(f"missing GT file: {path}")
-    gt = np.loadtxt(path, dtype=np.int64)
-    gt = np.atleast_1d(gt).astype(np.int64)
-    if len(gt) != int(n_frames):
-        raise ValueError(f"{video_id}: GT length={len(gt)}, expected n_frames={n_frames}")
-    return gt
 
 
 def save_window_csv(path: Path, rows: List[dict]) -> None:
@@ -448,6 +438,7 @@ def infer_video(
     gt_root: str | Path,
     debug_state: bool,
     collect_score_hidden: bool = False,
+    write_outputs: bool = True,
 ) -> dict:
     video_id = refs[0].video_id
     first_meta = dataset.samples[refs[0].index]
@@ -647,7 +638,8 @@ def infer_video(
             )
     if int(rows[-1]["end_frame"]) != n_frames:
         raise ValueError(f"{video_id}: last window ends at {rows[-1]['end_frame']}, expected n_frames={n_frames}")
-    save_window_csv(output_dir / f"{video_id}_window_scores.csv", rows)
+    if write_outputs:
+        save_window_csv(output_dir / f"{video_id}_window_scores.csv", rows)
 
     standard_scores = np.zeros(n_frames, dtype=np.float32)
     causal_scores = np.full(n_frames, np.nan, dtype=np.float32)
@@ -664,9 +656,10 @@ def infer_video(
             causal_scores[start:next_end] = float(row["score_prob"])
             causal_valid[start:next_end] = True
 
-    np.save(output_dir / f"{video_id}_standard_frame_scores.npy", standard_scores)
-    np.save(output_dir / f"{video_id}_causal_frame_scores.npy", causal_scores)
-    np.save(output_dir / f"{video_id}_causal_valid_mask.npy", causal_valid)
+    if write_outputs:
+        np.save(output_dir / f"{video_id}_standard_frame_scores.npy", standard_scores)
+        np.save(output_dir / f"{video_id}_causal_frame_scores.npy", causal_scores)
+        np.save(output_dir / f"{video_id}_causal_valid_mask.npy", causal_valid)
 
     standard_auc, standard_ap = _auc_ap(standard_scores, gt)
     causal_auc, causal_ap = _auc_ap(causal_scores[causal_valid], gt[causal_valid]) if causal_valid.any() else (None, None)
