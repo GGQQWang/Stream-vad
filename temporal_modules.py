@@ -13,6 +13,8 @@ from ssm_block import SSMBlock
 
 TEMPORAL_MODELS = ("ssm", "lstm", "stc", "qformer", "transformer")
 DEFAULT_TEMPORAL_HISTORY = 16
+RECURRENT_TEMPORAL_MODELS = frozenset({"ssm", "lstm"})
+EXPLICIT_HISTORY_TEMPORAL_MODELS = frozenset({"stc", "qformer", "transformer"})
 
 
 def detach_temporal_memory(memory):
@@ -57,6 +59,135 @@ def temporal_memory_stats(memory) -> dict[str, int]:
         "num_elements": int(sum(tensor.numel() for tensor in tensors)),
         "bytes": int(sum(tensor.numel() * tensor.element_size() for tensor in tensors)),
     }
+
+
+def validate_temporal_horizon(
+    module: nn.Module,
+    horizon: int,
+    *,
+    max_horizon: int | None = None,
+) -> int:
+    """Validate an inference horizon against checkpoint/module capacity."""
+    horizon = int(horizon)
+    if horizon < 1:
+        raise ValueError("history horizon must be positive")
+    if max_horizon is not None and horizon > int(max_horizon):
+        raise ValueError(
+            f"history horizon {horizon} exceeds checkpoint capacity {int(max_horizon)}"
+        )
+    model_name = str(getattr(module, "temporal_model", ""))
+    if model_name not in TEMPORAL_MODELS:
+        raise ValueError(f"unknown temporal model {model_name!r}")
+    capacity = getattr(module, "history_length", None)
+    if model_name in EXPLICIT_HISTORY_TEMPORAL_MODELS:
+        if capacity is None or horizon > int(capacity):
+            raise ValueError(
+                f"history horizon {horizon} exceeds {model_name} capacity {capacity}"
+            )
+    return horizon
+
+
+def truncate_explicit_temporal_memory(
+    module: nn.Module,
+    memory,
+    horizon: int,
+    *,
+    before_step: bool = False,
+):
+    """Cap an explicit-history buffer without changing recurrent state."""
+    horizon = validate_temporal_horizon(module, horizon)
+    model_name = str(module.temporal_model)
+    if model_name not in EXPLICIT_HISTORY_TEMPORAL_MODELS or memory is None:
+        return memory
+    if not isinstance(memory, torch.Tensor) or memory.ndim != 3:
+        raise ValueError(
+            f"{model_name} temporal memory must be [B, T, D], got {type(memory)!r}"
+        )
+    keep = horizon - 1 if before_step else horizon
+    if keep == 0:
+        return memory[:, :0]
+    return memory[:, -keep:]
+
+
+class StrictHorizonTemporalRunner:
+    """Evaluate each state from exactly the most recent ``horizon`` inputs.
+
+    SSM/LSTM are replayed from zero state using only the lightweight temporal
+    module. Explicit-history models retain and cap their projected input
+    buffer, which is mathematically equivalent to passing the recent prefix.
+    """
+
+    def __init__(self, module: nn.Module, horizon: int, *, max_horizon: int | None = None):
+        self.module = module
+        self.horizon = validate_temporal_horizon(
+            module, horizon, max_horizon=max_horizon,
+        )
+        self.temporal_model = str(module.temporal_model)
+        self.reset()
+
+    def reset(self) -> None:
+        self._input_history = None
+        self._memory = None
+        self.num_predictions = 0
+        self.num_replayed_inputs = 0
+
+    @property
+    def retained_input_count(self) -> int:
+        if self.temporal_model in RECURRENT_TEMPORAL_MODELS:
+            return 0 if self._input_history is None else int(self._input_history.shape[1])
+        return 0 if self._memory is None else int(self._memory.shape[1])
+
+    def step(self, x_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if x_t.ndim != 2:
+            raise ValueError(f"temporal step input must be [B, D], got {tuple(x_t.shape)}")
+        if self.temporal_model in RECURRENT_TEMPORAL_MODELS:
+            current = x_t.unsqueeze(1)
+            history = (
+                current
+                if self._input_history is None
+                else torch.cat([self._input_history, current], dim=1)
+            )
+            self._input_history = history[:, -self.horizon:]
+            output, _, internal = self.module.forward_chunk(
+                self._input_history,
+                state=None,
+                return_internal=True,
+            )
+            self.num_replayed_inputs += int(self._input_history.shape[1])
+        else:
+            memory = truncate_explicit_temporal_memory(
+                self.module,
+                self._memory,
+                self.horizon,
+                before_step=True,
+            )
+            output, memory, internal = self.module.forward_chunk(
+                x_t.unsqueeze(1),
+                state=memory,
+                return_internal=True,
+            )
+            self._memory = truncate_explicit_temporal_memory(
+                self.module, memory, self.horizon,
+            )
+            self.num_replayed_inputs += 1
+        self.num_predictions += 1
+        return output[:, -1], internal[:, -1]
+
+    def forward_chunk(self, inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if inputs.ndim != 3:
+            raise ValueError(f"temporal inputs must be [B, T, D], got {tuple(inputs.shape)}")
+        outputs = []
+        internal = []
+        for index in range(inputs.shape[1]):
+            output_t, internal_t = self.step(inputs[:, index])
+            outputs.append(output_t)
+            internal.append(internal_t)
+        if not outputs:
+            return (
+                inputs.new_empty(inputs.shape[0], 0, int(self.module.output_dim)),
+                inputs.new_empty(inputs.shape[0], 0, int(self.module.state_dim)),
+            )
+        return torch.stack(outputs, dim=1), torch.stack(internal, dim=1)
 
 
 class CausalTemporalModule(nn.Module):

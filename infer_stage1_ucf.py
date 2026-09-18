@@ -27,7 +27,14 @@ from pipeline_stage1 import (
     _find_embed,
     _load_temporal_conditioning,
 )
-from temporal_modules import TEMPORAL_MODELS, checkpoint_temporal_config
+from temporal_modules import (
+    EXPLICIT_HISTORY_TEMPORAL_MODELS,
+    StrictHorizonTemporalRunner,
+    TEMPORAL_MODELS,
+    checkpoint_temporal_config,
+    truncate_explicit_temporal_memory,
+    validate_temporal_horizon,
+)
 from ucf_eval_utils import load_gt
 
 
@@ -96,7 +103,6 @@ def _check_stage1_config(state: dict, model_path: str) -> None:
     expected = {
         "frames_per_clip": FRAMES_PER_CLIP,
         "sample_interval": SAMPLE_INTERVAL,
-        "max_windows": MAX_WINDOWS,
         "min_pixels": MIN_PIXELS,
         "max_pixels": MAX_PIXELS,
     }
@@ -334,11 +340,16 @@ def profile_cached_video(
     dtype: torch.dtype,
     prompt_text: str,
     profiler: OnlineInferenceProfiler,
+    history_horizon: int | None = None,
 ) -> None:
     """Profile one stream window-by-window, with cache I/O outside timing."""
     video_id = refs[0].video_id
     embed_fn = _find_embed(model.qwen)
     temporal_cache: dict = {}
+    if history_horizon is not None:
+        validate_temporal_horizon(
+            model.ssm, history_horizon, max_horizon=model.temporal_history,
+        )
     with torch.no_grad():
         for ref in refs:
             batch = hivau_collate([dataset[ref.index]])
@@ -366,6 +377,17 @@ def profile_cached_video(
                     spatial_mask = batch["spatial_mask"][b:b + 1, w:w + 1].to(device=device)
 
                 started_at, measured = profiler.start_window(device)
+                if (
+                    history_horizon is not None
+                    and model.temporal_model in EXPLICIT_HISTORY_TEMPORAL_MODELS
+                    and video_id in temporal_cache
+                ):
+                    temporal_cache[video_id] = truncate_explicit_temporal_memory(
+                        model.ssm,
+                        temporal_cache[video_id],
+                        history_horizon,
+                        before_step=True,
+                    )
                 with torch.autocast(
                     device_type=device.type,
                     dtype=dtype,
@@ -439,6 +461,7 @@ def infer_video(
     debug_state: bool,
     collect_score_hidden: bool = False,
     write_outputs: bool = True,
+    history_horizon: int | None = None,
 ) -> dict:
     video_id = refs[0].video_id
     first_meta = dataset.samples[refs[0].index]
@@ -449,6 +472,13 @@ def infer_video(
     ssm_cache: dict = {}
     rows: List[dict] = []
     score_hidden_by_window: Dict[int, torch.Tensor] = {}
+    strict_runner = None
+    if history_horizon is not None:
+        strict_runner = StrictHorizonTemporalRunner(
+            model.ssm,
+            history_horizon,
+            max_horizon=model.temporal_history,
+        )
 
     # timing accumulators (wall-clock; processing excludes data loading)
     data_loading_sec = 0.0
@@ -480,7 +510,20 @@ def infer_video(
             if "features" in batch:
                 window_batch = batch["features"].to(device=device, dtype=dtype)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
-                    if model.visual_fusion in SPATIAL_FUSION_MODES:
+                    if strict_runner is not None:
+                        state_emb, _, _, h_internal = model.encode_window_features_strict_horizon(
+                            window_batch,
+                            valid_mask,
+                            strict_runner,
+                        )
+                        if model.visual_fusion in SPATIAL_FUSION_MODES:
+                            if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
+                                raise ValueError(
+                                    "spatial FiLM inference requires spatial_features/spatial_mask"
+                                )
+                            spatial_features = batch["spatial_features"].to(device=device)
+                            spatial_mask = batch["spatial_mask"].to(device=device)
+                    elif model.visual_fusion in SPATIAL_FUSION_MODES:
                         if batch.get("spatial_features") is None or batch.get("spatial_mask") is None:
                             raise ValueError("spatial FiLM inference requires spatial_features/spatial_mask")
                         state_emb, _, _, h_internal, ssm_cache = model.encode_window_features(
@@ -502,6 +545,8 @@ def infer_video(
                             training=False,
                         )
             else:
+                if strict_runner is not None:
+                    raise ValueError("strict history-horizon evaluation requires cached features")
                 frames = batch["frames"][0]
                 valid_w_cpu = valid_mask_cpu[0].nonzero(as_tuple=True)[0]
                 clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
@@ -621,6 +666,8 @@ def infer_video(
 
     if video_id in ssm_cache:
         ssm_cache.pop(video_id, None)
+    if strict_runner is not None:
+        strict_runner.reset()
     if debug_state:
         print(f"SSM_STATE_CLEAR video={video_id}")
 

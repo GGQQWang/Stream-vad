@@ -261,6 +261,9 @@ class _Dataset:
 
 
 class _ProfileTemporal:
+    temporal_model = "ssm"
+    history_length = None
+
     def get_memory_stats(self, memory):
         if memory is None:
             return {"num_elements": 0, "bytes": 0}
@@ -269,12 +272,16 @@ class _ProfileTemporal:
 
 class _InferModel:
     visual_fusion = "film_spatial"
+    temporal_model = "ssm"
+    temporal_history = 64
 
     def __init__(self):
         self.qwen = object()
         self.ssm = _ProfileTemporal()
         self.used_visual_prefix = False
         self.used_state_score = False
+        self.score_forward_calls = 0
+        self.strict_encode_calls = 0
 
     def encode_window_features(self, window_batch, valid_mask, video_ids, ssm_cache, training, return_internal=False):
         assert return_internal
@@ -296,6 +303,7 @@ class _InferModel:
         self, visual_prefix, visual_mask, embed_fn, tokenizer, prompt_text, return_hidden=False,
     ):
         assert self.used_visual_prefix
+        self.score_forward_calls += 1
         count = visual_prefix.shape[0]
         logits = torch.tensor([0.1, -0.2])[:count]
         hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])[:count]
@@ -332,6 +340,20 @@ class _StateOnlyInferModel(_InferModel):
 
 class _StateSpatialInferModel(_InferModel):
     visual_fusion = "state_spatial_film"
+
+
+class _StrictInferModel(_InferModel):
+    def __init__(self, temporal_model="ssm"):
+        super().__init__()
+        self.temporal_model = temporal_model
+        self.ssm.temporal_model = temporal_model
+
+    def encode_window_features_strict_horizon(self, window_batch, valid_mask, runner):
+        self.strict_encode_calls += 1
+        num_windows = window_batch.shape[1]
+        state = torch.randn(1, num_windows, 4)
+        internal = torch.randn(1, num_windows, 4)
+        return state, window_batch, torch.zeros_like(window_batch), internal
 
 
 def test_online_profiler_excludes_warmup_and_uses_actual_memory(monkeypatch):
@@ -489,6 +511,36 @@ def test_infer_video_optionally_collects_score_head_input_hidden(monkeypatch, tm
 
     assert [row["window_index"] for row in result["window_rows"]] == [0, 1]
     assert torch.equal(result["score_hidden"], torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+
+@pytest.mark.parametrize("temporal_model", ("ssm", "lstm"))
+def test_strict_replay_runs_temporal_path_without_replaying_qwen(
+    monkeypatch, tmp_path, temporal_model,
+):
+    infer = _import_infer(monkeypatch)
+    model = _StrictInferModel(temporal_model)
+    monkeypatch.setattr(infer, "hivau_collate", lambda items: items[0])
+    monkeypatch.setattr(infer, "load_gt", lambda *args, **kwargs: np.zeros(10, dtype=np.int64))
+    monkeypatch.setattr(infer, "_find_embed", lambda qwen: torch.nn.Embedding(8, 4))
+
+    result = infer.infer_video(
+        model=model,
+        processor=None,
+        tokenizer=type("Tok", (), {})(),
+        dataset=_Dataset(_cached_batch(include_spatial=True)),
+        refs=[_Ref()],
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        prompt_text="prompt",
+        output_dir=tmp_path,
+        gt_root=tmp_path,
+        debug_state=False,
+        history_horizon=4,
+    )
+
+    assert result["num_windows"] == 2
+    assert model.strict_encode_calls == 1
+    assert model.score_forward_calls == 1
 
 
 def test_film_spatial_cached_inference_missing_spatial_cache_fails(monkeypatch, tmp_path):

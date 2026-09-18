@@ -47,6 +47,7 @@ from spatial_film import SpatialFiLM
 from ssm_block import SSMBlock
 from temporal_modules import (
     DEFAULT_TEMPORAL_HISTORY,
+    StrictHorizonTemporalRunner,
     TEMPORAL_MODELS,
     build_temporal_module,
     checkpoint_temporal_config,
@@ -710,7 +711,6 @@ class StreamingVADGenerationModel(nn.Module):
         """Causal temporal module + gated residual over pooled window vectors."""
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
         ssm_param = next(self.ssm.parameters())
-        adapter_param = next(self.adapter.parameters())
         ssm_out = torch.zeros(
             window_batch.shape,
             device=ssm_param.device,
@@ -746,16 +746,66 @@ class StreamingVADGenerationModel(nn.Module):
             ssm_out[b, bw] = out.squeeze(0).to(device=ssm_out.device, dtype=ssm_out.dtype)
             ssm_state_cache[vid] = new_st
 
-        ssm_out = ssm_out.to(device=adapter_param.device, dtype=adapter_param.dtype)
+        state_embeddings, h_internal = self.compose_window_states(
+            window_batch, ssm_out, h_internal, valid_mask,
+        )
+        if return_internal:
+            return state_embeddings, window_batch, ssm_out, h_internal, ssm_state_cache
+        return state_embeddings, window_batch, ssm_out, ssm_state_cache
+
+    def compose_window_states(
+        self,
+        window_batch: torch.Tensor,
+        temporal_output: torch.Tensor,
+        h_internal: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply the unchanged adapter/modulation path to temporal outputs."""
+        adapter_param = next(self.adapter.parameters())
+        ssm_out = temporal_output.to(device=adapter_param.device, dtype=adapter_param.dtype)
         delta = self.adapter(ssm_out)
         alpha = torch.sigmoid(self.alpha_logit).to(device=delta.device, dtype=delta.dtype)
         base = window_batch.to(device=delta.device, dtype=delta.dtype)
         h_internal = h_internal.to(device=base.device, dtype=base.dtype)
         modulated_base = self._apply_temporal_modulation(base, h_internal, valid_mask)
         state_embeddings = modulated_base + alpha * delta
-        if return_internal:
-            return state_embeddings, window_batch, ssm_out, h_internal, ssm_state_cache
-        return state_embeddings, window_batch, ssm_out, ssm_state_cache
+        return state_embeddings, h_internal
+
+    def encode_window_features_strict_horizon(
+        self,
+        window_batch: torch.Tensor,
+        valid_mask: torch.Tensor,
+        runner: StrictHorizonTemporalRunner,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode one batch-1 chunk with strict sliding temporal history."""
+        if window_batch.shape[:2] != valid_mask.shape:
+            raise ValueError("window_batch and valid_mask dimensions do not match")
+        if window_batch.shape[0] != 1:
+            raise ValueError("strict horizon inference requires one video stream per batch")
+        valid_w = valid_mask[0].nonzero(as_tuple=True)[0]
+        ssm_param = next(self.ssm.parameters())
+        temporal_output = torch.zeros(
+            window_batch.shape,
+            device=ssm_param.device,
+            dtype=ssm_param.dtype,
+        )
+        h_internal = torch.zeros(
+            window_batch.shape[0], window_batch.shape[1], self.d_ssm,
+            device=ssm_param.device,
+            dtype=ssm_param.dtype,
+        )
+        if len(valid_w):
+            inputs = window_batch[0, valid_w].to(
+                device=ssm_param.device,
+                dtype=ssm_param.dtype,
+            ).unsqueeze(0)
+            output, internal = runner.forward_chunk(inputs)
+            temporal_output[0, valid_w] = output[0]
+            h_internal[0, valid_w] = internal[0]
+        state_embeddings, h_internal = self.compose_window_states(
+            window_batch, temporal_output, h_internal, valid_mask,
+        )
+        return state_embeddings, window_batch, temporal_output, h_internal
 
     def extract_window_features(
         self,
@@ -1432,6 +1482,25 @@ def _clear_finished_states(model: StreamingVADGenerationModel, batch: dict, ssm_
                 print(f"SSM_STATE_CLEAR video_id={vid} existed={existed}")
 
 
+def _clear_training_chunk_states(
+    model: StreamingVADGenerationModel,
+    batch: dict,
+    temporal_cache: dict,
+    limit_history_to_chunk: bool,
+) -> None:
+    if not limit_history_to_chunk:
+        _clear_finished_states(model, batch, temporal_cache)
+        return
+    for video_id in batch["video_id"]:
+        existed = video_id in temporal_cache
+        temporal_cache.pop(video_id, None)
+        if getattr(model, "debug_state", False):
+            print(
+                f"TEMPORAL_TRAINING_CHUNK_CLEAR video_id={video_id} "
+                f"existed={existed}"
+            )
+
+
 def _encode_chunk_states(
     model: StreamingVADGenerationModel,
     processor: Qwen2VLProcessor,
@@ -2024,6 +2093,11 @@ def main():
                        help="stride inside a clip; 3 for ~10fps at 30fps source")
     parser.add_argument("--max-windows", type=int, default=8,
                        help="max scoring windows per TBPTT chunk")
+    parser.add_argument(
+        "--limit-training-history-to-chunk",
+        action="store_true",
+        help="reset temporal state after every training chunk so max available history is max_windows",
+    )
     parser.add_argument("--vit-micro-batch", type=int, default=1)
     parser.add_argument("--llm-micro-batch", type=int, default=0)
     parser.add_argument("--min-pixels", type=int, default=200704)
@@ -2080,6 +2154,15 @@ def main():
         raise ValueError("--save-every must be >= 1")
     if args.temporal_history < 1:
         raise ValueError("--temporal-history must be >= 1")
+    if args.limit_training_history_to_chunk:
+        if args.objective != "score_token":
+            raise ValueError("--limit-training-history-to-chunk requires --objective score_token")
+        if args.batch_size != 1:
+            raise ValueError("--limit-training-history-to-chunk requires --batch-size 1")
+        if args.temporal_history != args.max_windows:
+            raise ValueError(
+                "strict long-horizon training requires temporal_history == max_windows"
+            )
     if args.resume and args.init_checkpoint:
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.visual_fusion in SPATIAL_FUSION_MODES and args.objective != "score_token":
@@ -2196,6 +2279,13 @@ def main():
         json.dump({
             "temporal_model": args.temporal_model,
             "temporal_config": model.ssm.get_config(),
+            "max_windows": args.max_windows,
+            "max_training_horizon": (
+                args.max_windows if args.limit_training_history_to_chunk else None
+            ),
+            "training_history_reset": (
+                "chunk" if args.limit_training_history_to_chunk else "video_end"
+            ),
             "total_params": total,
             "trainable_params": trainable,
             "temporal_params": temporal_params,
@@ -2346,6 +2436,15 @@ def main():
                     f"{mode} config mismatch: {key}={ckpt[key]!r}, "
                     f"expected {getattr(args, key)!r}"
                 )
+        saved_training_reset = ckpt.get("training_history_reset", "video_end")
+        expected_training_reset = (
+            "chunk" if args.limit_training_history_to_chunk else "video_end"
+        )
+        if saved_training_reset != expected_training_reset:
+            raise ValueError(
+                f"{mode} config mismatch: training_history_reset="
+                f"{saved_training_reset!r}, expected {expected_training_reset!r}"
+            )
         if "objective" in ckpt and ckpt["objective"] != args.objective:
             raise ValueError(
                 f"{mode} objective mismatch: checkpoint={ckpt['objective']!r}, "
@@ -2512,6 +2611,12 @@ def main():
             "temporal_config": model.ssm.get_config(),
             "temporal_state_dim": args.d_ssm,
             "temporal_history": args.temporal_history,
+            "max_training_horizon": (
+                args.max_windows if args.limit_training_history_to_chunk else None
+            ),
+            "training_history_reset": (
+                "chunk" if args.limit_training_history_to_chunk else "video_end"
+            ),
             "temporal_params": temporal_params,
             "trainable_params": trainable,
             "adapter": model.adapter.state_dict(),
@@ -2891,7 +2996,12 @@ def main():
                             float(valid_probs.max().item()),
                         )
 
-                _clear_finished_states(model, batch, ssm_cache)
+                _clear_training_chunk_states(
+                    model,
+                    batch,
+                    ssm_cache,
+                    args.limit_training_history_to_chunk,
+                )
 
                 pbar.set_postfix(
                     loss=sum(train_losses[-10:]) / min(10, len(train_losses)),
