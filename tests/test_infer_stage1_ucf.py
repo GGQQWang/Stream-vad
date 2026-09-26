@@ -24,6 +24,8 @@ def _import_infer(monkeypatch):
     )
     tr_mod = types.ModuleType("transformers")
     tr_mod.AutoTokenizer = type("AutoTokenizer", (), {"from_pretrained": staticmethod(lambda *a, **k: object())})
+    tr_mod.AutoConfig = type("AutoConfig", (), {"from_pretrained": staticmethod(lambda *a, **k: types.SimpleNamespace(model_type="qwen2_vl"))})
+    tr_mod.AutoProcessor = type("AutoProcessor", (), {"from_pretrained": staticmethod(lambda *a, **k: object())})
     tr_mod.Qwen2VLProcessor = type("Qwen2VLProcessor", (), {"from_pretrained": staticmethod(lambda *a, **k: object())})
     tr_mod.get_linear_schedule_with_warmup = lambda *args, **kwargs: None
     tr_mod.set_seed = lambda *args, **kwargs: None
@@ -198,6 +200,31 @@ def test_load_stage1_model_restores_state_spatial_film_checkpoint(monkeypatch, t
     assert model.visual_fusion == "state_spatial_film"
     assert model.spatial_film.loaded is state["spatial_film"]
     assert model.eval_called
+
+
+def test_load_stage1_model_uses_qwen3_language_width(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    state = _state("state_spatial_film")
+    state["score_query"] = torch.randn(1, 4096)
+    state["summary_query"] = torch.randn(1, 4096)
+    monkeypatch.setattr(infer.torch, "load", lambda *args, **kwargs: state)
+    monkeypatch.setattr(infer, "StreamingVADGenerationModel", _FakeStage1Model)
+    monkeypatch.setattr(infer, "_load_temporal_conditioning", lambda *args, **kwargs: None)
+
+    class _Qwen3:
+        def __init__(self):
+            self.config = types.SimpleNamespace(text_config=types.SimpleNamespace(hidden_size=4096))
+
+        def to(self, *args, **kwargs):
+            return self
+
+    monkeypatch.setattr(infer, "load_vl_model", lambda *args, **kwargs: _Qwen3())
+    monkeypatch.setattr(infer, "load_vl_processor", lambda *args, **kwargs: object())
+
+    model, *_ = infer.load_stage1_model(_args(tmp_path))
+
+    assert model.score_query.shape == (1, 4096)
+    assert model.visual_fusion == "state_spatial_film"
 
 
 def test_load_stage1_model_spatial_fusion_requires_spatial_film(monkeypatch, tmp_path):

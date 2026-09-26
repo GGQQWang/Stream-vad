@@ -1,0 +1,2 @@
+# Install after requirements.txt for Qwen3-VL; the original Qwen2 environment stays pinned.
+transformers>=4.57.3,<4.58

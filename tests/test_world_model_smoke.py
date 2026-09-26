@@ -67,6 +67,13 @@ class _FakeQwen(nn.Module):
     def __init__(self):
         super().__init__()
         self.visual = nn.Identity()
+        self.config = types.SimpleNamespace(hidden_size=16)
+
+
+def test_stage1_rejects_mismatched_language_hidden_size():
+    pipe = _import_pipeline_stage1()
+    with pytest.raises(ValueError, match="does not match model hidden_size"):
+        pipe.StreamingVADGenerationModel(_FakeQwen(), llm_hidden=4)
 
 
 def _rand_target():
@@ -439,6 +446,19 @@ def _make_streaming_model(world_include_decoder=True):
     return model
 
 
+def test_stage1_modules_follow_language_hidden_size():
+    model = _make_streaming_model(world_include_decoder=False)
+    assert model.llm_hidden == 16
+    assert model.ssm.in_proj[0].in_features == 16
+    assert model.ssm.out_proj.out_features == 16
+    assert model.adapter[0].in_features == 16
+    assert model.score_head[0].in_features == 16
+    assert model.score_query.shape == (1, 16)
+    assert model.summary_query.shape == (1, 16)
+    assert model.spatial_film.net[-1].out_features == 32
+    assert model.world_branch.visual_proj.in_features == 16
+
+
 def test_zero_init_modulation_matches_old_formula():
     torch.manual_seed(0)
     model = _make_streaming_model()
@@ -497,6 +517,7 @@ def test_film_spatial_prefix_drops_padding_and_gathers_score_query():
         def __init__(self):
             super().__init__()
             self.visual = nn.Identity()
+            self.config = types.SimpleNamespace(hidden_size=4)
             self.seen_attention_mask = None
 
         def forward(self, inputs_embeds, attention_mask, **kwargs):
@@ -555,6 +576,7 @@ def test_state_spatial_film_prefix_keeps_state_first_and_masks_spatial_padding()
         def __init__(self):
             super().__init__()
             self.visual = nn.Identity()
+            self.config = types.SimpleNamespace(hidden_size=4)
             self.seen_inputs = None
             self.seen_attention_mask = None
 
@@ -626,6 +648,7 @@ def test_state_only_score_path_ignores_spatial_film_module():
         def __init__(self):
             super().__init__()
             self.visual = nn.Identity()
+            self.config = types.SimpleNamespace(hidden_size=4)
 
         def forward(self, inputs_embeds, attention_mask, **kwargs):
             return type("Out", (), {"hidden_states": [inputs_embeds.cumsum(dim=1).float()]})
@@ -675,6 +698,7 @@ def test_film_spatial_backward_hits_film_and_masks_padding_tokens():
         def __init__(self):
             super().__init__()
             self.visual = nn.Identity()
+            self.config = types.SimpleNamespace(hidden_size=4)
 
         def forward(self, inputs_embeds, attention_mask, **kwargs):
             masked = inputs_embeds * attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
@@ -739,6 +763,7 @@ def test_state_spatial_film_backward_hits_state_and_history_paths():
         def __init__(self):
             super().__init__()
             self.visual = nn.Linear(4, 4)
+            self.config = types.SimpleNamespace(hidden_size=4)
 
         def forward(self, inputs_embeds, attention_mask, **kwargs):
             masked = inputs_embeds * attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
@@ -809,6 +834,7 @@ def test_state_spatial_film_checkpoint_roundtrip_restores_prefix_outputs():
         def __init__(self):
             super().__init__()
             self.visual = nn.Identity()
+            self.config = types.SimpleNamespace(hidden_size=4)
 
         def forward(self, inputs_embeds, attention_mask, **kwargs):
             masked = inputs_embeds * attention_mask.unsqueeze(-1).to(inputs_embeds.dtype)
@@ -907,6 +933,7 @@ def test_stage_b_warmup_trainability():
 
 
 if __name__ == "__main__":
+    test_stage1_rejects_mismatched_language_hidden_size()
     test_decoder_produces_per_position_ce()
     test_temporal_proj_structure()
     test_causal_mask_is_upper_triangular()
@@ -922,6 +949,7 @@ if __name__ == "__main__":
     test_future_ibq_target_samples_only_valid_partial_window()
     test_future_ibq_target_samples_only_single_valid_frame()
     test_grid_shape_assert()
+    test_stage1_modules_follow_language_hidden_size()
     test_zero_init_modulation_matches_old_formula()
     test_temporal_modulator_receives_anomaly_gradient()
     test_stage_c_modulation_path_reaches_temporal_proj_and_ssm()

@@ -1,16 +1,17 @@
-"""ViT forward wrapper — the heavy part of the visual pipeline.
+"""ViT forward wrapper for Qwen2-VL and Qwen3-VL visual towers.
 
 Bridges StreamWindowManager / TemporalTokenReducer output with
-Qwen2-VL's ViT transformer blocks and merger.  Two modes:
+the selected ViT transformer blocks and merger.  Two modes:
 
 - ``forward_batch()``   training:  pixel_values → patch_embed → temporal
                          compress → ViT blocks → merger.
 - ``forward_streaming()`` inference: pre-filtered patches → ViT blocks
                          → merger.
 
-Tested with transformers==4.46.2 (``rotary_pos_emb`` API).
+Qwen2-VL 4.46 uses ``rotary_pos_emb``; newer blocks use a (cos, sin) pair.
 """
 
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -21,10 +22,10 @@ from temporal import TemporalTokenReducer
 
 
 class ViTForwarder(nn.Module):
-    """Qwen2-VL ViT blocks + merger, batch & streaming.
+    """Qwen VL ViT blocks + merger, batch & streaming.
 
     Args:
-        visual: Qwen2-VL ``self.visual`` module.
+        visual: Qwen VL ``self.visual`` module.
         temporal_reducer: TemporalTokenReducer for batch mode.
     """
 
@@ -36,6 +37,18 @@ class ViTForwarder(nn.Module):
         super().__init__()
         self.visual = visual
         self.temporal_reducer = temporal_reducer or TemporalTokenReducer()
+        self._qwen3 = hasattr(visual, "fast_pos_embed_interpolate")
+        self._position_embeddings = "position_embeddings" in inspect.signature(
+            visual.blocks[0].forward
+        ).parameters
+        if self._qwen3 and not self._position_embeddings:
+            raise RuntimeError("Qwen3-VL vision blocks require position_embeddings support")
+
+    def _block_kwargs(self, rotary: torch.Tensor) -> dict:
+        if self._position_embeddings:
+            embedding = torch.cat((rotary, rotary), dim=-1)
+            return {"position_embeddings": (embedding.cos(), embedding.sin())}
+        return {"rotary_pos_emb": rotary}
 
     # ------------------------------------------------------------------
     # Batch mode (training: uniform clip sampling)
@@ -59,18 +72,21 @@ class ViTForwarder(nn.Module):
             stats (only if return_stats): dict with per-clip keep_ratios
                   and per-clip anomaly-friendly breakdown.
         """
-        patches = self.visual.patch_embed(pixel_values)          # [total, 1280]
-        rotary = self.visual.rot_pos_emb(grid_thw)               # [total, 1280]
+        patches = self.visual.patch_embed(pixel_values)
+        rotary = self.visual.rot_pos_emb(grid_thw)
 
         mask, seqlens = self.temporal_reducer(patches, grid_thw)
 
         patches = patches[mask]
         rotary = rotary[mask]
+        if self._qwen3:
+            patches = patches + self.visual.fast_pos_embed_interpolate(grid_thw)[mask]
 
         cu = F.pad(seqlens.cumsum(dim=0), (1, 0), value=0).int()
 
+        block_kwargs = self._block_kwargs(rotary)
         for blk in self.visual.blocks:
-            patches = blk(patches, cu_seqlens=cu, rotary_pos_emb=rotary)
+            patches = blk(patches, cu_seqlens=cu, **block_kwargs)
 
         tokens = self.visual.merger(patches)                     # [L/4, D_llm]
         merged_counts = torch.ceil(seqlens.float() / 4).int()
@@ -171,7 +187,7 @@ class ViTForwarder(nn.Module):
         """Process one flushed window.
 
         Args:
-            all_patches: ``[L, 1280]``  kept patches.
+            all_patches: ``[L, D_vision]``  kept patches.
             cu_seqlens:  ``[n_frames + 1]``.
             grid_thw:    ``[n_frames, 3]``.
             all_indices: ``[L]``  patch indices in full-frame RoPE grid.
@@ -179,11 +195,14 @@ class ViTForwarder(nn.Module):
         Returns:
             visual_tokens: ``[L/4, D_llm]``.
         """
-        rotary_full = self.visual.rot_pos_emb(grid_thw)          # [N_full, 1280]
-        rotary = rotary_full[all_indices]                         # [L, 1280]
+        rotary_full = self.visual.rot_pos_emb(grid_thw)
+        rotary = rotary_full[all_indices]
+        if self._qwen3:
+            all_patches = all_patches + self.visual.fast_pos_embed_interpolate(grid_thw)[all_indices]
 
+        block_kwargs = self._block_kwargs(rotary)
         for blk in self.visual.blocks:
             all_patches = blk(
-                all_patches, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary,
+                all_patches, cu_seqlens=cu_seqlens, **block_kwargs,
             )
         return self.visual.merger(all_patches)

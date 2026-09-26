@@ -33,8 +33,6 @@ except ImportError:
 
 from transformers import (
     AutoTokenizer,
-    Qwen2VLForConditionalGeneration,
-    Qwen2VLProcessor,
     get_linear_schedule_with_warmup,
     set_seed,
 )
@@ -76,6 +74,10 @@ from ibq_utils import (
     validate_ibq_cache_set,
 )
 from world_model import WorldModelBranch
+from qwen_vl_compat import (
+    language_hidden_size, load_vl_model, load_vl_processor, process_video_clips,
+    resolve_pixel_budget,
+)
 
 
 SPATIAL_FUSION_MODES = {"film_spatial", "state_spatial_film"}
@@ -86,13 +88,13 @@ VISUAL_FUSION_MODES = {"state_only", *SPATIAL_FUSION_MODES}
 # helpers
 # ---------------------------------------------------------------------------
 
-def _find_visual(model: Qwen2VLForConditionalGeneration) -> nn.Module:
+def _find_visual(model: nn.Module) -> nn.Module:
     if hasattr(model, "visual"):
         return model.visual
     return model.model.visual
 
 
-def _find_embed(model: Qwen2VLForConditionalGeneration) -> nn.Module:
+def _find_embed(model: nn.Module) -> nn.Module:
     return model.get_input_embeddings()
 
 
@@ -499,10 +501,10 @@ class StreamingVADGenerationModel(nn.Module):
 
     def __init__(
         self,
-        qwen: Qwen2VLForConditionalGeneration,
+        qwen: nn.Module,
         d_ssm: int = 256,
         n_ssm: int = 1,
-        llm_hidden: int = 3584,
+        llm_hidden: Optional[int] = None,
         reduction_ratio: float = 0.5,
         lof_k: int = 8,
         vit_micro_batch: int = 1,
@@ -512,6 +514,11 @@ class StreamingVADGenerationModel(nn.Module):
         super().__init__()
         if visual_fusion not in VISUAL_FUSION_MODES:
             raise ValueError(f"unknown visual_fusion: {visual_fusion}")
+        actual_hidden = language_hidden_size(qwen.config)
+        if llm_hidden is None:
+            llm_hidden = actual_hidden
+        elif llm_hidden != actual_hidden:
+            raise ValueError(f"llm_hidden={llm_hidden} does not match model hidden_size={actual_hidden}")
         visual = _find_visual(qwen)
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
@@ -767,6 +774,11 @@ class StreamingVADGenerationModel(nn.Module):
         else:
             tokens, merged_counts = vit_out
             stats = {}
+        if tokens.ndim != 2 or tokens.shape[-1] != self.llm_hidden:
+            raise ValueError(
+                f"ViT merger output shape {tuple(tokens.shape)} does not match "
+                f"language hidden_size={self.llm_hidden}"
+            )
 
         tg_list = video_grid_thw[:, 0].tolist()
         clip_token_counts: List[int] = []
@@ -1201,10 +1213,12 @@ def _verify_attention_backend(model: nn.Module, requested: str) -> None:
     print(f"  visual dtype = {next(visual.parameters()).dtype}")
 
     if requested == "flash_attention_2":
-        if "FlashAttention2" not in vis_attn_cls:
-            raise RuntimeError(f"Vision attention is {vis_attn_cls}, expected *FlashAttention2*")
-        if "FlashAttention2" not in txt_attn_cls:
-            raise RuntimeError(f"Text attention is {txt_attn_cls}, expected *FlashAttention2*")
+        vis_backend = getattr(getattr(first_vis_blk.attn, "config", None), "_attn_implementation", None)
+        txt_backend = getattr(getattr(first_txt_layer.self_attn, "config", None), "_attn_implementation", None)
+        if "FlashAttention2" not in vis_attn_cls and vis_backend != requested:
+            raise RuntimeError(f"Vision attention is {vis_attn_cls} with backend {vis_backend!r}, expected FA2")
+        if "FlashAttention2" not in txt_attn_cls and txt_backend != requested:
+            raise RuntimeError(f"Text attention is {txt_attn_cls} with backend {txt_backend!r}, expected FA2")
         print("  FLASH-ATTENTION-2 BACKEND CHECK: PASS")
     else:
         print("  SDPA BACKEND CHECK: PASS")
@@ -1219,7 +1233,7 @@ def _verify_attention_backend(model: nn.Module, requested: str) -> None:
 def validate_generative(
     model: StreamingVADGenerationModel,
     loader: DataLoader,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     device: torch.device,
     prompt_text: str,
@@ -1260,7 +1274,7 @@ def validate_generative(
             if not all_clips:
                 continue
 
-            processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+            processed = process_video_clips(processor, all_clips)
             pv = processed["pixel_values_videos"].to(device)
             gthw = processed["video_grid_thw"].to(device)
 
@@ -1402,7 +1416,7 @@ def _clear_finished_states(model: StreamingVADGenerationModel, batch: dict, ssm_
 
 def _encode_chunk_states(
     model: StreamingVADGenerationModel,
-    processor: Qwen2VLProcessor,
+    processor: object,
     batch: dict,
     device: torch.device,
     dtype: torch.dtype,
@@ -1428,7 +1442,7 @@ def _encode_chunk_states(
     else:
         frames = batch["frames"][0]                      # [max_w, F, C, H, W]
         all_clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
-        processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+        processed = process_video_clips(processor, all_clips)
         pv = processed["pixel_values_videos"].to(device)
         gthw = processed["video_grid_thw"].to(device)
 
@@ -1452,7 +1466,7 @@ def _encode_chunk_states(
 @torch.no_grad()
 def _mine_video_max_window(
     model: StreamingVADGenerationModel,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     dataset: HIVAUDataset,
     sample_indices: List[int],
@@ -1491,7 +1505,7 @@ def _mine_video_max_window(
 
 def _backward_mil_video_pass(
     model: StreamingVADGenerationModel,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     dataset: HIVAUDataset,
     sample_indices: List[int],
@@ -1607,7 +1621,7 @@ def _backward_mil_video_pass(
 @torch.no_grad()
 def _collect_video_candidate_outputs(
     model: StreamingVADGenerationModel,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     dataset: HIVAUDataset,
     sample_indices: List[int],
@@ -1660,7 +1674,7 @@ def validate_mil_rank(
     model: StreamingVADGenerationModel,
     dataset: HIVAUDataset,
     video_sampler,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     device: torch.device,
     dtype: torch.dtype,
@@ -1788,7 +1802,7 @@ def validate_mil_rank(
 def validate_score_token(
     model: StreamingVADGenerationModel,
     loader: DataLoader,
-    processor: Qwen2VLProcessor,
+    processor: object,
     tokenizer,
     device: torch.device,
     prompt_text: str,
@@ -1845,7 +1859,7 @@ def validate_score_token(
                         all_clips.append(f[w])
             if not all_clips:
                 continue
-            processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+            processed = process_video_clips(processor, all_clips)
             pv = processed["pixel_values_videos"].to(device)
             gthw = processed["video_grid_thw"].to(device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
@@ -1990,8 +2004,8 @@ def main():
                        help="max scoring windows per TBPTT chunk")
     parser.add_argument("--vit-micro-batch", type=int, default=1)
     parser.add_argument("--llm-micro-batch", type=int, default=0)
-    parser.add_argument("--min-pixels", type=int, default=200704)
-    parser.add_argument("--max-pixels", type=int, default=200704)
+    parser.add_argument("--min-pixels", type=int, default=None)
+    parser.add_argument("--max-pixels", type=int, default=None)
     parser.add_argument("--attn-implementation", type=str, choices=["flash_attention_2", "sdpa"], default="flash_attention_2")
     parser.add_argument("--objective", choices=["answer_ce", "mil_rank", "score_token"], default="score_token")
     parser.add_argument("--supervision-mode", choices=["all_windows", "last_window"], default="all_windows")
@@ -2040,6 +2054,9 @@ def main():
                             "world_branch); optimizer/scheduler stay fresh and training starts "
                             "from epoch 0. Mutually exclusive with --resume.")
     args = parser.parse_args()
+    args.min_pixels, args.max_pixels = resolve_pixel_budget(
+        args.model_path, args.min_pixels, args.max_pixels,
+    )
     if args.save_every < 1:
         raise ValueError("--save-every must be >= 1")
     if args.resume and args.init_checkpoint:
@@ -2072,9 +2089,9 @@ def main():
     writer = SummaryWriter(args.log_dir)
 
     # ---- model ----
-    print("Loading Qwen2-VL ...")
+    print("Loading Qwen VL model ...")
     dtype = torch.bfloat16
-    qwen = Qwen2VLForConditionalGeneration.from_pretrained(
+    qwen = load_vl_model(
         args.model_path, torch_dtype=dtype,
         attn_implementation=args.attn_implementation,
         device_map=None, low_cpu_mem_usage=True,
@@ -2089,7 +2106,7 @@ def main():
     _verify_attention_backend(qwen, args.attn_implementation)
 
     # ---- processor & tokenizer ----
-    processor = Qwen2VLProcessor.from_pretrained(
+    processor = load_vl_processor(
         args.model_path, min_pixels=args.min_pixels, max_pixels=args.max_pixels,
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -2112,7 +2129,7 @@ def main():
         p.requires_grad = False
 
     model = StreamingVADGenerationModel(
-        qwen, d_ssm=args.d_ssm, llm_hidden=qwen.config.hidden_size,
+        qwen, d_ssm=args.d_ssm,
         vit_micro_batch=args.vit_micro_batch,
         visual_fusion=args.visual_fusion,
     ).to(device)
@@ -2591,7 +2608,7 @@ def main():
                                 all_clips.append(f[w])
                     if not all_clips:
                         continue
-                    processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+                    processed = process_video_clips(processor, all_clips)
                     pv = processed["pixel_values_videos"].to(device)
                     gthw = processed["video_grid_thw"].to(device)
                     with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
@@ -2865,7 +2882,7 @@ def main():
                     if not all_clips:
                         continue
 
-                    processed = processor.image_processor(images=None, videos=all_clips, return_tensors="pt")
+                    processed = process_video_clips(processor, all_clips)
                     pv = processed["pixel_values_videos"].to(device)
                     gthw = processed["video_grid_thw"].to(device)
 

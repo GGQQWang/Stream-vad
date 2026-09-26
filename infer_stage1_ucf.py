@@ -16,7 +16,7 @@ import torch
 from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoTokenizer, Qwen2VLForConditionalGeneration, Qwen2VLProcessor
+from transformers import AutoTokenizer
 
 from hivau_dataset import HIVAUDataset, hivau_collate
 from mil_utils import group_video_chunks
@@ -26,6 +26,9 @@ from pipeline_stage1 import (
     StreamingVADGenerationModel,
     _find_embed,
     _load_temporal_conditioning,
+)
+from qwen_vl_compat import (
+    language_hidden_size, load_vl_model, load_vl_processor, process_video_clips,
 )
 
 
@@ -136,8 +139,8 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         raise ValueError(f"{visual_fusion} checkpoint is missing spatial_film state_dict")
 
     dtype = torch.bfloat16
-    print("Loading Qwen2-VL base model ...")
-    qwen = Qwen2VLForConditionalGeneration.from_pretrained(
+    print("Loading Qwen VL base model ...")
+    qwen = load_vl_model(
         args.model_path,
         torch_dtype=dtype,
         attn_implementation="flash_attention_2",
@@ -147,7 +150,7 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     qwen.config.use_cache = False
     qwen = PeftModel.from_pretrained(qwen, str(lora_dir), is_trainable=False).to(args.device)
 
-    processor = Qwen2VLProcessor.from_pretrained(
+    processor = load_vl_processor(
         args.model_path,
         min_pixels=MIN_PIXELS,
         max_pixels=MAX_PIXELS,
@@ -156,7 +159,7 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     model = StreamingVADGenerationModel(
         qwen,
         d_ssm=int(state.get("d_ssm", 256)),
-        llm_hidden=qwen.config.hidden_size,
+        llm_hidden=language_hidden_size(qwen.config),
         vit_micro_batch=1,
         world_include_decoder=False,
         visual_fusion=visual_fusion,
@@ -308,7 +311,7 @@ def infer_video(
                 frames = batch["frames"][0]
                 valid_w_cpu = valid_mask_cpu[0].nonzero(as_tuple=True)[0]
                 clips = [frames[int(w)] for w in valid_w_cpu.tolist()]
-                processed = processor.image_processor(images=None, videos=clips, return_tensors="pt")
+                processed = process_video_clips(processor, clips)
                 pixel_values = processed["pixel_values_videos"].to(device)
                 grid_thw = processed["video_grid_thw"].to(device)
                 with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):

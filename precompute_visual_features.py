@@ -1,4 +1,4 @@
-"""Precompute frozen Qwen2-VL visual features for Stream-vad training."""
+"""Precompute frozen Qwen VL visual features for Stream-vad training."""
 
 import argparse
 import os
@@ -7,7 +7,7 @@ from typing import List
 
 import torch
 from tqdm import tqdm
-from transformers import Qwen2VLForConditionalGeneration, Qwen2VLProcessor, set_seed
+from transformers import set_seed
 
 from feature_cache import (
     build_feature_cache_metadata,
@@ -17,6 +17,9 @@ from feature_cache import (
 from hivau_dataset import HIVAUDataset, hivau_collate
 from mil_utils import group_video_chunks
 from pipeline_stage1 import StreamingVADGenerationModel, _verify_attention_backend
+from qwen_vl_compat import (
+    load_vl_model, load_vl_processor, process_video_clips, resolve_pixel_budget,
+)
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -32,7 +35,7 @@ def _dtype_from_name(name: str) -> torch.dtype:
 @torch.no_grad()
 def _extract_chunk_features(
     model: StreamingVADGenerationModel,
-    processor: Qwen2VLProcessor,
+    processor: object,
     batch: dict,
     device: torch.device,
     dtype: torch.dtype,
@@ -45,11 +48,7 @@ def _extract_chunk_features(
     if not clips:
         return torch.empty(0, model.llm_hidden)
 
-    processed = processor.image_processor(
-        images=None,
-        videos=clips,
-        return_tensors="pt",
-    )
+    processed = process_video_clips(processor, clips)
     pixel_values = processed["pixel_values_videos"].to(device)
     grid_thw = processed["video_grid_thw"].to(device)
 
@@ -77,13 +76,16 @@ def main() -> None:
     parser.add_argument("--max-windows", type=int, default=8)
     parser.add_argument("--vit-micro-batch", type=int, default=1)
     parser.add_argument("--d-ssm", type=int, default=256)
-    parser.add_argument("--min-pixels", type=int, default=200704)
-    parser.add_argument("--max-pixels", type=int, default=200704)
+    parser.add_argument("--min-pixels", type=int, default=None)
+    parser.add_argument("--max-pixels", type=int, default=None)
     parser.add_argument("--attn-implementation", choices=["flash_attention_2", "sdpa"], default="flash_attention_2")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    args.min_pixels, args.max_pixels = resolve_pixel_budget(
+        args.model_path, args.min_pixels, args.max_pixels,
+    )
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -91,8 +93,8 @@ def main() -> None:
     save_dtype = compute_dtype
     os.makedirs(args.cache_root, exist_ok=True)
 
-    print("Loading Qwen2-VL for frozen visual precompute ...")
-    qwen = Qwen2VLForConditionalGeneration.from_pretrained(
+    print("Loading Qwen VL model for frozen visual precompute ...")
+    qwen = load_vl_model(
         args.model_path,
         torch_dtype=compute_dtype,
         attn_implementation=args.attn_implementation,
@@ -104,7 +106,7 @@ def main() -> None:
         p.requires_grad = False
     _verify_attention_backend(qwen, args.attn_implementation)
 
-    processor = Qwen2VLProcessor.from_pretrained(
+    processor = load_vl_processor(
         args.model_path,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
@@ -112,7 +114,6 @@ def main() -> None:
     model = StreamingVADGenerationModel(
         qwen,
         d_ssm=args.d_ssm,
-        llm_hidden=qwen.config.hidden_size,
         vit_micro_batch=args.vit_micro_batch,
     ).to(device)
     model.eval()
