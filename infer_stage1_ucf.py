@@ -41,13 +41,18 @@ def _load_json(path: str | Path):
         return json.load(f)
 
 
+def normalize_video_id(value: str | Path) -> str:
+    video_id = str(value)
+    return video_id[:-4] if video_id.lower().endswith(".mp4") else video_id
+
+
 def _video_id_from_entry(entry: dict) -> str:
     for key in ("video_id", "id", "name"):
         if key in entry:
-            return Path(str(entry[key])).stem
+            return normalize_video_id(entry[key])
     for key in ("video", "video_path", "path", "filename"):
         if key in entry:
-            return Path(str(entry[key])).stem
+            return normalize_video_id(Path(str(entry[key])).name)
     raise ValueError(f"manifest entry does not contain a video id: {entry}")
 
 
@@ -61,13 +66,15 @@ def normalize_manifest(manifest_path: str | Path, output_dir: Path, video_id: st
     else:
         raise ValueError("test manifest must be a dict or a list of dicts")
 
-    wanted_video_id = Path(video_id).stem if video_id else ""
+    wanted_video_id = normalize_video_id(video_id) if video_id else ""
     for vid, meta in iterable:
-        vid = Path(str(vid)).stem
+        vid = normalize_video_id(vid)
         if wanted_video_id and vid != wanted_video_id:
             continue
         if not isinstance(meta, dict):
             raise ValueError(f"manifest metadata must be a dict: video={vid}")
+        if vid in normalized:
+            raise ValueError(f"duplicate normalized video_id in manifest: {vid}")
         n_frames = meta.get("n_frames", meta.get("num_frames"))
         fps = meta.get("fps")
         if n_frames is None or fps is None:
@@ -521,7 +528,7 @@ def main() -> None:
     )
     grouped = group_video_chunks(dataset.samples)
     if args.video_id:
-        selected_video_id = Path(args.video_id).stem
+        selected_video_id = normalize_video_id(args.video_id)
         if selected_video_id not in grouped:
             raise ValueError(f"video_id={selected_video_id!r} not found in dataset")
         grouped = {selected_video_id: grouped[selected_video_id]}

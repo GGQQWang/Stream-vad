@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -44,6 +45,67 @@ def _import_infer(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", tr_mod)
     import infer_stage1_ucf as infer
     return importlib.reload(infer)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Abuse001_x264", "Abuse001_x264"),
+        ("Abuse001_x264.mp4", "Abuse001_x264"),
+        ("ABC.MP4", "ABC"),
+        (
+            "Bad.Boys.1995__#01-11-55_01-12-40_label_G-B2-B6",
+            "Bad.Boys.1995__#01-11-55_01-12-40_label_G-B2-B6",
+        ),
+        (
+            "Deadpool.2.2018__#0-04-46_0-05-01_label_B2-0-0",
+            "Deadpool.2.2018__#0-04-46_0-05-01_label_B2-0-0",
+        ),
+        ("v=abc__#1_label_G-0-0", "v=abc__#1_label_G-0-0"),
+    ],
+)
+def test_normalize_video_id(monkeypatch, value, expected):
+    infer = _import_infer(monkeypatch)
+    assert infer.normalize_video_id(value) == expected
+
+
+def test_normalize_manifest_preserves_dotted_video_ids(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    ids = [
+        "Bad.Boys.1995__#01-11-55_01-12-40_label_G-B2-B6",
+        "Bad.Boys.1995__#01-12-40_01-13-00_label_G-B2-B6",
+        "Black.Hawk.Down.2001__#01-13-59_01-14-49_label_B2-0-0",
+        "Deadpool.2.2018__#0-04-46_0-05-01_label_B2-0-0",
+    ]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({vid: {"n_frames": 48, "fps": 30} for vid in ids}))
+
+    normalized_path = infer.normalize_manifest(manifest, tmp_path / "out")
+    assert list(json.loads(normalized_path.read_text())) == ids
+    selected_path = infer.normalize_manifest(manifest, tmp_path / "selected", f"{ids[0]}.mp4")
+    assert list(json.loads(selected_path.read_text())) == [ids[0]]
+
+
+def test_normalize_manifest_list_entry_video_path(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    vid = "Bad.Boys.1995__#01-11-55_01-12-40_label_G-B2-B6"
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([{"video_path": f"/videos/{vid}.mp4", "n_frames": 48, "fps": 30}]))
+
+    normalized_path = infer.normalize_manifest(manifest, tmp_path / "out")
+    assert list(json.loads(normalized_path.read_text())) == [vid]
+
+
+def test_normalize_manifest_rejects_duplicate_ids(monkeypatch, tmp_path):
+    infer = _import_infer(monkeypatch)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "Abuse001_x264": {"n_frames": 48, "fps": 30},
+        "Abuse001_x264.mp4": {"n_frames": 48, "fps": 30},
+    }))
+
+    with pytest.raises(ValueError, match="duplicate normalized video_id"):
+        infer.normalize_manifest(manifest, tmp_path / "out")
 
 
 class _Loadable:
