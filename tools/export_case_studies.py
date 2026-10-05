@@ -412,6 +412,16 @@ def context_interval(event: Event, *, pre_sec: float, post_sec: float) -> tuple[
     return max(0.0, event.start_sec - pre_sec), min(event.n_frames / event.fps, event.end_sec + post_sec)
 
 
+def plot_context_interval(
+    event: Event, frame_context: tuple[float, float], plot_range: str,
+) -> tuple[float, float]:
+    if plot_range == "full":
+        return 0.0, event.n_frames / event.fps
+    if plot_range == "local":
+        return frame_context
+    raise ValueError(f"unknown plot range: {plot_range}")
+
+
 def resolve_video_path(video_root: str | Path, video_id: str, entry: dict) -> Path:
     root = Path(video_root)
     preferred = root / f"{video_id}.mp4"
@@ -457,12 +467,10 @@ def read_window_scores(path: str | Path, *, video_id: str, n_frames: int, fps: f
 
 
 def case_timeline(
-    case: SelectedCase, rows: list[dict], gt: np.ndarray, context: tuple[float, float],
+    case: SelectedCase, rows: list[dict], gt: np.ndarray,
 ) -> list[dict]:
     out = []
     for row in rows:
-        if row["end_sec"] < context[0] or row["start_sec"] >= context[1]:
-            continue
         start, end = row["start_frame"], row["end_frame"]
         out.append({
             **row,
@@ -475,11 +483,11 @@ def case_timeline(
 
 def score_points(
     infer_dir: str | Path, case: SelectedCase, rows: list[dict],
-    context: tuple[float, float], mode: str,
+    plot_context: tuple[float, float], mode: str,
 ) -> tuple[np.ndarray, np.ndarray, str]:
     event = case.event
     if mode == "window-end":
-        points = [row for row in rows if context[0] <= row["end_sec"] <= context[1]]
+        points = [row for row in rows if plot_context[0] <= row["end_sec"] <= plot_context[1]]
         return (
             np.array([row["end_sec"] for row in points], dtype=float),
             np.array([row["score_prob"] for row in points], dtype=float),
@@ -497,7 +505,7 @@ def score_points(
         if mask.shape != (event.n_frames,) or mask.dtype != np.bool_:
             raise ValueError(f"{event.video_id}: invalid causal_valid_mask")
     times = np.arange(event.n_frames) / event.fps
-    mask &= (times >= context[0]) & (times <= context[1])
+    mask &= (times >= plot_context[0]) & (times <= plot_context[1])
     if not np.isfinite(values[mask]).all():
         raise ValueError(f"{event.video_id}: non-finite {mode} score in valid region")
     note = (
@@ -520,27 +528,33 @@ def decode_selected_frames(video_path: Path, indices: list[int], n_frames: int) 
 
 
 def _draw_curve(ax, *, case: SelectedCase, x: np.ndarray, y: np.ndarray,
-                all_events: list[tuple[int, int]], context: tuple[float, float],
+                all_events: list[tuple[int, int]], plot_context: tuple[float, float],
                 score_mode: str):
     event = case.event
-    gt_label_used = False
+    other_label_used = False
+    selected_found = False
     for start, end in all_events:
-        left, right = max(context[0], start / event.fps), min(context[1], end / event.fps)
+        selected = (start, end) == (event.start_frame, event.end_frame)
+        selected_found |= selected
+        left, right = max(plot_context[0], start / event.fps), min(plot_context[1], end / event.fps)
         if right > left:
-            ax.axvspan(left, right, color="#c6635a", alpha=0.16,
-                       label="Ground-truth anomaly interval" if not gt_label_used else None)
-            gt_label_used = True
+            label = "Selected GT event" if selected else "Other GT anomaly interval" if not other_label_used else None
+            ax.axvspan(left, right, color="#c6635a", alpha=0.20 if selected else 0.10, label=label)
+            if not selected:
+                other_label_used = True
+    if not selected_found:
+        raise ValueError(f"selected event {event.case_id} is absent from video GT intervals")
     ax.axvline(event.start_sec, color="#b44a42", linewidth=0.9, linestyle="--")
     ax.axvline(event.end_sec, color="#b44a42", linewidth=0.9, linestyle="--")
     if len(x):
         if score_mode == "window-end":
             ax.step(x, y, where="post", color="#176b8a", linewidth=1.5,
                     marker="o", markersize=2.5, label="Anomaly score")
-            if x[-1] < context[1]:
-                ax.hlines(y[-1], x[-1], context[1], color="#176b8a", linewidth=1.5)
+            if x[-1] < plot_context[1]:
+                ax.hlines(y[-1], x[-1], plot_context[1], color="#176b8a", linewidth=1.5)
         else:
             ax.plot(x, y, color="#176b8a", linewidth=1.2, label="Anomaly score")
-    ax.set_xlim(*context)
+    ax.set_xlim(*plot_context)
     ax.set_ylim(0, 1)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Anomaly score")
@@ -551,8 +565,9 @@ def _draw_curve(ax, *, case: SelectedCase, x: np.ndarray, y: np.ndarray,
 def render_case(
     case_dir: Path, case: SelectedCase, anchors: list[tuple[str, int]],
     frames: list[np.ndarray], x: np.ndarray, y: np.ndarray,
-    all_events: list[tuple[int, int]], context: tuple[float, float], dpi: int,
+    all_events: list[tuple[int, int]], plot_context: tuple[float, float], dpi: int,
     score_mode: str,
+    local_zoom: tuple[np.ndarray, np.ndarray, tuple[float, float]] | None = None,
 ) -> None:
     import matplotlib
 
@@ -567,10 +582,19 @@ def render_case(
 
     fig, ax = plt.subplots(figsize=(7.2, 2.7), layout="constrained")
     _draw_curve(ax, case=case, x=x, y=y, all_events=all_events,
-                context=context, score_mode=score_mode)
+                plot_context=plot_context, score_mode=score_mode)
     fig.savefig(case_dir / "score_curve.pdf", bbox_inches="tight", facecolor="white")
     fig.savefig(case_dir / "score_curve.png", dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
+
+    if local_zoom is not None:
+        local_x, local_y, local_context = local_zoom
+        fig, ax = plt.subplots(figsize=(7.2, 2.7), layout="constrained")
+        _draw_curve(ax, case=case, x=local_x, y=local_y, all_events=all_events,
+                    plot_context=local_context, score_mode=score_mode)
+        fig.savefig(case_dir / "score_curve_local.pdf", bbox_inches="tight", facecolor="white")
+        fig.savefig(case_dir / "score_curve_local.png", dpi=dpi, bbox_inches="tight", facecolor="white")
+        plt.close(fig)
 
     fig = plt.figure(figsize=(max(7.2, len(frames) * 1.45), 4.7), layout="constrained")
     grid = fig.add_gridspec(2, len(frames), height_ratios=(1.15, 1.0))
@@ -584,7 +608,7 @@ def render_case(
         ax_frame.set_xlabel(f"{frame_index / case.event.fps:.2f} s", fontsize=8)
     ax_curve = fig.add_subplot(grid[1, :])
     _draw_curve(ax_curve, case=case, x=x, y=y, all_events=all_events,
-                context=context, score_mode=score_mode)
+                plot_context=plot_context, score_mode=score_mode)
     fig.savefig(case_dir / "case_panel.pdf", bbox_inches="tight", facecolor="white")
     fig.savefig(case_dir / "case_panel.png", dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -615,7 +639,9 @@ def git_worktree_dirty() -> bool:
 
 
 def case_metadata(
-    case: SelectedCase, *, seed: int, score_mode: str, context: tuple[float, float],
+    case: SelectedCase, *, seed: int, score_mode: str, plot_range: str,
+    frame_context: tuple[float, float], plot_context: tuple[float, float],
+    num_gt_events_in_video: int, local_zoom_exported: bool,
     anchors: list[tuple[str, int]], duplicates: list[dict], source_window_score_csv: Path,
     source_gt: Path, source_video: Path, commit: str, score_note: str,
     worktree_dirty: bool = False,
@@ -640,8 +666,14 @@ def case_metadata(
         "score_mode_note": score_note,
         "gt_overlap_definition": "fraction of GT-positive frames in [start_frame, end_frame)",
         "gt_at_window_end_definition": "GT label of the last observed frame (end_frame - 1)",
-        "context_start_sec": context[0],
-        "context_end_sec": context[1],
+        "plot_range": plot_range,
+        "frame_context_start_sec": frame_context[0],
+        "frame_context_end_sec": frame_context[1],
+        "plot_context_start_sec": plot_context[0],
+        "plot_context_end_sec": plot_context[1],
+        "num_gt_events_in_video": num_gt_events_in_video,
+        "selected_event_index": event.event_index,
+        "local_zoom_exported": local_zoom_exported,
         "selected_frame_indices": [index for _, index in anchors],
         "selected_frame_times": [index / event.fps for _, index in anchors],
         "selected_frame_anchor_labels": [label for label, _ in anchors],
@@ -727,7 +759,7 @@ def export_case(
     case: SelectedCase, *, infer_dir: Path, video_root: Path, gt_root: Path,
     manifest: dict[str, dict], output_dir: Path, seed: int, score_mode: str,
     pre_sec: float, post_sec: float, frames_per_case: int, dpi: int, commit: str,
-    worktree_dirty: bool,
+    worktree_dirty: bool, plot_range: str, export_local_zoom: bool,
 ) -> dict:
     event = case.event
     case_dir = output_dir / event.case_id
@@ -736,23 +768,31 @@ def export_case(
     video_path = resolve_video_path(video_root, event.video_id, manifest[event.video_id])
     gt = load_gt(gt_root, event.video_id, event.n_frames)
     rows = read_window_scores(score_csv, video_id=event.video_id, n_frames=event.n_frames, fps=event.fps)
-    context = context_interval(event, pre_sec=pre_sec, post_sec=post_sec)
+    frame_context = context_interval(event, pre_sec=pre_sec, post_sec=post_sec)
+    plot_context = plot_context_interval(event, frame_context, plot_range)
+    all_events = contiguous_events(gt)
     anchors, duplicates = temporal_anchors(
         event, pre_sec=pre_sec, post_sec=post_sec, frames_per_case=frames_per_case,
     )
-    x, y, score_note = score_points(infer_dir, case, rows, context, score_mode)
+    x, y, score_note = score_points(infer_dir, case, rows, plot_context, score_mode)
+    local_zoom = None
+    if export_local_zoom:
+        local_x, local_y, _ = score_points(infer_dir, case, rows, frame_context, score_mode)
+        local_zoom = (local_x, local_y, frame_context)
     frames = decode_selected_frames(video_path, [index for _, index in anchors], event.n_frames)
     case_dir.mkdir(parents=True, exist_ok=True)
-    render_case(case_dir, case, anchors, frames, x, y, contiguous_events(gt),
-                context, dpi, score_mode)
+    render_case(case_dir, case, anchors, frames, x, y, all_events,
+                plot_context, dpi, score_mode, local_zoom=local_zoom)
     metadata = case_metadata(
-        case, seed=seed, score_mode=score_mode, context=context,
+        case, seed=seed, score_mode=score_mode, plot_range=plot_range,
+        frame_context=frame_context, plot_context=plot_context,
+        num_gt_events_in_video=len(all_events), local_zoom_exported=export_local_zoom,
         anchors=anchors, duplicates=duplicates, source_window_score_csv=score_csv,
         source_gt=gt_path, source_video=video_path, commit=commit, score_note=score_note,
         worktree_dirty=worktree_dirty,
     )
     (case_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    write_csv(case_dir / "timeline.csv", TIMELINE_FIELDS, case_timeline(case, rows, gt, context))
+    write_csv(case_dir / "timeline.csv", TIMELINE_FIELDS, case_timeline(case, rows, gt))
     return index_row(case, seed=seed, output_path=case_dir)
 
 
@@ -787,6 +827,10 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
     parser.add_argument("--failure-seed", type=int, help="defaults to --seed")
     parser.add_argument("--pre-sec", type=float, default=3.0)
     parser.add_argument("--post-sec", type=float, default=3.0)
+    parser.add_argument("--plot-range", choices=("full", "local"), default="full",
+                        help="score curve range; frame anchors always remain event-centered")
+    parser.add_argument("--export-local-zoom", action="store_true",
+                        help="also save a score-only local zoom around the selected event")
     parser.add_argument("--score-mode", choices=("window-end", "causal-frame", "standard-frame"), default="window-end")
     parser.add_argument("--frames-per-case", type=int, default=7)
     parser.add_argument("--dpi", type=int, default=300)
@@ -880,6 +924,7 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
             seed=args.seed, score_mode=args.score_mode, pre_sec=args.pre_sec,
             post_sec=args.post_sec, frames_per_case=args.frames_per_case,
             dpi=args.dpi, commit=commit, worktree_dirty=worktree_dirty,
+            plot_range=args.plot_range, export_local_zoom=args.export_local_zoom,
         ))
     write_csv(args.output_dir / "index.csv", INDEX_FIELDS, index)
     write_gallery(args.output_dir / "gallery.html", index)

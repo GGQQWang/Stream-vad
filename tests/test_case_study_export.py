@@ -136,7 +136,7 @@ def test_window_end_alignment_uses_end_sec_without_shifting(tmp_path):
     assert y.tolist() == [0.1, 0.8, 0.3]
     assert "window end" in note
     gt = np.array([0] * 10 + [1] * 10 + [0] * 10)
-    timeline = cases.case_timeline(case, rows, gt, (0, 3))
+    timeline = cases.case_timeline(case, rows, gt)
     assert [r["gt_overlap"] for r in timeline] == [0, 1, 0]
     assert [r["gt_at_window_end"] for r in timeline] == [0, 1, 0]
 
@@ -152,7 +152,7 @@ def test_window_end_curve_holds_last_emitted_score():
     fig, ax = plt.subplots()
     cases._draw_curve(ax, case=case, x=np.array([1.0, 2.0]),
                       y=np.array([0.2, 0.8]), all_events=[(10, 20)],
-                      context=(0, 3), score_mode="window-end")
+                      plot_context=(0, 3), score_mode="window-end")
     assert any(line.get_drawstyle() == "steps-post" for line in ax.lines)
     assert len(ax.collections) >= 1  # last emitted score persists to context end
     plt.close(fig)
@@ -202,7 +202,9 @@ def test_metadata_and_index_serialization_without_auc_ap(tmp_path):
     case = cases.SelectedCase(event, "medium", "stratified-random", "GT only", 2)
     anchors = [("start", 10), ("middle", 15), ("end", 19)]
     metadata = cases.case_metadata(
-        case, seed=42, score_mode="window-end", context=(0, 3), anchors=anchors,
+        case, seed=42, score_mode="window-end", plot_range="full",
+        frame_context=(0, 3), plot_context=(0, 5),
+        num_gt_events_in_video=1, local_zoom_exported=False, anchors=anchors,
         duplicates=[], source_window_score_csv=tmp_path / "scores.csv",
         source_gt=tmp_path / "gt.txt", source_video=tmp_path / "video.mp4",
         commit="abc123", score_note="window score emitted at window end",
@@ -211,6 +213,7 @@ def test_metadata_and_index_serialization_without_auc_ap(tmp_path):
     assert metadata["selected_frame_indices"] == [10, 15, 19]
     assert metadata["git_commit"] == "abc123"
     assert metadata["git_worktree_dirty"] is False
+    assert metadata["plot_context_end_sec"] == 5
     assert not {"auc", "ap", "selection_score"}.intersection(metadata)
     row = cases.index_row(case, seed=42, output_path=tmp_path / event.case_id)
     cases.write_csv(tmp_path / "index.csv", cases.INDEX_FIELDS, [row])
@@ -425,7 +428,9 @@ def test_high_auc_export_audit_metadata_index_candidates_and_gallery(tmp_path, m
         case_dir = kwargs["output_dir"] / case.event.case_id
         case_dir.mkdir()
         (case_dir / "metadata.json").write_text(json.dumps(cases.case_metadata(
-            case, seed=kwargs["seed"], score_mode="window-end", context=(0, 6),
+            case, seed=kwargs["seed"], score_mode="window-end", plot_range="full",
+            frame_context=(0, 6), plot_context=(0, 6),
+            num_gt_events_in_video=1, local_zoom_exported=False,
             anchors=[], duplicates=[], source_window_score_csv=tmp_path / "scores.csv",
             source_gt=tmp_path / "gt.txt", source_video=tmp_path / "video.mp4",
             commit="test", score_note="window-end",
@@ -474,3 +479,118 @@ def test_high_auc_overlap_rejects_unavailable_distinct_failures(tmp_path):
             events, records, infer_dir=infer_dir, num_cases=1, seed=1,
             auc_top_k=6, auc_min=None, num_failures=1, failure_bottom_k=2, failure_seed=1,
         )
+
+
+def test_full_and_local_plot_context_do_not_change_event_frame_anchors():
+    event = _event(start=30, end=40, fps=10, n_frames=100)
+    frame_context = cases.context_interval(event, pre_sec=1, post_sec=2)
+    anchors, _ = cases.temporal_anchors(event, pre_sec=1, post_sec=2, frames_per_case=7)
+    assert frame_context == (2, 6)
+    assert cases.plot_context_interval(event, frame_context, "full") == (0, 10)
+    assert cases.plot_context_interval(event, frame_context, "local") == frame_context
+    assert anchors[0] == ("pre", 25)
+    assert anchors[-1] == ("post", 49)
+    assert [label for label, _ in anchors[1:-1]] == ["start", "early", "middle", "late", "end"]
+
+
+def test_full_window_end_scores_and_timeline_include_all_windows(tmp_path):
+    event = _event(start=30, end=40, fps=10, n_frames=100)
+    case = cases.SelectedCase(event, "medium", "manual", "manual")
+    path = tmp_path / "video_window_scores.csv"
+    scores = [i / 10 for i in range(10)]
+    _write_windows(path, "video", scores)
+    rows = cases.read_window_scores(path, video_id="video", n_frames=100, fps=10)
+    full = cases.plot_context_interval(event, (2, 6), "full")
+    full_x, full_y, _ = cases.score_points(tmp_path, case, rows, full, "window-end")
+    local_x, local_y, _ = cases.score_points(tmp_path, case, rows, (2, 6), "window-end")
+    assert full_x.tolist() == list(range(1, 11))
+    assert full_y.tolist() == scores
+    assert local_x.tolist() == [2, 3, 4, 5, 6]
+    assert local_y.tolist() == scores[1:6]
+    gt = np.array([0] * 30 + [1] * 10 + [0] * 60)
+    timeline = cases.case_timeline(case, rows, gt)
+    assert len(timeline) == 10
+    assert [row["window_index"] for row in timeline] == list(range(10))
+    assert [row["gt_overlap"] for row in timeline] == [0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+
+
+def test_full_frame_score_modes_include_entire_valid_video(tmp_path):
+    event = _event(start=10, end=20, fps=10, n_frames=30)
+    case = cases.SelectedCase(event, "medium", "manual", "manual")
+    np.save(tmp_path / "video_causal_frame_scores.npy", np.arange(30) / 30)
+    np.save(tmp_path / "video_causal_valid_mask.npy", np.array([False] * 10 + [True] * 20))
+    np.save(tmp_path / "video_standard_frame_scores.npy", np.arange(30) / 30)
+    causal_x, _, _ = cases.score_points(tmp_path, case, [], (0, 3), "causal-frame")
+    standard_x, _, _ = cases.score_points(tmp_path, case, [], (0, 3), "standard-frame")
+    assert causal_x.tolist() == pytest.approx([i / 10 for i in range(10, 30)])
+    assert standard_x.tolist() == pytest.approx([i / 10 for i in range(30)])
+
+
+def test_full_curve_distinguishes_selected_and_other_gt_events():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    event = _event(start=30, end=40, fps=10, n_frames=100)
+    case = cases.SelectedCase(event, "medium", "manual", "manual")
+    fig, ax = plt.subplots()
+    cases._draw_curve(ax, case=case, x=np.arange(1, 11), y=np.full(10, 0.5),
+                      all_events=[(10, 20), (30, 40), (70, 80)],
+                      plot_context=(0, 10), score_mode="window-end")
+    labels = ax.get_legend_handles_labels()[1]
+    assert set(labels) == {"Selected GT event", "Other GT anomaly interval", "Anomaly score"}
+    assert [patch.get_alpha() for patch in ax.patches] == [0.10, 0.20, 0.10]
+    assert ax.get_xlim() == (0, 10)
+    assert ax.get_ylim() == (0, 1)
+    assert sum(line.get_linestyle() == "--" for line in ax.lines) == 2
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("plot_args,expected_range,zoom", [
+    ([], "full", False),
+    (["--plot-range", "local"], "local", False),
+    (["--export-local-zoom"], "full", True),
+])
+def test_export_plot_range_metadata_timeline_and_optional_zoom(
+    tmp_path, monkeypatch, plot_args, expected_range, zoom,
+):
+    video_id = "multi.event"
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({video_id: {"n_frames": 60, "fps": 10}}))
+    gt_root, infer_dir, video_root, output_dir = (
+        tmp_path / "gt", tmp_path / "infer", tmp_path / "videos", tmp_path / "out",
+    )
+    _write_gt(gt_root, video_id, [0] * 10 + [1] * 10 + [0] * 20 + [1] * 10 + [0] * 10)
+    infer_dir.mkdir()
+    video_root.mkdir()
+    (video_root / f"{video_id}.mp4").touch()
+    _write_windows(infer_dir / f"{video_id}_window_scores.csv", video_id, [0.1, 0.8, 0.2, 0.1, 0.9, 0.2])
+    monkeypatch.setattr(cases, "decode_selected_frames", lambda path, indices, n_frames: [
+        np.full((16, 20, 3), 80, dtype=np.uint8) for _ in indices
+    ])
+    cases.main([
+        "--infer-dir", str(infer_dir), "--video-root", str(video_root),
+        "--gt-root", str(gt_root), "--manifest", str(manifest_path),
+        "--output-dir", str(output_dir), "--selection-mode", "manual",
+        "--video-ids", f"{video_id}__event00", "--pre-sec", "0.5",
+        "--post-sec", "0.5", "--dpi", "72", *plot_args,
+    ])
+    case_dir = output_dir / f"{video_id}__event00"
+    metadata = json.loads((case_dir / "metadata.json").read_text())
+    assert metadata["plot_range"] == expected_range
+    assert (metadata["frame_context_start_sec"], metadata["frame_context_end_sec"]) == (0.5, 2.5)
+    expected_plot = (0, 6) if expected_range == "full" else (0.5, 2.5)
+    assert (metadata["plot_context_start_sec"], metadata["plot_context_end_sec"]) == expected_plot
+    assert metadata["num_gt_events_in_video"] == 2
+    assert metadata["selected_event_index"] == 0
+    assert metadata["local_zoom_exported"] is zoom
+    assert metadata["selected_frame_indices"][0] == 8
+    assert (case_dir / "case_panel.png").is_file()
+    assert (case_dir / "score_curve.pdf").is_file()
+    assert (case_dir / "score_curve_local.pdf").is_file() is zoom
+    assert (case_dir / "score_curve_local.png").is_file() is zoom
+    with (case_dir / "timeline.csv").open(newline="") as handle:
+        timeline = list(csv.DictReader(handle))
+    assert len(timeline) == 6
+    assert [int(row["window_index"]) for row in timeline] == list(range(6))
