@@ -271,3 +271,206 @@ def test_auto_export_fails_if_any_gt_event_video_has_no_scores(tmp_path):
             "--gt-root", str(gt_root), "--manifest", str(manifest),
             "--output-dir", str(tmp_path / "out"),
         ])
+
+
+def _auc_fixture(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    gt_root, infer_dir = tmp_path / "gt", tmp_path / "infer"
+    infer_dir.mkdir()
+    aucs = [0.99, 0.95, 0.80, 0.30, 0.20, 0.10]
+    ids = [f"v{i}" for i in range(len(aucs))] + ["normal", "undefined"]
+    manifest = {video_id: {"n_frames": 60, "fps": 10.0} for video_id in ids}
+    manifest_path.write_text(json.dumps(manifest))
+    videos = []
+    for i, video_id in enumerate(ids):
+        gt = [0] * 60
+        if video_id != "normal":
+            gt[10:11 + i] = [1] * (i + 1)
+            if video_id == "v0":
+                gt[30:34] = [1] * 4
+        _write_gt(gt_root, video_id, gt)
+        _write_windows(infer_dir / f"{video_id}_window_scores.csv", video_id, [0.5] * 6)
+        videos.append({
+            "video_id": video_id,
+            "standard_auc": aucs[i] if i < len(aucs) else 0.99 if video_id == "normal" else None,
+            "standard_ap": 0.5, "causal_auc": 0.4, "causal_ap": 0.3,
+        })
+    (infer_dir / "metrics.json").write_text(json.dumps({"videos": videos}))
+    args = [
+        "--infer-dir", str(infer_dir), "--video-root", str(tmp_path),
+        "--gt-root", str(gt_root), "--manifest", str(manifest_path),
+        "--output-dir", str(tmp_path / "out"), "--selection-mode", "high-auc-pool",
+    ]
+    return manifest_path, gt_root, infer_dir, args
+
+
+def test_high_auc_metrics_reading_and_none_or_normal_exclusion(tmp_path):
+    manifest_path, gt_root, infer_dir, _ = _auc_fixture(tmp_path)
+    manifest = cases.load_manifest(manifest_path)
+    events = cases.build_candidates(manifest, gt_root)
+    records = cases.load_video_metrics(infer_dir / "metrics.json", events, manifest)
+    assert [record["video_id"] for record in records] == [f"v{i}" for i in range(6)]
+    assert [record["auc_rank"] for record in records] == list(range(1, 7))
+    assert records[0]["num_gt_events"] == 2
+    assert records[0]["standard_ap"] == 0.5
+    (infer_dir / "bad.json").write_text(json.dumps({"videos": {}}))
+    with pytest.raises(ValueError, match="expected metrics"):
+        cases.load_video_metrics(infer_dir / "bad.json", events, manifest)
+
+
+def test_high_auc_top_k_min_and_multi_event_pool(tmp_path):
+    manifest_path, gt_root, infer_dir, _ = _auc_fixture(tmp_path)
+    manifest = cases.load_manifest(manifest_path)
+    events = cases.build_candidates(manifest, gt_root)
+    records = cases.load_video_metrics(infer_dir / "metrics.json", events, manifest)
+    selected, audit, rows = cases.select_high_auc_cases(
+        events, records, infer_dir=infer_dir, num_cases=0, seed=42,
+        auc_top_k=2, auc_min=0.9, num_failures=0, failure_bottom_k=30, failure_seed=42,
+    )
+    assert [record["video_id"] for record in audit["success_candidate_videos"]] == ["v0", "v1"]
+    assert audit["success_event_pool_size"] == 3
+    assert {case.event.case_id for case in selected} == {"v0__event00", "v0__event01", "v1__event00"}
+    assert [row["pool_role"] for row in rows] == ["success_candidate"] * 2 + ["unused"] * 4
+    _, filtered, _ = cases.select_high_auc_cases(
+        events, records, infer_dir=infer_dir, num_cases=0, seed=42,
+        auc_top_k=None, auc_min=0.95, num_failures=0, failure_bottom_k=30, failure_seed=42,
+    )
+    assert filtered["success_video_pool_size"] == 2
+
+
+def test_high_auc_duration_stratification_is_seeded(tmp_path):
+    manifest_path, gt_root, infer_dir, _ = _auc_fixture(tmp_path)
+    manifest = cases.load_manifest(manifest_path)
+    events = cases.build_candidates(manifest, gt_root)
+    records = cases.load_video_metrics(infer_dir / "metrics.json", events, manifest)
+    def select(order):
+        return cases.select_high_auc_cases(
+            order, records, infer_dir=infer_dir, num_cases=3, seed=17,
+            auc_top_k=4, auc_min=None, num_failures=0, failure_bottom_k=30, failure_seed=17,
+        )[0]
+    first, second = select(events), select(list(reversed(events)))
+    assert [case.event.case_id for case in first] == [case.event.case_id for case in second]
+    assert {case.duration_bin for case in first} == set(cases.BINS)
+    assert all(case.selection_mode == "high-auc-pool" and case.case_role == "success" for case in first)
+
+
+def test_failure_bottom_k_seeded_and_median_event(tmp_path):
+    manifest_path, gt_root, infer_dir, _ = _auc_fixture(tmp_path)
+    manifest = cases.load_manifest(manifest_path)
+    events = cases.build_candidates(manifest, gt_root)
+    records = cases.load_video_metrics(infer_dir / "metrics.json", events, manifest)
+    def select():
+        return cases.select_high_auc_cases(
+            events, records, infer_dir=infer_dir, num_cases=1, seed=42,
+            auc_top_k=2, auc_min=None, num_failures=2, failure_bottom_k=2, failure_seed=7,
+        )
+    selected, audit, rows = select()
+    assert [record["video_id"] for record in audit["failure_pool_videos"]] == ["v5", "v4"]
+    assert [case.event.video_id for case in selected if case.case_role == "failure"] == [
+        case.event.video_id for case in select()[0] if case.case_role == "failure"
+    ]
+    assert {case.event.video_id for case in selected if case.case_role == "failure"} == {"v4", "v5"}
+    assert [row["pool_role"] for row in rows[-2:]] == ["failure_candidate"] * 2
+    assert all(case.sampling_seed == 7 for case in selected if case.case_role == "failure")
+
+
+def test_failure_uses_event_closest_to_video_median_duration(tmp_path):
+    events = [_event("high", end=12)] + [
+        _event("low", index, start=10 + index * 15, end=10 + index * 15 + duration,
+               n_frames=70)
+        for index, duration in enumerate((2, 5, 11))
+    ]
+    records = [
+        {"video_id": "high", "standard_auc": 0.9, "auc_rank": 1, "num_gt_events": 1},
+        {"video_id": "low", "standard_auc": 0.1, "auc_rank": 2, "num_gt_events": 3},
+    ]
+    for video_id in ("high", "low"):
+        (tmp_path / f"{video_id}_window_scores.csv").touch()
+    selected, _, _ = cases.select_high_auc_cases(
+        events, records, infer_dir=tmp_path, num_cases=1, seed=1,
+        auc_top_k=1, auc_min=None, num_failures=1, failure_bottom_k=1, failure_seed=1,
+    )
+    failure = next(case for case in selected if case.case_role == "failure")
+    assert failure.event.event_index == 1
+
+
+def test_high_auc_pool_missing_window_scores_fails_even_in_dry_run(tmp_path):
+    _, _, infer_dir, args = _auc_fixture(tmp_path)
+    (infer_dir / "v0_window_scores.csv").unlink()
+    with pytest.raises(FileNotFoundError, match="v0"):
+        cases.main(args + ["--auc-top-k", "1", "--dry-run"])
+    (infer_dir / "v0_window_scores.csv").touch()
+    (infer_dir / "v5_window_scores.csv").unlink()
+    with pytest.raises(FileNotFoundError, match="v5"):
+        cases.main(args + ["--auc-top-k", "1", "--num-failures", "1",
+                           "--failure-bottom-k", "1", "--dry-run"])
+
+
+def test_high_auc_dry_run_audit_does_not_write_outputs(tmp_path, capsys):
+    _, _, _, args = _auc_fixture(tmp_path)
+    cases.main(args + ["--auc-top-k", "2", "--num-cases", "2", "--dry-run"])
+    audit = json.loads(capsys.readouterr().out)
+    assert audit["selection_mode"] == "high-auc-pool"
+    assert audit["selection_basis"] == cases.AUC_SELECTION_BASIS
+    assert audit["success_video_pool_size"] == 2
+    assert audit["success_event_pool_size"] == 3
+    assert audit["num_selected_success"] == 2
+    assert len(audit["success_candidate_videos"]) == 2
+    assert not (tmp_path / "out").exists()
+
+
+def test_high_auc_export_audit_metadata_index_candidates_and_gallery(tmp_path, monkeypatch):
+    _, _, _, args = _auc_fixture(tmp_path)
+    def fake_export(case, **kwargs):
+        case_dir = kwargs["output_dir"] / case.event.case_id
+        case_dir.mkdir()
+        (case_dir / "metadata.json").write_text(json.dumps(cases.case_metadata(
+            case, seed=kwargs["seed"], score_mode="window-end", context=(0, 6),
+            anchors=[], duplicates=[], source_window_score_csv=tmp_path / "scores.csv",
+            source_gt=tmp_path / "gt.txt", source_video=tmp_path / "video.mp4",
+            commit="test", score_note="window-end",
+        )))
+        return cases.index_row(case, seed=kwargs["seed"], output_path=case_dir)
+    monkeypatch.setattr(cases, "export_case", fake_export)
+    cases.main(args + ["--auc-top-k", "2", "--num-cases", "2", "--num-failures", "1",
+                       "--failure-bottom-k", "2", "--failure-seed", "7"])
+    output = tmp_path / "out"
+    selection = json.loads((output / "selection.json").read_text())
+    assert selection["selection_basis"] == cases.AUC_SELECTION_BASIS
+    assert selection["metrics_path"].endswith("metrics.json")
+    assert selection["num_selected_success"] == 2
+    assert selection["num_failures"] == 1
+    with (output / "index.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["case_role"] for row in rows] == ["success", "success", "failure"]
+    assert float(rows[0]["video_standard_auc"]) >= float(rows[1]["video_standard_auc"])
+    assert all(row["selection_basis"] == cases.AUC_SELECTION_BASIS for row in rows)
+    success_meta = json.loads((output / rows[0]["case_id"] / "metadata.json").read_text())
+    failure_meta = json.loads((output / rows[-1]["case_id"] / "metadata.json").read_text())
+    assert success_meta["success_pool_rank"] == success_meta["auc_rank"]
+    assert success_meta["success_pool_size"] == 2
+    assert success_meta["success_selection_reason"]
+    assert failure_meta["failure_pool_bottom_k"] == 2
+    assert failure_meta["failure_selection_reason"]
+    assert failure_meta["seed"] == 7
+    with (output / "candidate_videos.csv").open(newline="") as handle:
+        candidates = list(csv.DictReader(handle))
+    assert len(candidates) == 6
+    assert candidates[0]["pool_role"] == "success_candidate"
+    assert candidates[-1]["pool_role"] == "failure_candidate"
+    assert candidates[0]["num_gt_events"] == "2"
+    gallery = (output / "gallery.html").read_text()
+    assert "success" in gallery and "failure" in gallery and "standard AUC" in gallery
+    assert gallery.index("success") < gallery.index("failure")
+
+
+def test_high_auc_overlap_rejects_unavailable_distinct_failures(tmp_path):
+    manifest_path, gt_root, infer_dir, _ = _auc_fixture(tmp_path)
+    manifest = cases.load_manifest(manifest_path)
+    events = cases.build_candidates(manifest, gt_root)
+    records = cases.load_video_metrics(infer_dir / "metrics.json", events, manifest)
+    with pytest.raises(ValueError, match="outside the success pool"):
+        cases.select_high_auc_cases(
+            events, records, infer_dir=infer_dir, num_cases=1, seed=1,
+            auc_top_k=6, auc_min=None, num_failures=1, failure_bottom_k=2, failure_seed=1,
+        )

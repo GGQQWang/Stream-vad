@@ -8,7 +8,7 @@ import html
 import json
 import math
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -19,7 +19,13 @@ BINS = ("short", "medium", "long")
 INDEX_FIELDS = (
     "case_id", "video_id", "event_index", "duration_bin", "event_duration_sec",
     "event_start_sec", "event_end_sec", "selection_mode", "seed", "output_path",
+    "case_role", "video_standard_auc", "auc_rank", "selection_basis",
 )
+CANDIDATE_VIDEO_FIELDS = (
+    "video_id", "standard_auc", "standard_ap", "causal_auc", "causal_ap",
+    "auc_rank", "num_gt_events", "pool_role",
+)
+AUC_SELECTION_BASIS = "per-video standard_auc from existing metrics.json"
 TIMELINE_FIELDS = (
     "video_id", "case_id", "window_index", "start_frame", "end_frame",
     "start_sec", "end_sec", "score_prob", "gt_overlap", "gt_at_window_end",
@@ -63,6 +69,12 @@ class SelectedCase:
     selection_mode: str
     reason: str
     random_rank: int | None = None
+    case_role: str = ""
+    video_standard_auc: float | None = None
+    auc_rank: int | None = None
+    success_pool_size: int | None = None
+    failure_pool_bottom_k: int | None = None
+    sampling_seed: int | None = None
 
 
 def normalize_video_id(value: str | Path) -> str:
@@ -220,6 +232,149 @@ def select_cases(
         "unfilled_total": remaining,
     }
     return selected, audit
+
+
+def load_video_metrics(path: str | Path, events: list[Event], manifest: dict[str, dict]) -> list[dict]:
+    with Path(path).open(encoding="utf-8") as handle:
+        metrics = json.load(handle)
+    if not isinstance(metrics, dict) or not isinstance(metrics.get("videos"), list):
+        raise ValueError(f"{path}: expected metrics['videos'] list")
+    event_counts: dict[str, int] = {}
+    for event in events:
+        event_counts[event.video_id] = event_counts.get(event.video_id, 0) + 1
+    records = []
+    seen = set()
+    for video in metrics["videos"]:
+        if not isinstance(video, dict) or "video_id" not in video:
+            raise ValueError(f"{path}: invalid per-video metrics entry")
+        video_id = normalize_video_id(video["video_id"])
+        if video_id in seen:
+            raise ValueError(f"{path}: duplicate video_id in metrics: {video_id}")
+        seen.add(video_id)
+        if video_id not in manifest or not event_counts.get(video_id):
+            continue
+        auc = video.get("standard_auc")
+        if auc is None:
+            continue
+        if isinstance(auc, bool) or not isinstance(auc, (int, float)) or not math.isfinite(auc) or not 0 <= auc <= 1:
+            raise ValueError(f"{path}: invalid standard_auc for {video_id}: {auc!r}")
+        records.append({
+            "video_id": video_id, "standard_auc": float(auc),
+            "standard_ap": video.get("standard_ap"),
+            "causal_auc": video.get("causal_auc"), "causal_ap": video.get("causal_ap"),
+            "num_gt_events": event_counts[video_id],
+        })
+    records.sort(key=lambda item: (-item["standard_auc"], item["video_id"]))
+    for rank, record in enumerate(records, start=1):
+        record["auc_rank"] = rank
+    return records
+
+
+def select_high_auc_cases(
+    events: list[Event], records: list[dict], *, infer_dir: Path, num_cases: int,
+    seed: int, auc_top_k: int | None, auc_min: float | None,
+    num_failures: int, failure_bottom_k: int, failure_seed: int,
+) -> tuple[list[SelectedCase], dict, list[dict]]:
+    if num_cases < 0 or num_failures < 0 or (auc_top_k is not None and auc_top_k <= 0):
+        raise ValueError("num-cases/num-failures must be nonnegative; auc-top-k must be positive")
+    if num_failures and failure_bottom_k <= 0:
+        raise ValueError("failure-bottom-k must be positive when selecting failures")
+    if auc_min is not None and (not math.isfinite(auc_min) or not 0 <= auc_min <= 1):
+        raise ValueError("auc-min must be within [0, 1]")
+
+    success_pool = [record for record in records if auc_min is None or record["standard_auc"] >= auc_min]
+    if auc_top_k is not None:
+        success_pool = success_pool[:auc_top_k]
+    # Define the bottom-K on all eligible abnormal videos, before disjointness handling.
+    failure_pool = (
+        sorted(records, key=lambda item: (item["standard_auc"], item["video_id"]))[:failure_bottom_k]
+        if num_failures else []
+    )
+    success_ids = {record["video_id"] for record in success_pool}
+    missing = sorted({record["video_id"] for record in success_pool + failure_pool
+                      if not (infer_dir / f"{record['video_id']}_window_scores.csv").is_file()})
+    if missing:
+        raise FileNotFoundError(
+            f"selected AUC candidate pool lacks window-score CSV; selection aborted: {missing}"
+        )
+
+    events_by_video: dict[str, list[Event]] = {}
+    for event in events:
+        events_by_video.setdefault(event.video_id, []).append(event)
+    success_events = [event for record in success_pool for event in events_by_video[record["video_id"]]]
+    if not success_events and not num_failures:
+        raise ValueError("no calculable abnormal videos satisfy the high-AUC selection filters")
+    selected: list[SelectedCase] = []
+    success_quantiles = None
+    if success_events:
+        bins, success_quantiles = duration_bins(success_events)
+        if num_cases:
+            sampled, _ = select_cases(success_events, bins, mode="stratified-random", num_cases=num_cases, seed=seed)
+        else:
+            sampled, _ = select_cases(success_events, bins, mode="all", num_cases=0, seed=seed)
+        by_id = {record["video_id"]: record for record in success_pool}
+        selected = [replace(
+            case, selection_mode="high-auc-pool", case_role="success",
+            reason="high per-video standard_auc; duration-stratified seeded sampling" if num_cases else
+                   "high per-video standard_auc; all candidate events",
+            video_standard_auc=by_id[case.event.video_id]["standard_auc"],
+            auc_rank=by_id[case.event.video_id]["auc_rank"], success_pool_size=len(success_pool),
+            sampling_seed=seed,
+        ) for case in sampled]
+
+    # Never export the same logical case as both success and failure.
+    failure_options = [record for record in failure_pool if record["video_id"] not in success_ids]
+    if num_failures > len(failure_options):
+        raise ValueError(
+            f"bottom-K failure pool has only {len(failure_options)} videos outside the success pool; "
+            f"cannot select {num_failures} distinct failures"
+        )
+    rng = np.random.default_rng(failure_seed)
+    indices = rng.permutation(len(failure_options))[:num_failures]
+    failure_bins = {}
+    if events:
+        failure_bins, _ = duration_bins(events)
+    for index in indices:
+        record = failure_options[int(index)]
+        video_events = events_by_video[record["video_id"]]
+        median = float(np.median([event.duration_sec for event in video_events]))
+        event = min(video_events, key=lambda item: (abs(item.duration_sec - median), item.event_index))
+        selected.append(SelectedCase(
+            event, failure_bins[event.case_id], "high-auc-pool",
+            "seeded random video from bottom-K per-video standard_auc; median-duration GT event",
+            case_role="failure", video_standard_auc=record["standard_auc"],
+            auc_rank=record["auc_rank"], failure_pool_bottom_k=failure_bottom_k,
+            sampling_seed=failure_seed,
+        ))
+
+    selected.sort(key=lambda case: (
+        case.case_role != "success",
+        -case.video_standard_auc if case.case_role == "success" else case.video_standard_auc,
+        case.event.case_id,
+    ))
+    candidate_rows = []
+    failure_ids = {record["video_id"] for record in failure_pool}
+    for record in records:
+        video_id = record["video_id"]
+        candidate_rows.append({
+            **record,
+            "pool_role": "success_candidate" if video_id in success_ids else
+                         "failure_candidate" if video_id in failure_ids else "unused",
+        })
+    audit = {
+        "selection_mode": "high-auc-pool", "selection_basis": AUC_SELECTION_BASIS,
+        "primary_filter": "high per-video standard_auc",
+        "secondary_sampling": "duration-stratified seeded sampling" if num_cases else "all candidate events",
+        "auc_top_k": auc_top_k, "auc_min": auc_min,
+        "success_video_pool_size": len(success_pool), "success_event_pool_size": len(success_events),
+        "success_duration_quantiles_sec": success_quantiles,
+        "num_selected_success": sum(case.case_role == "success" for case in selected),
+        "num_failures": sum(case.case_role == "failure" for case in selected),
+        "failure_bottom_k": failure_bottom_k, "seed": seed, "failure_seed": failure_seed,
+        "success_candidate_videos": success_pool, "failure_pool_videos": failure_pool,
+        "failure_pool_excluded_success_video_ids": sorted(success_ids & failure_ids),
+    }
+    return selected, audit, candidate_rows
 
 
 def temporal_anchors(
@@ -480,7 +635,7 @@ def case_metadata(
         "duration_bin": case.duration_bin,
         "selection_mode": case.selection_mode,
         "selection_reason": case.reason,
-        "seed": seed,
+        "seed": case.sampling_seed if case.sampling_seed is not None else seed,
         "score_mode": score_mode,
         "score_mode_note": score_note,
         "gt_overlap_definition": "fraction of GT-positive frames in [start_frame, end_frame)",
@@ -499,6 +654,21 @@ def case_metadata(
     }
     if case.random_rank is not None:
         metadata["selection_rank_within_random_permutation"] = case.random_rank
+    if case.selection_mode == "high-auc-pool":
+        metadata.update({
+            "case_role": case.case_role, "selection_basis": AUC_SELECTION_BASIS,
+            "video_standard_auc": case.video_standard_auc, "auc_rank": case.auc_rank,
+        })
+        if case.case_role == "success":
+            metadata.update({
+                "success_pool_rank": case.auc_rank, "success_pool_size": case.success_pool_size,
+                "success_selection_reason": case.reason,
+            })
+        else:
+            metadata.update({
+                "failure_pool_bottom_k": case.failure_pool_bottom_k,
+                "failure_selection_reason": case.reason,
+            })
     return metadata
 
 
@@ -509,23 +679,34 @@ def index_row(case: SelectedCase, *, seed: int, output_path: Path) -> dict:
         "event_index": event.event_index, "duration_bin": case.duration_bin,
         "event_duration_sec": event.duration_sec, "event_start_sec": event.start_sec,
         "event_end_sec": event.end_sec, "selection_mode": case.selection_mode,
-        "seed": seed, "output_path": str(output_path),
+        "seed": case.sampling_seed if case.sampling_seed is not None else seed,
+        "case_role": case.case_role, "video_standard_auc": case.video_standard_auc,
+        "auc_rank": case.auc_rank,
+        "selection_basis": AUC_SELECTION_BASIS if case.selection_mode == "high-auc-pool" else "",
     }
 
 
 def write_gallery(path: Path, index_rows: list[dict]) -> None:
     cards = []
-    for row in index_rows:
+    for row in sorted(index_rows, key=lambda item: (
+        item["case_role"] == "failure",
+        -item["video_standard_auc"] if item["case_role"] == "success" else
+        item["video_standard_auc"] if item["case_role"] == "failure" else 0,
+    )):
         case_id = html.escape(str(row["case_id"]))
         video_id = html.escape(str(row["video_id"]))
         href = quote(str(row["case_id"]), safe="")
         duration = float(row["event_duration_sec"])
         start, end = float(row["event_start_sec"]), float(row["event_end_sec"])
+        role = html.escape(str(row["case_role"]))
+        role_prefix = role + " · " if role else ""
+        auc = row["video_standard_auc"]
+        auc_label = f" · standard AUC {float(auc):.3f}" if auc is not None else ""
         cards.append(
             '<article><a href="' + href + '/case_panel.png"><img src="' + href +
             '/case_panel.png" alt="' + case_id + ' case panel"></a>' +
-            '<div class="details"><strong>' + case_id + '</strong><span>' + video_id +
-            f' · {duration:.2f} s · {html.escape(str(row["duration_bin"]))}' +
+            '<div class="details"><strong>' + role_prefix + case_id + '</strong><span>' + video_id +
+            auc_label + f' · {duration:.2f} s · {html.escape(str(row["duration_bin"]))}' +
             f' · {start:.2f}–{end:.2f} s</span><a href="' + href +
             '/case_panel.pdf">PDF</a></div></article>'
         )
@@ -594,9 +775,16 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--video-ids", nargs="+", default=[])
     parser.add_argument("--video-id-file", type=Path)
-    parser.add_argument("--selection-mode", choices=("manual", "stratified-random", "all"), default="stratified-random")
-    parser.add_argument("--num-cases", type=int, default=12)
+    parser.add_argument("--selection-mode", choices=("manual", "stratified-random", "high-auc-pool", "all"), default="stratified-random")
+    parser.add_argument("--num-cases", type=int, default=12,
+                        help="high-auc-pool: 0 exports every success event in the candidate pool")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--auc-top-k", type=int, help="top N videos by existing per-video standard AUC")
+    parser.add_argument("--auc-min", type=float, help="minimum existing per-video standard AUC")
+    parser.add_argument("--num-failures", type=int, default=0, help="additional failure videos to sample")
+    parser.add_argument("--failure-bottom-k", type=int, default=30,
+                        help="failure sampling pool size among lowest-AUC abnormal videos")
+    parser.add_argument("--failure-seed", type=int, help="defaults to --seed")
     parser.add_argument("--pre-sec", type=float, default=3.0)
     parser.add_argument("--post-sec", type=float, default=3.0)
     parser.add_argument("--score-mode", choices=("window-end", "causal-frame", "standard-frame"), default="window-end")
@@ -606,10 +794,17 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
     args = parser.parse_args(argv)
     if args.pre_sec < 0 or args.post_sec < 0 or args.frames_per_case < 3 or args.dpi <= 0:
         parser.error("pre/post seconds must be nonnegative; frames-per-case >= 3; dpi > 0")
+    if args.selection_mode != "high-auc-pool" and any((
+        args.auc_top_k is not None, args.auc_min is not None, args.num_failures,
+        args.failure_bottom_k != 30, args.failure_seed is not None,
+    )):
+        parser.error("AUC pool options require --selection-mode high-auc-pool")
     manifest = load_manifest(args.manifest)
     candidates = build_candidates(manifest, args.gt_root)
     bins, quantiles = duration_bins(candidates)
     selectors = _selectors_from_args(args)
+    if args.selection_mode == "high-auc-pool" and selectors:
+        parser.error("--video-ids/--video-id-file require --selection-mode manual")
     if args.selection_mode in {"stratified-random", "all"} and not args.dry_run:
         # Missing inference output is an error, never an implicit case-selection filter.
         missing = sorted({event.video_id for event in candidates
@@ -619,13 +814,25 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
                 f"{len(missing)} GT-positive videos lack window-score CSV; "
                 f"selection aborted without filtering candidates: {missing[:20]}"
             )
-    selected, audit = select_cases(
-        candidates, bins, mode=args.selection_mode, num_cases=args.num_cases,
-        seed=args.seed, selectors=selectors,
-    )
+    candidate_rows = None
+    if args.selection_mode == "high-auc-pool":
+        metrics_path = args.infer_dir / "metrics.json"
+        records = load_video_metrics(metrics_path, candidates, manifest)
+        selected, audit, candidate_rows = select_high_auc_cases(
+            candidates, records, infer_dir=args.infer_dir, num_cases=args.num_cases,
+            seed=args.seed, auc_top_k=args.auc_top_k, auc_min=args.auc_min,
+            num_failures=args.num_failures, failure_bottom_k=args.failure_bottom_k,
+            failure_seed=args.seed if args.failure_seed is None else args.failure_seed,
+        )
+    else:
+        selected, audit = select_cases(
+            candidates, bins, mode=args.selection_mode, num_cases=args.num_cases,
+            seed=args.seed, selectors=selectors,
+        )
     selection = {
         "selection_mode": args.selection_mode,
-        "selection_basis": "GT event duration tertiles only; no model predictions or performance metrics",
+        "selection_basis": AUC_SELECTION_BASIS if args.selection_mode == "high-auc-pool" else
+                           "GT event duration tertiles only; no model predictions or performance metrics",
         "seed": args.seed,
         "rng": "numpy.random.default_rng",
         "manifest": str(args.manifest),
@@ -645,10 +852,15 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
                 "duration_bin": case.duration_bin,
                 "selection_reason": case.reason,
                 "selection_rank_within_random_permutation": case.random_rank,
+                "case_role": case.case_role, "video_standard_auc": case.video_standard_auc,
+                "auc_rank": case.auc_rank,
             }
             for case in selected
         ],
     }
+    if args.selection_mode == "high-auc-pool":
+        selection["metrics_path"] = str(metrics_path)
+        selection.update(audit)
     if args.dry_run:
         print(json.dumps(selection, indent=2))
         return selected
@@ -658,6 +870,8 @@ def main(argv: list[str] | None = None) -> list[SelectedCase]:
     selection["git_commit"] = commit
     selection["git_worktree_dirty"] = worktree_dirty
     (args.output_dir / "selection.json").write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    if candidate_rows is not None:
+        write_csv(args.output_dir / "candidate_videos.csv", CANDIDATE_VIDEO_FIELDS, candidate_rows)
     index = []
     for case in selected:
         index.append(export_case(
