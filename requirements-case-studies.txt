@@ -1,0 +1,4 @@
+# Optional dependencies for tools/export_case_studies.py.
+numpy
+matplotlib>=3.5
+decord>=0.6.0
