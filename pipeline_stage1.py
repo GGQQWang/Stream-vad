@@ -14,6 +14,7 @@ import argparse
 import math
 import os
 import random
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -75,7 +76,7 @@ from ibq_utils import (
 )
 from world_model import WorldModelBranch
 from qwen_vl_compat import (
-    language_hidden_size, load_vl_model, load_vl_processor, process_video_clips,
+    language_hidden_size, load_vl_model, load_vl_processor, model_family, process_video_clips,
     resolve_pixel_budget,
 )
 
@@ -510,10 +511,15 @@ class StreamingVADGenerationModel(nn.Module):
         vit_micro_batch: int = 1,
         world_include_decoder: bool = True,
         visual_fusion: str = "state_only",
+        temporal_mode: str = "ssm",
     ):
         super().__init__()
         if visual_fusion not in VISUAL_FUSION_MODES:
             raise ValueError(f"unknown visual_fusion: {visual_fusion}")
+        if temporal_mode not in {"ssm", "none"}:
+            raise ValueError(f"unknown temporal_mode: {temporal_mode}")
+        if temporal_mode == "none" and (visual_fusion != "state_only" or world_include_decoder):
+            raise ValueError("temporal_mode=none requires state_only fusion and no world decoder")
         actual_hidden = language_hidden_size(qwen.config)
         if llm_hidden is None:
             llm_hidden = actual_hidden
@@ -522,15 +528,15 @@ class StreamingVADGenerationModel(nn.Module):
         visual = _find_visual(qwen)
         self.vit = ViTForwarder(visual, TemporalTokenReducer())
         self.spatial = SpatialTokenCompressor(reduction_ratio, k=lof_k)
-        self.ssm = SSMBlock(d_input=llm_hidden, d_model=d_ssm,
-                            n_layers=n_ssm, llm_hidden=llm_hidden)
-        self.adapter = nn.Sequential(
-            nn.Linear(llm_hidden, llm_hidden),
-            nn.GELU(),
-            nn.Linear(llm_hidden, llm_hidden),
-            nn.LayerNorm(llm_hidden),
-        )
-        self.alpha_logit = nn.Parameter(torch.tensor(-2.1972246))
+        self.ssm = (SSMBlock(d_input=llm_hidden, d_model=d_ssm,
+                             n_layers=n_ssm, llm_hidden=llm_hidden)
+                    if temporal_mode == "ssm" else None)
+        self.adapter = (nn.Sequential(
+            nn.Linear(llm_hidden, llm_hidden), nn.GELU(),
+            nn.Linear(llm_hidden, llm_hidden), nn.LayerNorm(llm_hidden),
+        ) if temporal_mode == "ssm" else None)
+        self.alpha_logit = (nn.Parameter(torch.tensor(-2.1972246))
+                            if temporal_mode == "ssm" else None)
         self.score_head = nn.Sequential(
             nn.Linear(llm_hidden, llm_hidden // 4),
             nn.GELU(),
@@ -539,25 +545,27 @@ class StreamingVADGenerationModel(nn.Module):
         )
         self.score_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
         self.summary_query = nn.Parameter(torch.randn(1, llm_hidden) * 0.02)
-        self.spatial_film = SpatialFiLM(d_ssm=d_ssm, llm_hidden=llm_hidden)
+        self.spatial_film = (SpatialFiLM(d_ssm=d_ssm, llm_hidden=llm_hidden)
+                             if temporal_mode == "ssm" else None)
         # world-model auxiliary branch (training-only): SSM internal
         # temporal hidden -> predicted delta; current spatial tokens +
         # delta token -> autoregressive IBQ visual decoder.  The frozen
         # IBQ codebook is a non-persistent buffer loaded from the IBQ
         # cache at startup; logits are per-position dot products against
         # it, so no trainable [V, H] output layer exists.
-        self.world_branch = WorldModelBranch(
+        self.world_branch = (WorldModelBranch(
             llm_hidden=llm_hidden, d_ssm=d_ssm,
             include_decoder=world_include_decoder,
-        )
-        self.temporal_modulator = nn.Sequential(
+        ) if temporal_mode == "ssm" else None)
+        self.temporal_modulator = (nn.Sequential(
             nn.LayerNorm(IBQ_CODE_EMBED_DIM),
             nn.Linear(IBQ_CODE_EMBED_DIM, IBQ_CODE_EMBED_DIM),
             nn.GELU(),
             nn.Linear(IBQ_CODE_EMBED_DIM, llm_hidden),
-        )
-        nn.init.zeros_(self.temporal_modulator[-1].weight)
-        nn.init.zeros_(self.temporal_modulator[-1].bias)
+        ) if temporal_mode == "ssm" else None)
+        if self.temporal_modulator is not None:
+            nn.init.zeros_(self.temporal_modulator[-1].weight)
+            nn.init.zeros_(self.temporal_modulator[-1].bias)
         self.world_include_decoder = world_include_decoder
         codebook = (
             torch.empty(IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
@@ -567,6 +575,7 @@ class StreamingVADGenerationModel(nn.Module):
         self.world_codebook_size = IBQ_CODEBOOK_SIZE
         self.llm_hidden = llm_hidden
         self.visual_fusion = visual_fusion
+        self.temporal_mode = temporal_mode
         self.vit_micro_batch = vit_micro_batch
         self.debug_state = False
         self.last_modulation_stats: Dict[str, float] = {}
@@ -692,6 +701,11 @@ class StreamingVADGenerationModel(nn.Module):
         return_internal: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """SSM + gated residual over precomputed per-window visual vectors."""
+        if self.temporal_mode == "none":
+            self.last_modulation_stats = {}
+            if return_internal:
+                return window_batch, window_batch, None, None, ssm_state_cache
+            return window_batch, window_batch, None, ssm_state_cache
         valid_b, valid_w = valid_mask.nonzero(as_tuple=True)
         ssm_param = next(self.ssm.parameters())
         adapter_param = next(self.adapter.parameters())
@@ -2035,6 +2049,10 @@ def main():
                        help="run the zero-temporal shortcut baseline every N optimizer steps (0 disables)")
     parser.add_argument("--visual-fusion", choices=("state_only", "film_spatial", "state_spatial_film"), default="state_only",
                        help="state_only uses one state token; film_spatial uses FiLM spatial tokens; state_spatial_film uses both")
+    parser.add_argument("--ablation-group", choices=("B", "C", "D", "E"), default="",
+                        help="A-E study: B/C use current-window-only features; D/E use causal SSM and state-guided fusion")
+    parser.add_argument("--max-train-updates", type=int, default=0,
+                        help="smoke test only: stop after N optimizer updates; do not use for formal training")
     parser.add_argument("--binary-threshold", type=float, default=0.5)
     parser.add_argument("--dump-window-scores", default="",
                        help="optional JSON path for validation window-level predictions; also writes *_sorted.csv")
@@ -2063,6 +2081,20 @@ def main():
         raise ValueError("--resume and --init-checkpoint are mutually exclusive")
     if args.visual_fusion in SPATIAL_FUSION_MODES and args.objective != "score_token":
         raise ValueError("spatial FiLM fusion currently supports --objective score_token only")
+    if args.ablation_group:
+        expected_semantics = args.ablation_group in {"C", "E"}
+        if (args.objective != "score_token" or args.visual_fusion != "state_only"
+                or args.lambda_world != 0 or args.world_warmup_steps != 0
+                or args.lambda_score != 1 or (args.lambda_sum > 0) != expected_semantics
+                or args.lambda_sum < 0 or args.init_checkpoint):
+            raise ValueError(
+                "ablation B-E requires score_token/state_only, lambda_score=1, "
+                "lambda_world=0, world_warmup_steps=0, matching lambda_sum, "
+                "and no init-checkpoint"
+            )
+    if args.max_train_updates < 0:
+        raise ValueError("--max-train-updates must be nonnegative")
+    temporal_mode = "none" if args.ablation_group in {"B", "C"} else "ssm"
 
     set_seed(args.seed)
     device = torch.device(args.device)
@@ -2096,6 +2128,10 @@ def main():
         attn_implementation=args.attn_implementation,
         device_map=None, low_cpu_mem_usage=True,
     ).to(device)
+    if args.ablation_group and (
+        model_family(qwen.config) != "qwen2_vl" or language_hidden_size(qwen.config) != 3584
+    ):
+        raise ValueError("ablation B-E requires Qwen2-VL-7B (language hidden size 3584)")
     qwen.config.use_cache = False
     if hasattr(qwen, "gradient_checkpointing_enable"):
         qwen.gradient_checkpointing_enable()
@@ -2132,39 +2168,50 @@ def main():
         qwen, d_ssm=args.d_ssm,
         vit_micro_batch=args.vit_micro_batch,
         visual_fusion=args.visual_fusion,
+        temporal_mode=temporal_mode,
+        world_include_decoder=(args.lambda_world > 0 or not args.ablation_group),
     ).to(device)
     model.debug_state = bool(args.debug_state)
-    model.ssm.debug_device = bool(args.debug_device)
+    if model.ssm is not None:
+        model.ssm.debug_device = bool(args.debug_device)
 
     # one-time world-model shape sanity checks (not per batch)
-    assert model.world_branch.visual_proj.in_features == model.llm_hidden
-    assert model.world_branch.d_ssm == model.world_branch.decoder_dim
-    assert model.ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
+    if args.lambda_world > 0:
+        assert model.world_branch.visual_proj.in_features == model.llm_hidden
+        assert model.world_branch.d_ssm == model.world_branch.decoder_dim
+        assert model.ibq_codebook.shape == (IBQ_CODEBOOK_SIZE, IBQ_CODE_EMBED_DIM)
 
     if args.lambda_world <= 0:
         # world model disabled: freeze the branch so it costs no
         # optimizer memory and receives no gradients
-        for p in model.world_branch.parameters():
-            p.requires_grad = False
-    if args.visual_fusion == "state_only":
+        if model.world_branch is not None:
+            for p in model.world_branch.parameters():
+                p.requires_grad = False
+    if args.visual_fusion == "state_only" and model.spatial_film is not None:
         # Keep the default path's trainable parameter set compatible with
         # previous state-only runs.  SpatialFiLM is used only by the
         # explicit spatial-FiLM ablations.
         for p in model.spatial_film.parameters():
             p.requires_grad = False
+    if args.ablation_group in {"B", "D"}:
+        model.summary_query.requires_grad_(False)
 
     # ---- param counts ----
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    ssm_params = sum(p.numel() for p in model.ssm.parameters())
-    adapter_params = sum(p.numel() for p in model.adapter.parameters())
+    ssm_params = sum(p.numel() for p in model.ssm.parameters()) if model.ssm is not None else 0
+    adapter_params = sum(p.numel() for p in model.adapter.parameters()) if model.adapter is not None else 0
     lora_params = sum(p.numel() for n, p in qwen.named_parameters() if p.requires_grad and "lora" in n)
     vit_trainable = sum(p.numel() for p in _find_visual(qwen).parameters() if p.requires_grad)
     print(f"Params: total={total/1e6:.1f}M  trainable={trainable/1e6:.1f}M  "
           f"SSM={ssm_params/1e3:.0f}K  adapter={adapter_params/1e3:.0f}K  "
           f"LoRA={lora_params/1e3:.0f}K  vit_trainable={vit_trainable}")
     assert vit_trainable == 0, "ViT should be frozen"
-    assert ssm_params > 0 and adapter_params > 0 and lora_params > 0
+    assert lora_params > 0
+    if temporal_mode == "ssm":
+        assert ssm_params > 0 and adapter_params > 0
+    else:
+        assert ssm_params == 0 and adapter_params == 0
 
     # ---- data ----
     train_ds = HIVAUDataset(
@@ -2324,12 +2371,28 @@ def main():
             if args.resume:
                 raise ValueError(msg)
             print(f"WARNING: {msg}; loading weights into the requested protocol.")
+        if args.ablation_group and ckpt.get("ablation_group") != args.ablation_group:
+            raise ValueError(
+                f"{mode} ablation_group mismatch: checkpoint={ckpt.get('ablation_group')!r}, "
+                f"requested={args.ablation_group!r}"
+            )
+        if args.resume and args.ablation_group:
+            for key in ("lambda_score", "lambda_sum", "lambda_world", "temporal_mode"):
+                expected = temporal_mode if key == "temporal_mode" else getattr(args, key)
+                if ckpt.get(key) != expected:
+                    raise ValueError(f"resume {key} mismatch: checkpoint={ckpt.get(key)!r}, expected={expected!r}")
 
         # model components
-        model.ssm.load_state_dict(ckpt["ssm"])
-        model.adapter.load_state_dict(ckpt["adapter"])
+        if model.ssm is not None:
+            model.ssm.load_state_dict(ckpt["ssm"])
+            model.adapter.load_state_dict(ckpt["adapter"])
+        elif "ssm" in ckpt or "adapter" in ckpt:
+            raise ValueError("current-window ablation checkpoint unexpectedly contains temporal modules")
         world_predictor_compatible = True
-        if "world_branch" in ckpt:
+        if model.world_branch is None:
+            if "world_branch" in ckpt or "temporal_modulator" in ckpt:
+                raise ValueError("current-window ablation checkpoint unexpectedly contains temporal conditioning")
+        elif "world_branch" in ckpt:
             # drop legacy delta_predictor / delta_proj params; the rest
             # of the decoder weights still load
             saved_wb = dict(ckpt["world_branch"])
@@ -2374,8 +2437,9 @@ def main():
                     "world branch is newly initialized and the optimizer "
                     "state will be reset."
                 )
-        _load_temporal_conditioning(model, ckpt)
-        if "spatial_film" in ckpt:
+        if model.world_branch is not None:
+            _load_temporal_conditioning(model, ckpt)
+        if model.spatial_film is not None and "spatial_film" in ckpt:
             if _state_dict_shapes_match(model.spatial_film, ckpt["spatial_film"]):
                 model.spatial_film.load_state_dict(ckpt["spatial_film"])
             else:
@@ -2388,7 +2452,7 @@ def main():
             if attr in ckpt:
                 param = getattr(model, attr)
                 param.data.copy_(ckpt[attr].to(param.device, param.dtype))
-        if "alpha_logit" in ckpt:
+        if model.alpha_logit is not None and "alpha_logit" in ckpt:
             model.alpha_logit.data.copy_(
                 ckpt["alpha_logit"].to(model.alpha_logit.device, model.alpha_logit.dtype)
             )
@@ -2464,19 +2528,19 @@ def main():
             )
 
     def save_stage1_checkpoint(ckpt_dir: Path, epoch: int) -> None:
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        model.qwen.save_pretrained(str(ckpt_dir / "lora_adapter"))
-        torch.save({
-            "ssm": model.ssm.state_dict(),
-            "adapter": model.adapter.state_dict(),
+        if args.ablation_group and ckpt_dir.exists():
+            raise FileExistsError(f"ablation checkpoint already exists; refusing to overwrite: {ckpt_dir}")
+        if args.ablation_group:
+            ckpt_dir.parent.mkdir(parents=True, exist_ok=True)
+            save_dir = Path(tempfile.mkdtemp(prefix=f".{ckpt_dir.name}.tmp-", dir=ckpt_dir.parent))
+        else:
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+            save_dir = ckpt_dir
+        model.qwen.save_pretrained(str(save_dir / "lora_adapter"))
+        state = {
             "score_head": model.score_head.state_dict(),
-            "world_branch": model.world_branch.state_dict(),
-            "temporal_proj": model.world_branch.temporal_proj.state_dict(),
-            "temporal_modulator": model.temporal_modulator.state_dict(),
-            "spatial_film": model.spatial_film.state_dict(),
             "score_query": model.score_query.detach().cpu(),
             "summary_query": model.summary_query.detach().cpu(),
-            "alpha_logit": model.alpha_logit.detach().cpu(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,
@@ -2503,6 +2567,8 @@ def main():
             "lambda_sum": args.lambda_sum,
             "lambda_world": args.lambda_world,
             "visual_fusion": args.visual_fusion,
+            "temporal_mode": temporal_mode,
+            "ablation_group": args.ablation_group,
             "world_horizon": args.world_horizon,
             "world_warmup_steps": args.world_warmup_steps,
             "ibq_cache_root": args.ibq_cache_root,
@@ -2512,9 +2578,24 @@ def main():
             "feature_cache_model_id": args.model_path,
             "min_pixels": args.min_pixels,
             "max_pixels": args.max_pixels,
-        }, str(ckpt_dir / "train_state.pt"))
-        processor.save_pretrained(str(ckpt_dir))
-        tokenizer.save_pretrained(str(ckpt_dir))
+        }
+        if model.ssm is not None:
+            state.update({
+                "ssm": model.ssm.state_dict(),
+                "adapter": model.adapter.state_dict(),
+                "world_branch": model.world_branch.state_dict(),
+                "temporal_proj": model.world_branch.temporal_proj.state_dict(),
+                "temporal_modulator": model.temporal_modulator.state_dict(),
+                "spatial_film": model.spatial_film.state_dict(),
+                "alpha_logit": model.alpha_logit.detach().cpu(),
+            })
+        torch.save(state, str(save_dir / "train_state.pt"))
+        processor.save_pretrained(str(save_dir))
+        tokenizer.save_pretrained(str(save_dir))
+        if args.ablation_group:
+            if ckpt_dir.exists():
+                raise FileExistsError(f"ablation checkpoint appeared during save: {ckpt_dir}")
+            save_dir.rename(ckpt_dir)
 
     # ---- loop ----
     model.train()
@@ -2707,7 +2788,10 @@ def main():
                             normalizer=valid_mask.numel(),
                         )
 
-                        triggers, skipped_summary = collect_summary_triggers(batch, valid_mask_cpu)
+                        triggers, skipped_summary = (
+                            collect_summary_triggers(batch, valid_mask_cpu)
+                            if args.lambda_sum > 0 else ([], 0)
+                        )
                         if triggers:
                             trigger_b = torch.tensor([t[0] for t in triggers], dtype=torch.long, device=device)
                             trigger_w = torch.tensor([t[1] for t in triggers], dtype=torch.long, device=device)
@@ -2852,6 +2936,9 @@ def main():
                     score=sum(train_score_losses[-10:]) / min(10, len(train_score_losses)),
                     sum_trig=int(train_summary_triggers[-1]),
                 )
+                if args.max_train_updates and global_step >= args.max_train_updates:
+                    print(f"Smoke limit reached: {global_step} optimizer updates")
+                    break
 
         elif args.objective == "answer_ce":
             ssm_cache: dict = {}
@@ -3025,10 +3112,19 @@ def main():
                 )
 
         # ---- end of epoch ----
+        if args.ablation_group in {"C", "E"} and train_summary_triggers_total == 0:
+            if args.max_train_updates:
+                print("WARNING: smoke run reached no semantic triggers; verify C/E on a positive-event batch")
+            else:
+                raise RuntimeError(
+                    f"ablation {args.ablation_group} saw no semantic triggers in epoch {epoch}; "
+                    "semantic supervision did not participate in training"
+                )
         lr = scheduler.get_last_lr()[0]
         writer.add_scalar("train/loss", np.mean(train_losses), epoch)
         writer.add_scalar("train/lr", lr, epoch)
-        writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
+        if model.alpha_logit is not None:
+            writer.add_scalar("train/alpha", torch.sigmoid(model.alpha_logit).item(), epoch)
         if args.objective == "score_token":
             score_prob_mean_epoch = (
                 train_score_prob_sum / train_valid_windows_total
@@ -3122,7 +3218,7 @@ def main():
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     writer.add_scalar(f"val/{k}", v, epoch)
-            if metrics.get("auc", 0) > best_metric:
+            if not args.ablation_group and metrics.get("auc", 0) > best_metric:
                 best_metric = metrics["auc"]
                 save_stage1_checkpoint(Path(args.log_dir) / "best", epoch)
                 print(f"  best auc={best_metric:.4f}")

@@ -19,6 +19,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from hivau_dataset import HIVAUDataset, hivau_collate
+from frame_score_eval import auc_ap, frame_scores_from_windows, metadata_without_test_annotations
 from mil_utils import group_video_chunks
 from pipeline_stage1 import (
     SPATIAL_FUSION_MODES,
@@ -59,7 +60,10 @@ def _video_id_from_entry(entry: dict) -> str:
     raise ValueError(f"manifest entry does not contain a video id: {entry}")
 
 
-def normalize_manifest(manifest_path: str | Path, output_dir: Path, video_id: str = "") -> Path:
+def normalize_manifest(
+    manifest_path: str | Path, output_dir: Path, video_id: str = "",
+    *, official_gt_only: bool = False,
+) -> Path:
     raw = _load_json(manifest_path)
     normalized: Dict[str, dict] = {}
     if isinstance(raw, dict):
@@ -82,15 +86,18 @@ def normalize_manifest(manifest_path: str | Path, output_dir: Path, video_id: st
         fps = meta.get("fps")
         if n_frames is None or fps is None:
             raise ValueError(f"manifest must provide n_frames and fps: video={vid}")
-        normalized[vid] = {
-            **meta,
-            "n_frames": int(n_frames),
-            "fps": float(fps),
-            "label": meta.get("label", []),
-            "events": meta.get("events", []),
-            "clips": meta.get("clips", []),
-            "clips_caption": meta.get("clips_caption", []),
-        }
+        if official_gt_only:
+            normalized[vid] = metadata_without_test_annotations(int(n_frames), float(fps))
+        else:
+            normalized[vid] = {
+                **meta,
+                "n_frames": int(n_frames),
+                "fps": float(fps),
+                "label": meta.get("label", []),
+                "events": meta.get("events", []),
+                "clips": meta.get("clips", []),
+                "clips_caption": meta.get("clips_caption", []),
+            }
     if not normalized:
         raise ValueError(f"no videos selected from manifest: video_id={video_id!r}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -133,8 +140,19 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     _check_stage1_config(state, args.model_path)
     visual_fusion = str(state.get("visual_fusion", "state_only"))
+    temporal_mode = str(state.get("temporal_mode", "ssm"))
     if visual_fusion not in VISUAL_FUSION_MODES:
         raise ValueError(f"unknown Stage-1 visual_fusion={visual_fusion!r}")
+    if temporal_mode not in {"ssm", "none"}:
+        raise ValueError(f"unknown Stage-1 temporal_mode={temporal_mode!r}")
+    group = state.get("ablation_group", "")
+    if group in {"B", "C", "D", "E"}:
+        expected_mode = "none" if group in {"B", "C"} else "ssm"
+        expected_semantics = group in {"C", "E"}
+        if (temporal_mode != expected_mode or visual_fusion != "state_only"
+                or (float(state.get("lambda_sum", 0)) > 0) != expected_semantics
+                or float(state.get("lambda_world", 0)) != 0):
+            raise ValueError(f"inconsistent ablation checkpoint configuration for group {group}")
     if visual_fusion in SPATIAL_FUSION_MODES and "spatial_film" not in state:
         raise ValueError(f"{visual_fusion} checkpoint is missing spatial_film state_dict")
 
@@ -163,35 +181,33 @@ def load_stage1_model(args) -> tuple[StreamingVADGenerationModel, object, object
         vit_micro_batch=1,
         world_include_decoder=False,
         visual_fusion=visual_fusion,
+        temporal_mode=temporal_mode,
     ).to(args.device)
-    model.ssm.load_state_dict(state["ssm"])
-    model.adapter.load_state_dict(state["adapter"])
-    _load_temporal_conditioning(model, state)
+    if temporal_mode == "ssm":
+        model.ssm.load_state_dict(state["ssm"])
+        model.adapter.load_state_dict(state["adapter"])
+        _load_temporal_conditioning(model, state)
+    elif "ssm" in state or "adapter" in state:
+        raise ValueError("current-window checkpoint unexpectedly contains temporal modules")
     if visual_fusion in SPATIAL_FUSION_MODES:
         model.spatial_film.load_state_dict(state["spatial_film"])
     model.score_head.load_state_dict(state["score_head"])
     model.score_query.data.copy_(state["score_query"].to(model.score_query.device, model.score_query.dtype))
     if "summary_query" in state:
         model.summary_query.data.copy_(state["summary_query"].to(model.summary_query.device, model.summary_query.dtype))
-    if "alpha_logit" in state:
+    if model.alpha_logit is not None and "alpha_logit" in state:
         model.alpha_logit.data.copy_(state["alpha_logit"].to(model.alpha_logit.device, model.alpha_logit.dtype))
-    else:
+    elif model.alpha_logit is not None:
         print("WARNING: alpha_logit missing from checkpoint; using model default.")
     model.debug_state = False
     model.eval()
     prompt_text = str(state.get("prompt", "Current video status:"))
-    print(f"Loaded visual_fusion={visual_fusion}")
+    print(f"Loaded visual_fusion={visual_fusion} temporal_mode={temporal_mode} ablation_group={group or 'none'}")
     return model, processor, tokenizer, dtype, prompt_text
 
 
 def _auc_ap(scores: np.ndarray, gt: np.ndarray) -> tuple[float | None, float | None]:
-    if np.unique(gt).size < 2:
-        return None, None
-    try:
-        from sklearn.metrics import average_precision_score, roc_auc_score
-    except ImportError:
-        raise ImportError("scikit-learn is required for UCF evaluation")
-    return float(roc_auc_score(gt, scores)), float(average_precision_score(gt, scores))
+    return auc_ap(scores, gt)
 
 
 def load_gt(gt_root: str | Path, video_id: str, n_frames: int) -> np.ndarray:
@@ -261,6 +277,8 @@ def infer_video(
     processing_sec = 0.0
     steady_processing_sec = 0.0   # excludes first chunk (CUDA warmup)
     first_chunk_scored = 0
+    window_processing_ms: List[float] = []
+    score_forward_ms: List[float] = []
 
     with torch.no_grad():
         for chunk_i, ref in enumerate(refs):
@@ -346,6 +364,8 @@ def infer_video(
                 continue
             if chunk_i == 0:
                 first_chunk_scored = len(valid_b)
+            _synchronize(device)
+            score_start = time.perf_counter()
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=(device.type == "cuda")):
                 if model.visual_fusion in SPATIAL_FUSION_MODES:
                     visual_prefix, visual_prefix_mask = model.select_visual_prefix(
@@ -371,6 +391,8 @@ def infer_video(
                         tokenizer,
                         prompt_text=prompt_text,
                     )
+            _synchronize(device)
+            score_forward_ms.extend([1000.0 * (time.perf_counter() - score_start) / len(valid_b)] * len(valid_b))
             if not torch.isfinite(logits).all():
                 raise RuntimeError(
                     f"{video_id}: non-finite score logits in chunk {chunk_i} "
@@ -381,6 +403,7 @@ def infer_video(
             _synchronize(device)
             elapsed = time.perf_counter() - t1
             processing_sec += elapsed
+            window_processing_ms.extend([1000.0 * elapsed / len(valid_b)] * len(valid_b))
             if chunk_i > 0:
                 steady_processing_sec += elapsed
             start_frames = batch["window_start_frames"]
@@ -422,20 +445,7 @@ def infer_video(
         raise ValueError(f"{video_id}: last window ends at {rows[-1]['end_frame']}, expected n_frames={n_frames}")
     save_window_csv(output_dir / f"{video_id}_window_scores.csv", rows)
 
-    standard_scores = np.zeros(n_frames, dtype=np.float32)
-    causal_scores = np.full(n_frames, np.nan, dtype=np.float32)
-    causal_valid = np.zeros(n_frames, dtype=bool)
-    for row in rows:
-        start = max(0, int(row["start_frame"]))
-        end = min(n_frames, int(row["end_frame"]))
-        if end > start:
-            standard_scores[start:end] = float(row["score_prob"])
-    for idx, row in enumerate(rows):
-        start = min(n_frames, int(row["end_frame"]))
-        next_end = n_frames if idx + 1 == len(rows) else min(n_frames, int(rows[idx + 1]["end_frame"]))
-        if next_end > start:
-            causal_scores[start:next_end] = float(row["score_prob"])
-            causal_valid[start:next_end] = True
+    standard_scores, causal_scores, causal_valid = frame_scores_from_windows(rows, n_frames)
 
     np.save(output_dir / f"{video_id}_standard_frame_scores.npy", standard_scores)
     np.save(output_dir / f"{video_id}_causal_frame_scores.npy", causal_scores)
@@ -490,6 +500,11 @@ def infer_video(
         "rtf_full": rtf_full,
         "avg_window_ms": avg_window_ms,
         "steady_window_ms": steady_window_ms,
+        "p95_window_processing_ms": float(np.percentile(window_processing_ms, 95)),
+        "window_processing_ms": window_processing_ms,
+        "mean_score_forward_ms": float(np.mean(score_forward_ms)),
+        "p95_score_forward_ms": float(np.percentile(score_forward_ms, 95)),
+        "score_forward_ms": score_forward_ms,
         "gt": gt,
         "standard_scores": standard_scores,
         "causal_scores": causal_scores,
@@ -509,12 +524,22 @@ def main() -> None:
     parser.add_argument("--video-id", default="")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--debug-state", action="store_true")
+    parser.add_argument("--inference-max-windows", type=int, default=MAX_WINDOWS,
+                        help="use 1 for per-window streaming latency; does not change window span")
+    parser.add_argument("--strict", action="store_true",
+                        help="fail if any manifest video is skipped or fails inference")
+    parser.add_argument("--official-gt-only", action="store_true",
+                        help="ignore test-set HIVAU labels/events when indexing videos; use gt-root for metrics")
     args = parser.parse_args()
+    if args.inference_max_windows < 1:
+        parser.error("--inference-max-windows must be >= 1")
 
     args.device = torch.device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    normalized_manifest = normalize_manifest(args.test_manifest, output_dir, args.video_id)
+    normalized_manifest = normalize_manifest(
+        args.test_manifest, output_dir, args.video_id, official_gt_only=args.official_gt_only,
+    )
     model, processor, tokenizer, dtype, prompt_text = load_stage1_model(args)
 
     dataset = HIVAUDataset(
@@ -522,7 +547,7 @@ def main() -> None:
         args.video_root,
         total_sampled_frames=FRAMES_PER_CLIP,
         sample_interval=SAMPLE_INTERVAL,
-        max_windows=MAX_WINDOWS,
+        max_windows=args.inference_max_windows,
         feature_cache_root=args.feature_cache_root or None,
         feature_cache_model_id=args.model_path,
         min_pixels=MIN_PIXELS,
@@ -530,6 +555,11 @@ def main() -> None:
         require_spatial=(model.visual_fusion in SPATIAL_FUSION_MODES),
     )
     grouped = group_video_chunks(dataset.samples)
+    if args.strict:
+        expected_ids = set(_load_json(normalized_manifest))
+        missing_ids = sorted(expected_ids - set(grouped))
+        if missing_ids:
+            raise RuntimeError(f"inference dataset skipped {len(missing_ids)} manifest videos: {missing_ids[:20]}")
     if args.video_id:
         selected_video_id = normalize_video_id(args.video_id)
         if selected_video_id not in grouped:
@@ -540,6 +570,8 @@ def main() -> None:
     all_standard = []
     all_causal_gt = []
     all_causal = []
+    all_window_processing_ms = []
+    all_score_forward_ms = []
     videos = []
     failed_videos: List[dict] = []
     for video_id, refs in tqdm(grouped.items(), desc="Infer videos"):
@@ -561,7 +593,9 @@ def main() -> None:
             failed_videos.append({"video_id": video_id, "error": str(exc)[:300]})
             print(f"FAILED video={video_id}: {exc}")
             continue
-        videos.append({k: v for k, v in result.items() if k not in {"gt", "standard_scores", "causal_scores", "causal_valid"}})
+        videos.append({k: v for k, v in result.items() if k not in {"gt", "standard_scores", "causal_scores", "causal_valid", "window_processing_ms", "score_forward_ms"}})
+        all_window_processing_ms.extend(result["window_processing_ms"])
+        all_score_forward_ms.extend(result["score_forward_ms"])
         all_gt.append(result["gt"])
         all_standard.append(result["standard_scores"])
         mask = result["causal_valid"]
@@ -594,11 +628,18 @@ def main() -> None:
         "rtf_processing": total_processing_sec / total_video_sec if total_video_sec > 0 else None,
         "rtf_full": (total_processing_sec + total_data_sec) / total_video_sec if total_video_sec > 0 else None,
         "avg_window_ms": 1000.0 * total_processing_sec / max(total_windows, 1),
+        "mean_window_processing_ms": float(np.mean(all_window_processing_ms)) if all_window_processing_ms else None,
+        "p95_window_processing_ms": float(np.percentile(all_window_processing_ms, 95)) if all_window_processing_ms else None,
+        "mean_score_forward_ms": float(np.mean(all_score_forward_ms)) if all_score_forward_ms else None,
+        "p95_score_forward_ms": float(np.percentile(all_score_forward_ms, 95)) if all_score_forward_ms else None,
+        "inference_max_windows": args.inference_max_windows,
         "videos": videos,
     }
     with open(output_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
     print(json.dumps({k: v for k, v in metrics.items() if k != "videos"}, indent=2))
+    if args.strict and failed_videos:
+        raise RuntimeError(f"strict inference failed for {len(failed_videos)} videos; see metrics.json")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,30 @@
+{
+  "model_path": "/data3/wgq/models/Qwen2-VL-7B-Instruct",
+  "seed": 42,
+  "epochs": 1,
+  "lr": 1e-5,
+  "batch_size": 1,
+  "grad_accum": 4,
+  "lambda_sem": 0.1,
+  "pixels": 100352,
+  "ucf": {
+    "train_json": "/data3/wgq/data/HIVAU-70k/raw_annotations/ucf_database_train.json",
+    "train_video_root": "/data1/wjq/data/UCF_Crime/training/videos",
+    "anomaly_video_root": "/data1/wjq/data/UCF_Crime/Anomaly-Videos-ALL",
+    "feature_cache_root": "/data3/wgq/data/ucf_original_all_visual_cache_100352",
+    "test_manifest": "/data3/wgq/data/ucf_original_cache_manifests/ucf_original_test_cache_manifest.json",
+    "test_video_root": "/data1/wjq/data/UCF_Crime/testing/videos",
+    "test_gt_root": "/data1/wjq/data/UCF_Crime/testing/gt_labels",
+    "smoke_video_id": "Abuse028_x264"
+  },
+  "xd": {
+    "train_json": "",
+    "train_video_root": "",
+    "anomaly_video_root": "",
+    "feature_cache_root": "",
+    "test_manifest": "",
+    "test_video_root": "",
+    "test_gt_root": "",
+    "smoke_video_id": ""
+  }
+}
